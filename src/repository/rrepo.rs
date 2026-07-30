@@ -1,4 +1,4 @@
-use super::{PackageRepository, RepositoryFromUrl};
+use super::PackageRepository;
 use crate::http;
 use async_trait::async_trait;
 use moka::future::Cache;
@@ -32,19 +32,6 @@ impl RrepoRepository {
 
     pub fn url(&self) -> &Url {
         &self.url
-    }
-}
-
-#[async_trait]
-impl RepositoryFromUrl for RrepoRepository {
-    async fn from_url(client: http::HttpClient, url: Url) -> Result<Self, String> {
-        http::rrepo_repository_packages(&client, &url)
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?;
-
-        Ok(Self::new(client, url))
     }
 }
 

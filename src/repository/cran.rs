@@ -1,4 +1,4 @@
-use super::{ArchiveSupport, PackageRepository, RepositoryFromUrl};
+use super::{ArchiveSupport, PackageRepository};
 use crate::http;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -62,39 +62,6 @@ impl CranRepository {
             })
             .await
             .map_err(|error| error.as_ref().clone())
-    }
-}
-
-#[async_trait]
-impl RepositoryFromUrl for CranRepository {
-    async fn from_url(client: http::HttpClient, url: Url) -> Result<Self, String> {
-        let packages_probe = async {
-            http::cran_packages(&client, &url)
-                .await
-                .map_err(|error| error.to_string())?
-                .error_for_status()
-                .map_err(|error| error.to_string())
-        };
-        let archive_probe = async {
-            http::cran_archive_root(&client, &url)
-                .await
-                .map_err(|error| error.to_string())?
-                .error_for_status()
-                .map_err(|error| error.to_string())
-        };
-
-        let (packages_result, archive_result) = tokio::join!(packages_probe, archive_probe);
-        packages_result?;
-
-        let archives = match archive_result {
-            Ok(_) => ArchiveSupport::Available,
-            Err(error) if error.contains("404 Not Found") || error.contains("403 Forbidden") => {
-                ArchiveSupport::Unavailable
-            }
-            Err(error) => return Err(error),
-        };
-
-        Ok(Self::new(client, url, archives))
     }
 }
 
