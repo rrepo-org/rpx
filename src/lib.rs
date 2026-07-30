@@ -789,8 +789,33 @@ async fn cmd_run(command: &[String]) -> RpxResult<()> {
 }
 
 async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResult<()> {
-    let outcome = lock_from_description(repository_preference).await?;
-    if outcome.changed {
+    let description = read_description()?;
+    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let client = http::client();
+    let repositories = repository_preference
+        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .await
+        .map_err(|details| LockError::ResolveFailed { details })?;
+    let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
+    let preferred_versions = preferred_versions_from_lockfile(
+        current_lockfile.as_ref(),
+        &repositories,
+        &BTreeSet::new(),
+    )?;
+
+    let lockfile = lockfile_from_roots(
+        &client,
+        repositories,
+        roots,
+        preferred_versions,
+        current_lockfile.as_ref(),
+        None,
+    )
+    .await?;
+    let changed = current_lockfile.as_ref() != Some(&lockfile);
+    write_project_lockfile(&lockfile)?;
+
+    if changed {
         status("Updated rpx.lock");
     } else {
         status("rpx.lock is already up to date");
@@ -989,11 +1014,6 @@ fn print_status_group(title: &str, items: &[String]) {
     for item in items {
         status(format_args!("- {item}"));
     }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct LockOutcome {
-    changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1575,37 +1595,6 @@ fn remove_packages_from_description_dependencies(
             .collect::<Vec<_>>();
         description.set_enhances(Relations::from(retained));
     }
-}
-
-async fn lock_from_description(
-    repository_preference: DefaultRepositoryPreference,
-) -> RpxResult<LockOutcome> {
-    let description = read_description()?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
-    let repositories = repository_preference
-        .package_repositories(&client, &description, current_lockfile.as_ref())
-        .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
-    let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
-    let preferred_versions = preferred_versions_from_lockfile(
-        current_lockfile.as_ref(),
-        &repositories,
-        &BTreeSet::new(),
-    )?;
-
-    let lockfile = lockfile_from_roots(
-        &client,
-        repositories,
-        roots,
-        preferred_versions,
-        current_lockfile.as_ref(),
-        None,
-    )
-    .await?;
-    let changed = current_lockfile.as_ref() != Some(&lockfile);
-    write_project_lockfile(&lockfile)?;
-    Ok(LockOutcome { changed })
 }
 
 async fn load_sysreq_snapshot_for_lock(
