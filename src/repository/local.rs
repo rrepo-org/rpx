@@ -1,4 +1,5 @@
-use super::PackageRepository;
+use super::{PackageRepository, RepositoryError};
+use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use r_description::lossless::{RDescription, Version};
 use std::{
@@ -31,36 +32,48 @@ impl LocalRepository {
         &self.path
     }
 
-    async fn effective_description(&self) -> Result<Arc<RDescription>, String> {
+    async fn effective_description(&self) -> Result<Arc<RDescription>, RepositoryError> {
         if let Some(description) = &self.description_override {
             return Ok(Arc::clone(description));
         }
 
         let path = self.path.join("DESCRIPTION");
-        let contents = tokio::fs::read_to_string(&path).await.map_err(|error| {
-            format!("failed to read DESCRIPTION at {}: {error}", path.display())
-        })?;
-        let description = contents.parse::<RDescription>().map_err(|error| {
-            format!("failed to parse DESCRIPTION at {}: {error}", path.display())
-        })?;
+        let contents =
+            tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|source| RepositoryError::FileRead {
+                    path: path.clone(),
+                    source: Arc::new(source),
+                })?;
+        let description =
+            contents
+                .parse::<RDescription>()
+                .map_err(|source| RepositoryError::Description {
+                    location: format!("at {}", path.display()),
+                    source: Arc::new(source),
+                })?;
 
         Ok(Arc::new(description))
     }
 
-    async fn package_and_version(&self) -> Result<(String, Version), String> {
+    async fn package_and_version(&self) -> Result<(String, Version), RepositoryError> {
         let description = self.effective_description().await?;
         let package = description
             .package()
-            .ok_or_else(|| format!("DESCRIPTION at {} is missing Package", self.path.display()))?;
+            .ok_or_else(|| RepositoryError::MissingField {
+                path: self.path.join("DESCRIPTION"),
+                field: "Package",
+            })?;
         let version = description
             .version()
-            .ok_or_else(|| format!("DESCRIPTION at {} is missing Version", self.path.display()))?
+            .ok_or_else(|| RepositoryError::MissingField {
+                path: self.path.join("DESCRIPTION"),
+                field: "Version",
+            })?
             .parse::<Version>()
-            .map_err(|error| {
-                format!(
-                    "invalid Version in DESCRIPTION at {}: {error}",
-                    self.path.display()
-                )
+            .map_err(|details| RepositoryError::InvalidData {
+                resource: format!("Version in DESCRIPTION at {}", self.path.display()),
+                details,
             })?;
 
         Ok((package, version))
@@ -80,16 +93,28 @@ impl PackageRepository for LocalRepository {
             .is_some_and(|other| self.path == other.path)
     }
 
-    async fn packages(&self) -> Result<BTreeMap<String, Version>, String> {
+    async fn packages(
+        &self,
+        _client: &http::HttpClient,
+    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let (package, version) = self.package_and_version().await?;
-        Ok(BTreeMap::from([(package, version)]))
+        Ok(BTreeMap::from([(
+            package,
+            PackageVersion::new(version, repository),
+        )]))
     }
 
-    async fn versions(&self, package: &str) -> Result<BTreeSet<Version>, String> {
+    async fn versions(
+        &self,
+        _client: &http::HttpClient,
+        package: &str,
+    ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
+        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let (local_package, version) = self.package_and_version().await?;
 
         if package == local_package {
-            Ok(BTreeSet::from([version]))
+            Ok(BTreeSet::from([PackageVersion::new(version, repository)]))
         } else {
             Ok(BTreeSet::new())
         }
@@ -97,29 +122,35 @@ impl PackageRepository for LocalRepository {
 
     async fn description(
         &self,
+        _client: &http::HttpClient,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, String> {
+    ) -> Result<Arc<RDescription>, RepositoryError> {
         let description = self.effective_description().await?;
         let local_package = description
             .package()
-            .ok_or_else(|| format!("DESCRIPTION at {} is missing Package", self.path.display()))?;
+            .ok_or_else(|| RepositoryError::MissingField {
+                path: self.path.join("DESCRIPTION"),
+                field: "Package",
+            })?;
         let local_version = description
             .version()
-            .ok_or_else(|| format!("DESCRIPTION at {} is missing Version", self.path.display()))?
+            .ok_or_else(|| RepositoryError::MissingField {
+                path: self.path.join("DESCRIPTION"),
+                field: "Version",
+            })?
             .parse::<Version>()
-            .map_err(|error| {
-                format!(
-                    "invalid Version in DESCRIPTION at {}: {error}",
-                    self.path.display()
-                )
+            .map_err(|details| RepositoryError::InvalidData {
+                resource: format!("Version in DESCRIPTION at {}", self.path.display()),
+                details,
             })?;
 
         if package != local_package || version != &local_version {
-            return Err(format!(
-                "local repository at {} does not contain {package} {version}",
-                self.path.display()
-            ));
+            return Err(RepositoryError::PackageVersionNotFound {
+                path: self.path.clone(),
+                package: package.to_string(),
+                version: version.clone(),
+            });
         }
 
         Ok(description)

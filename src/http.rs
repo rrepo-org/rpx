@@ -626,6 +626,7 @@ pub async fn rrepo_repository_packages(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .push("packages");
 
     get_response(client, url).await
@@ -639,6 +640,7 @@ pub async fn rrepo_package_versions(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["packages", package, "versions"]);
 
     get_response(client, url).await
@@ -653,6 +655,7 @@ pub async fn rrepo_package_description(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["packages", package, "versions", version, "description"]);
 
     get_response(client, url).await
@@ -667,6 +670,7 @@ pub async fn rrepo_source_artifact(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["packages", package, "versions", version, "source"]);
 
     get_response(client, url).await
@@ -682,6 +686,7 @@ pub async fn rrepo_windows_binary(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend([
             "packages", package, "versions", version, "binaries", "windows", r_minor,
         ]);
@@ -700,6 +705,7 @@ pub async fn rrepo_macos_binary(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend([
             "packages", package, "versions", version, "binaries", "macos", target, r_minor,
         ]);
@@ -714,6 +720,7 @@ pub async fn cran_packages(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", "PACKAGES"]);
 
     client.get(url).send().await
@@ -726,6 +733,7 @@ pub async fn cran_archive_root(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", "Archive", ""]);
 
     client.get(url).send().await
@@ -739,6 +747,7 @@ pub async fn cran_package_archive_listing(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, ""]);
 
     client.get(url).send().await
@@ -754,6 +763,7 @@ pub async fn cran_current_source_tarball(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", &file_name]);
 
     client.get(url).send().await
@@ -769,6 +779,7 @@ pub async fn cran_archive_source_tarball(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, &file_name]);
 
     client.get(url).send().await
@@ -782,6 +793,7 @@ pub async fn cran_latest_package_description(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["web", "packages", package, "DESCRIPTION"]);
 
     client.get(url).send().await
@@ -798,6 +810,7 @@ pub async fn cran_windows_binary(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["bin", "windows", "contrib", r_minor, &file_name]);
 
     client.get(url).send().await
@@ -815,6 +828,7 @@ pub async fn cran_macos_binary(
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["bin", "macosx", target, "contrib", r_minor, &file_name]);
 
     client.get(url).send().await
@@ -940,6 +954,7 @@ fn cran_archive_source_url_for_error(
 
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
+        .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, &file_name]);
 
     url

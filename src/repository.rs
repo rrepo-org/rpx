@@ -3,6 +3,7 @@ mod local;
 mod rrepo;
 
 use crate::http;
+use crate::resolver::PackageVersion;
 use async_trait::async_trait;
 use r_description::lossless::{RDescription, Version};
 use reqwest::Url;
@@ -11,8 +12,10 @@ use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
+    path::PathBuf,
     sync::Arc,
 };
+use thiserror::Error;
 
 pub use cran::CranRepository;
 pub use local::LocalRepository;
@@ -27,21 +30,90 @@ pub enum ArchiveSupport {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Error)]
+pub enum RepositoryError {
+    #[error("request failed: {source}")]
+    Request {
+        #[source]
+        source: Arc<reqwest_middleware::Error>,
+    },
+
+    #[error("response failed: {source}")]
+    Response {
+        #[source]
+        source: Arc<reqwest::Error>,
+    },
+
+    #[error("failed to read source archive: {source}")]
+    Archive {
+        #[source]
+        source: Arc<std::io::Error>,
+    },
+
+    #[error("failed to read {path}: {source}")]
+    FileRead {
+        path: PathBuf,
+        #[source]
+        source: Arc<std::io::Error>,
+    },
+
+    #[error("failed to parse DESCRIPTION {location}: {source}")]
+    Description {
+        location: String,
+        #[source]
+        source: Arc<r_description::lossless::Error>,
+    },
+
+    #[error("invalid {resource}: {details}")]
+    InvalidData { resource: String, details: String },
+
+    #[error("DESCRIPTION at {path} is missing {field}")]
+    MissingField { path: PathBuf, field: &'static str },
+
+    #[error("source package does not contain {package}/DESCRIPTION")]
+    DescriptionNotFound { package: String },
+
+    #[error("local repository at {path} does not contain {package} {version}")]
+    PackageVersionNotFound {
+        path: PathBuf,
+        package: String,
+        version: Version,
+    },
+
+    #[error("invalid repository URL {value}")]
+    InvalidUrl { value: String },
+
+    #[error("{url} is not an rrepo API ({rrepo}) or CRAN-like repository ({cran})")]
+    UnrecognizedRepository {
+        url: String,
+        rrepo: Box<RepositoryError>,
+        cran: Box<RepositoryError>,
+    },
+}
+
 #[async_trait]
 pub trait PackageRepository: Any + Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn equals(&self, other: &dyn PackageRepository) -> bool;
 
-    async fn packages(&self) -> Result<BTreeMap<String, Version>, String>;
+    async fn packages(
+        &self,
+        client: &http::HttpClient,
+    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError>;
 
-    async fn versions(&self, package: &str) -> Result<BTreeSet<Version>, String>;
+    async fn versions(
+        &self,
+        client: &http::HttpClient,
+        package: &str,
+    ) -> Result<BTreeSet<PackageVersion>, RepositoryError>;
 
     async fn description(
         &self,
+        client: &http::HttpClient,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, String>;
+    ) -> Result<Arc<RDescription>, RepositoryError>;
 }
 
 impl dyn PackageRepository {
@@ -52,21 +124,25 @@ impl dyn PackageRepository {
     pub async fn from_url(
         client: &http::HttpClient,
         value: &str,
-    ) -> Result<Arc<dyn PackageRepository>, String> {
-        let normalized_url = normalize_repository_url(value);
-        let url = Url::parse(&normalized_url)
-            .map_err(|error| format!("invalid repository URL {normalized_url}: {error}"))?;
+    ) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+        let value = value.trim();
+        let url = Url::parse(value).map_err(|_| RepositoryError::InvalidUrl {
+            value: value.to_string(),
+        })?;
 
         let rrepo_url = url.clone();
         let rrepo_probe = async {
             http::rrepo_repository_packages(client, &rrepo_url)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|source| RepositoryError::Request {
+                    source: Arc::new(source),
+                })?
                 .error_for_status()
-                .map_err(|error| error.to_string())?;
+                .map_err(|source| RepositoryError::Response {
+                    source: Arc::new(source),
+                })?;
 
-            Ok::<Arc<dyn PackageRepository>, String>(Arc::new(RrepoRepository::new(
-                client.clone(),
+            Ok::<Arc<dyn PackageRepository>, RepositoryError>(Arc::new(RrepoRepository::new(
                 rrepo_url,
             )))
         };
@@ -76,16 +152,24 @@ impl dyn PackageRepository {
             let packages_probe = async {
                 http::cran_packages(client, &cran_url)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Request {
+                        source: Arc::new(source),
+                    })?
                     .error_for_status()
-                    .map_err(|error| error.to_string())
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })
             };
             let archive_probe = async {
                 http::cran_archive_root(client, &cran_url)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Request {
+                        source: Arc::new(source),
+                    })?
                     .error_for_status()
-                    .map_err(|error| error.to_string())
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })
             };
 
             let (packages_result, archive_result) = tokio::join!(packages_probe, archive_probe);
@@ -93,18 +177,19 @@ impl dyn PackageRepository {
 
             let archives = match archive_result {
                 Ok(_) => ArchiveSupport::Available,
-                Err(error)
-                    if error.contains("404 Not Found") || error.contains("403 Forbidden") =>
+                Err(RepositoryError::Response { source })
+                    if matches!(
+                        source.status(),
+                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN)
+                    ) =>
                 {
                     ArchiveSupport::Unavailable
                 }
                 Err(error) => return Err(error),
             };
 
-            Ok::<Arc<dyn PackageRepository>, String>(Arc::new(CranRepository::new(
-                client.clone(),
-                cran_url,
-                archives,
+            Ok::<Arc<dyn PackageRepository>, RepositoryError>(Arc::new(CranRepository::new(
+                cran_url, archives,
             )))
         };
 
@@ -118,9 +203,11 @@ impl dyn PackageRepository {
                     Err(rrepo_error) => {
                         match cran_probe.await {
                             Ok(repository) => Ok(repository),
-                            Err(cran_error) => Err(format!(
-                                "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
-                            )),
+                            Err(cran_error) => Err(RepositoryError::UnrecognizedRepository {
+                                url: value.to_string(),
+                                rrepo: Box::new(rrepo_error),
+                                cran: Box::new(cran_error),
+                            }),
                         }
                     }
                 }
@@ -132,9 +219,11 @@ impl dyn PackageRepository {
                     Err(cran_error) => {
                         match rrepo_probe.await {
                             Ok(repository) => Ok(repository),
-                            Err(rrepo_error) => Err(format!(
-                                "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
-                            )),
+                            Err(rrepo_error) => Err(RepositoryError::UnrecognizedRepository {
+                                url: value.to_string(),
+                                rrepo: Box::new(rrepo_error),
+                                cran: Box::new(cran_error),
+                            }),
                         }
                     }
                 }
@@ -151,6 +240,7 @@ impl PartialEq for dyn PackageRepository {
 
 impl Eq for dyn PackageRepository {}
 
+#[deprecated(note = "parse into Url and canonicalize with path_segments_mut().pop_if_empty()")]
 pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
 }

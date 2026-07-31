@@ -1,5 +1,5 @@
-use super::PackageRepository;
-use crate::http;
+use super::{PackageRepository, RepositoryError};
+use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use moka::future::Cache;
 use r_description::lossless::{RDescription, Version};
@@ -13,17 +13,19 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
     url: Url,
-    client: http::HttpClient,
     packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
     versions: Cache<String, BTreeSet<Version>>,
     descriptions: Cache<(String, Version), Arc<RDescription>>,
 }
 
 impl RrepoRepository {
-    pub fn new(client: http::HttpClient, url: Url) -> Self {
+    pub fn new(mut url: Url) -> Self {
+        url.path_segments_mut()
+            .expect("repository base URL should support path segments")
+            .pop_if_empty();
+
         Self {
             url,
-            client,
             packages: Cache::new(1),
             versions: Cache::new(1024),
             descriptions: Cache::new(4096),
@@ -48,23 +50,33 @@ impl PackageRepository for RrepoRepository {
             .is_some_and(|other| self.url == other.url)
     }
 
-    async fn packages(&self) -> Result<BTreeMap<String, Version>, String> {
+    async fn packages(
+        &self,
+        client: &http::HttpClient,
+    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let response = self
             .packages
             .try_get_with((), async {
-                let response = http::rrepo_repository_packages(&self.client, &self.url)
+                let response = http::rrepo_repository_packages(client, &self.url)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Request {
+                        source: Arc::new(source),
+                    })?
                     .error_for_status()
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?
                     .json::<http::RrepoPackagesResponse>()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?;
 
-                Ok::<Arc<http::RrepoPackagesResponse>, String>(Arc::new(response))
+                Ok::<Arc<http::RrepoPackagesResponse>, RepositoryError>(Arc::new(response))
             })
             .await
-            .map_err(|error| error.as_ref().clone())?;
+            .map_err(Arc::unwrap_or_clone)?;
 
         Ok(response
             .packages
@@ -84,40 +96,56 @@ impl PackageRepository for RrepoRepository {
                     }
                 };
 
-                Some((package.name.clone(), version))
+                Some((
+                    package.name.clone(),
+                    PackageVersion::new(version, Arc::clone(&repository)),
+                ))
             })
             .collect())
     }
 
-    async fn versions(&self, package: &str) -> Result<BTreeSet<Version>, String> {
-        if !self.packages().await?.contains_key(package) {
-            return Ok(BTreeSet::new());
-        }
-
+    async fn versions(
+        &self,
+        client: &http::HttpClient,
+        package: &str,
+    ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
+        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
-                let response = http::rrepo_package_versions(&self.client, &self.url, package)
+                let response = http::rrepo_package_versions(client, &self.url, package)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Request {
+                        source: Arc::new(source),
+                    })?
                     .error_for_status()
-                    .map_err(|error| error.to_string())?
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?
                     .json::<http::RrepoPackageVersionsResponse>()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?;
 
                 response
                     .versions
                     .into_iter()
                     .map(|summary| {
-                        summary.version.parse::<Version>().map_err(|error| {
-                            format!("invalid version {} for {package}: {error}", summary.version)
+                        summary.version.parse::<Version>().map_err(|details| {
+                            RepositoryError::InvalidData {
+                                resource: format!(
+                                    "package version {} for {package}",
+                                    summary.version
+                                ),
+                                details,
+                            }
                         })
                     })
-                    .collect::<Result<BTreeSet<_>, String>>()
+                    .collect::<Result<BTreeSet<_>, RepositoryError>>()
             })
             .await
-            .map_err(|error| error.as_ref().clone())?;
+            .map_err(Arc::unwrap_or_clone)?;
 
         tracing::trace!(
             package,
@@ -126,34 +154,45 @@ impl PackageRepository for RrepoRepository {
             "loaded package versions"
         );
 
-        Ok(versions)
+        Ok(versions
+            .into_iter()
+            .map(|version| PackageVersion::new(version, Arc::clone(&repository)))
+            .collect())
     }
 
     async fn description(
         &self,
+        client: &http::HttpClient,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, String> {
+    ) -> Result<Arc<RDescription>, RepositoryError> {
         let key = (package.to_string(), version.clone());
 
         self.descriptions
             .try_get_with(key, async {
                 let description = http::rrepo_package_description(
-                    &self.client,
+                    client,
                     &self.url,
                     package,
                     &version.to_string(),
                 )
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|source| RepositoryError::Request {
+                    source: Arc::new(source),
+                })?
                 .error_for_status()
-                .map_err(|error| error.to_string())?
+                .map_err(|source| RepositoryError::Response {
+                    source: Arc::new(source),
+                })?
                 .text()
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|source| RepositoryError::Response {
+                    source: Arc::new(source),
+                })?
                 .parse::<RDescription>()
-                .map_err(|error| {
-                    format!("failed to parse DESCRIPTION for {package} {version}: {error}")
+                .map_err(|source| RepositoryError::Description {
+                    location: format!("for {package} {version}"),
+                    source: Arc::new(source),
                 })?;
 
                 tracing::trace!(
@@ -163,9 +202,9 @@ impl PackageRepository for RrepoRepository {
                     "fetched package description"
                 );
 
-                Ok::<Arc<RDescription>, String>(Arc::new(description))
+                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
             })
             .await
-            .map_err(|error| error.as_ref().clone())
+            .map_err(Arc::unwrap_or_clone)
     }
 }
