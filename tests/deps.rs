@@ -59,6 +59,38 @@ fn relation_names(relations: Option<r_description::lossless::Relations>) -> Vec<
 }
 
 #[test]
+fn reports_pubgrub_no_solution_explanation() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-no-solution";
+    write_description(
+        &container,
+        project_path,
+        "Package: rlang\nVersion: 1.0.1\nTitle: Local rlang\nDescription: Resolver conflict fixture.\nLicense: MIT\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>",
+    );
+
+    let command = format!("cd {project_path} && rpx add 'testthat@>=3.1.8'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::lock::no_solution"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("package requirements are incompatible"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("testthat") && stderr.contains("rlang"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("There is no solution"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add";

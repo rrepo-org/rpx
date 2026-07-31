@@ -1,6 +1,7 @@
 use clap::Parser;
 use futures_util::StreamExt;
 use miette::Diagnostic;
+use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
 use r_description::{
     VersionConstraint,
     lossless::{RDescription, Relation, Relations, Version},
@@ -211,6 +212,13 @@ enum LockError {
     )]
     ResolveFailed { details: String },
 
+    #[error("package requirements are incompatible\n\n{explanation}")]
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Adjust package constraints in DESCRIPTION and try again.")
+    )]
+    NoSolution { explanation: String },
+
     #[error("repository operation failed: {source}")]
     #[diagnostic(code(rpx::lock::repository_failed))]
     Repository {
@@ -218,7 +226,7 @@ enum LockError {
         source: RepositoryError,
     },
 
-    #[error("failed to resolve package set from registry: {source}")]
+    #[error("failed to resolve package set from registry")]
     #[diagnostic(
         code(rpx::lock::resolve_failed),
         help("Check package names and version constraints in DESCRIPTION.")
@@ -231,6 +239,18 @@ enum LockError {
     #[error("repository {repository} cannot be written to the lockfile")]
     #[diagnostic(code(rpx::lock::unsupported_repository))]
     UnsupportedRepository { repository: String },
+}
+
+fn lock_error_from_resolution(error: ResolutionError) -> LockError {
+    match error {
+        ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
+            derivation_tree.collapse_no_versions();
+            LockError::NoSolution {
+                explanation: DefaultStringReporter::report(&derivation_tree),
+            }
+        }
+        source => LockError::Resolution { source },
+    }
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -1980,7 +2000,7 @@ async fn lockfile_from_roots(
         preferred_versions,
     )
     .await
-    .map_err(|source| LockError::Resolution { source })?;
+    .map_err(lock_error_from_resolution)?;
 
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile).await;
     lockfile_from_selected_versions(
@@ -3241,9 +3261,9 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         LockError, LockfileCompatibilityError, ProjectPackage, apply_added_packages_to_description,
-        locked_dependencies_from_description, locked_install_order, locked_package_repositories,
-        lockfile_supports_project, package_not_found_help, parse_add_package,
-        pinned_package_relations, project_install_partitions,
+        lock_error_from_resolution, locked_dependencies_from_description, locked_install_order,
+        locked_package_repositories, lockfile_supports_project, package_not_found_help,
+        parse_add_package, pinned_package_relations, project_install_partitions,
         remove_packages_from_description_dependencies, roots_from_description,
         validate_lockfile_compatibility,
     };
@@ -3252,6 +3272,8 @@ mod tests {
         LockedSystemRequirements, Lockfile,
     };
     use crate::repository::{LocalRepository, PackageRepository};
+    use crate::resolver::{RDependencyProvider, ResolutionError};
+    use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
     use r_description::{
         VersionConstraint,
         lossless::{RDescription, Relation, Version},
@@ -3272,6 +3294,26 @@ mod tests {
             .expect_err("local repositories should not be lockable");
 
         assert!(matches!(error, LockError::UnsupportedRepository { .. }));
+    }
+
+    #[test]
+    fn renders_pubgrub_no_solution_report() {
+        let error: PubGrubError<RDependencyProvider> =
+            PubGrubError::NoSolution(DerivationTree::External(External::NoVersions(
+                "testthat".to_string(),
+                Ranges::empty(),
+            )));
+
+        let error = lock_error_from_resolution(ResolutionError::PubGrub(error));
+        let LockError::NoSolution { explanation } = &error else {
+            panic!("no-solution error should have a dedicated diagnostic");
+        };
+
+        assert!(explanation.contains("testthat"));
+        let rendered = format!("{:?}", miette::Report::new(error));
+        assert!(rendered.contains("package requirements are incompatible"));
+        assert!(rendered.contains("testthat"));
+        assert!(!rendered.contains("There is no solution"));
     }
 
     #[test]
