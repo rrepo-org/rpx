@@ -15,6 +15,12 @@ pub struct LocalRepository {
     description_override: Option<Arc<RDescription>>,
 }
 
+impl std::fmt::Display for LocalRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path.display().fmt(formatter)
+    }
+}
+
 impl LocalRepository {
     pub fn new(path: PathBuf) -> Self {
         Self {

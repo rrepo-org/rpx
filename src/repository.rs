@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
     path::PathBuf,
     sync::Arc,
 };
@@ -92,7 +92,7 @@ pub enum RepositoryError {
 }
 
 #[async_trait]
-pub trait PackageRepository: Any + Debug + Send + Sync {
+pub trait PackageRepository: Any + Debug + Display + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn equals(&self, other: &dyn PackageRepository) -> bool;

@@ -21,6 +21,12 @@ pub struct CranRepository {
     descriptions: Cache<(String, Version), Arc<RDescription>>,
 }
 
+impl std::fmt::Display for CranRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.url.fmt(formatter)
+    }
+}
+
 impl CranRepository {
     pub fn new(mut url: Url, archives: ArchiveSupport) -> Self {
         url.path_segments_mut()

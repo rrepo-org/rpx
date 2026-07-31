@@ -18,6 +18,12 @@ pub struct RrepoRepository {
     descriptions: Cache<(String, Version), Arc<RDescription>>,
 }
 
+impl std::fmt::Display for RrepoRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.url.fmt(formatter)
+    }
+}
+
 impl RrepoRepository {
     pub fn new(mut url: Url) -> Self {
         url.path_segments_mut()
