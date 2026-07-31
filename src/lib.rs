@@ -58,8 +58,7 @@ use project::{
 };
 use r::{InstallFailure, base_packages, install_local_package, installed_packages};
 use repository::DEFAULT_REGISTRY_BASE_URL;
-use repository::normalize_repository_url;
-use resolver::{is_base_package, resolve_from_registry};
+use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
@@ -78,7 +77,10 @@ use crate::{
         RVirtualEnv, fetch_runtime_info, installed_packages_async, r_version_async,
         remove_packages_from_venv,
     },
-    repository::{ArchiveSupport, PackageRepository, RepositoryType},
+    repository::{
+        ArchiveSupport, CranRepository, PackageRepository, RepositoryError, RrepoRepository,
+        parse_repository_url,
+    },
     resolver::PackageVersion,
 };
 
@@ -142,9 +144,13 @@ enum ProjectError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum RepoError {
-    #[error("failed to add repository {url}: {details}")]
+    #[error("failed to add repository {url}: {source}")]
     #[diagnostic(code(rpx::repo::add_failed))]
-    Add { url: String, details: String },
+    Add {
+        url: String,
+        #[source]
+        source: RepositoryError,
+    },
 
     #[error("failed to remove repository credential: {details}")]
     #[diagnostic(code(rpx::repo::credential_remove_failed))]
@@ -201,6 +207,27 @@ enum LockError {
         help("Check package names and version constraints in DESCRIPTION.")
     )]
     ResolveFailed { details: String },
+
+    #[error("repository operation failed: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    Repository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to resolve package set from registry: {source}")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    Resolution {
+        #[source]
+        source: ResolutionError,
+    },
+
+    #[error("repository {repository} cannot be written to the lockfile")]
+    #[diagnostic(code(rpx::lock::unsupported_repository))]
+    UnsupportedRepository { repository: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -479,7 +506,7 @@ async fn cmd_add(
     let repositories = repository_preference
         .package_repositories(&client, &description, current_lockfile.as_ref())
         .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
+        .map_err(|source| LockError::Repository { source })?;
 
     let mut desired_roots =
         roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
@@ -552,35 +579,40 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
         .package_repositories(&client, &description, current_lockfile.as_ref())
         .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
-    let new_repo = PackageRepository::from_url(&client, url)
+        .map_err(|source| LockError::Repository { source })?;
+    let new_repo = <dyn PackageRepository>::from_url(&client, url)
         .await
-        .map_err(|details| RepoError::Add {
-            url: normalize_repository_url(url),
-            details,
+        .map_err(|source| RepoError::Add {
+            url: url.trim().to_string(),
+            source,
         })?;
+    let new_repo_url = remote_repository_url(new_repo.as_ref())
+        .expect("URL-classified repositories should be remote")
+        .clone();
 
     let mut additional_repositories = description.additional_repositories().unwrap_or_default();
-    if additional_repositories
-        .iter()
-        .any(|existing| normalize_repository_url(existing) == new_repo.base_url().as_str())
-    {
+    if additional_repositories.iter().any(|existing| {
+        parse_repository_url(existing).is_ok_and(|existing| existing == new_repo_url)
+    }) {
         status(format_args!(
             "Repository already configured: {}",
-            new_repo.base_url().as_str()
+            new_repo_url.as_str()
         ));
         return Ok(());
     }
 
-    additional_repositories.push(new_repo.base_url().to_string());
+    additional_repositories.push(new_repo_url.to_string());
     let additional_repositories = additional_repositories
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
     description.set_additional_repositories(&additional_repositories);
 
-    if !repositories.contains(&new_repo) {
-        repositories.push(new_repo.clone());
+    if !repositories
+        .iter()
+        .any(|repository| repository.as_ref() == new_repo.as_ref())
+    {
+        repositories.push(Arc::clone(&new_repo));
     }
 
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
@@ -601,10 +633,7 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
 
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
-    status(format_args!(
-        "Added repository {}",
-        new_repo.base_url().to_string()
-    ));
+    status(format_args!("Added repository {new_repo_url}"));
     Ok(())
 }
 
@@ -615,16 +644,18 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
         .package_repositories(&client, &description, current_lockfile.as_ref())
         .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
-    let normalized_url = normalize_repository_url(url);
-    let base_url = reqwest::Url::parse(&normalized_url).map_err(|error| RepoError::Add {
-        url: normalized_url.clone(),
-        details: format!("invalid repository URL {normalized_url}: {error}"),
+        .map_err(|source| LockError::Repository { source })?;
+    let base_url = parse_repository_url(url).map_err(|source| RepoError::Add {
+        url: url.trim().to_string(),
+        source,
     })?;
+    let normalized_url = base_url.to_string();
 
     let mut additional_repositories = description.additional_repositories().unwrap_or_default();
     let previous_len = additional_repositories.len();
-    additional_repositories.retain(|existing| normalize_repository_url(existing) != normalized_url);
+    additional_repositories.retain(|existing| {
+        parse_repository_url(existing).map_or(true, |existing| existing != base_url)
+    });
 
     if additional_repositories.len() == previous_len {
         status(format_args!("Repository not configured: {normalized_url}"));
@@ -637,7 +668,9 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
         .collect::<Vec<_>>();
     description.set_additional_repositories(&additional_repositories);
 
-    repositories.retain(|repository| repository.base_url().as_str() != normalized_url);
+    repositories.retain(|repository| {
+        remote_repository_url(repository.as_ref()).is_none_or(|url| url != &base_url)
+    });
 
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
     let preferred_versions = preferred_versions_from_lockfile(
@@ -678,11 +711,11 @@ async fn cmd_repo_list() -> RpxResult<()> {
     }
 
     for url in additional_repositories {
-        let normalized_url = normalize_repository_url(&url);
-        let base_url = reqwest::Url::parse(&normalized_url).map_err(|error| RepoError::Add {
-            url: normalized_url.clone(),
-            details: format!("invalid repository URL {normalized_url}: {error}"),
+        let base_url = parse_repository_url(&url).map_err(|source| RepoError::Add {
+            url: url.clone(),
+            source,
         })?;
+        let normalized_url = base_url.to_string();
         let credential = http::has_stored_credential(&base_url).map_err(|error| {
             RepoError::CredentialInspect {
                 details: error.to_string(),
@@ -713,7 +746,7 @@ async fn cmd_remove(
     let repositories = repository_preference
         .package_repositories(&client, &description, current_lockfile.as_ref())
         .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
+        .map_err(|source| LockError::Repository { source })?;
 
     let mut desired_roots =
         roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
@@ -795,7 +828,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
     let repositories = repository_preference
         .package_repositories(&client, &description, current_lockfile.as_ref())
         .await
-        .map_err(|details| LockError::ResolveFailed { details })?;
+        .map_err(|source| LockError::Repository { source })?;
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
     let preferred_versions = preferred_versions_from_lockfile(
         current_lockfile.as_ref(),
@@ -1039,7 +1072,7 @@ impl DefaultRepositoryPreference {
         client: &http::HttpClient,
         description: &RDescription,
         lockfile: Option<&Lockfile>,
-    ) -> Result<Vec<PackageRepository>, String> {
+    ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
         let mut repos = match lockfile {
             Some(lockfile) => package_repositories_from_lockfile(lockfile)?,
             None => package_repositories_from_description(client, description).await?,
@@ -1047,7 +1080,10 @@ impl DefaultRepositoryPreference {
 
         if self == Self::Enabled || (self == Self::FromLockfileOrDefault && lockfile.is_none()) {
             let default = default_repository(client).await?;
-            if !repos.contains(&default) {
+            if !repos
+                .iter()
+                .any(|repository| repository.as_ref() == default.as_ref())
+            {
                 repos.insert(0, default);
             }
         }
@@ -1058,22 +1094,24 @@ impl DefaultRepositoryPreference {
 
 fn package_repositories_from_lockfile(
     lockfile: &Lockfile,
-) -> Result<Vec<PackageRepository>, String> {
+) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
     lockfile
         .repositories
         .iter()
         .map(|locked_repository| {
-            let url =
-                reqwest::Url::parse(&locked_repository.url).map_err(|error| error.to_string())?;
+            let url = parse_repository_url(&locked_repository.url)?;
 
-            let repo_type = locked_repository_type(
-                locked_repository.kind,
-                locked_repository
-                    .cran_archive_support
-                    .unwrap_or(ArchiveSupport::Unavailable),
-            );
-
-            Ok(PackageRepository::new(url, repo_type))
+            Ok(match locked_repository.kind {
+                LockedRepositoryKind::Rrepo => {
+                    Arc::new(RrepoRepository::new(url)) as Arc<dyn PackageRepository>
+                }
+                LockedRepositoryKind::CranLike => Arc::new(CranRepository::new(
+                    url,
+                    locked_repository
+                        .cran_archive_support
+                        .unwrap_or(ArchiveSupport::Unavailable),
+                )),
+            })
         })
         .collect()
 }
@@ -1081,13 +1119,13 @@ fn package_repositories_from_lockfile(
 async fn package_repositories_from_description(
     client: &http::HttpClient,
     description: &RDescription,
-) -> Result<Vec<PackageRepository>, String> {
+) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
     let additional_repositories = description.additional_repositories().unwrap_or_default();
 
     futures_util::future::join_all(
         additional_repositories
             .iter()
-            .map(|url| async move { PackageRepository::from_url(client, url).await }),
+            .map(|url| async move { <dyn PackageRepository>::from_url(client, url).await }),
     )
     .await
     .into_iter()
@@ -1098,19 +1136,27 @@ fn lockfile_repositories_match_description(
     description: &RDescription,
     lockfile: &Lockfile,
 ) -> bool {
-    let description_repositories = description
+    let Some(description_repositories) = description
         .additional_repositories()
         .unwrap_or_default()
         .into_iter()
-        .map(|url| normalize_repository_url(&url))
-        .collect::<Vec<_>>();
-    let default_repository = default_repository_base_url();
-    let lockfile_repositories = lockfile
+        .map(|url| parse_repository_url(&url).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Ok(default_repository) = default_repository_base_url() else {
+        return false;
+    };
+    let Some(lockfile_repositories) = lockfile
         .repositories
         .iter()
-        .map(|repository| normalize_repository_url(&repository.url))
-        .filter(|url| url != &default_repository)
-        .collect::<Vec<_>>();
+        .map(|repository| parse_repository_url(&repository.url).ok())
+        .filter(|url| url.as_ref() != Some(&default_repository))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
 
     description_repositories == lockfile_repositories
 }
@@ -1262,7 +1308,7 @@ fn invalid_add_constraint(package: &str, details: impl Into<String>) -> AddError
 
 async fn add_relations_for_packages(
     client: &http::HttpClient,
-    repositories: &[PackageRepository],
+    repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
 ) -> RpxResult<BTreeSet<Relation>> {
     let non_base_packages = packages
@@ -1294,7 +1340,7 @@ async fn add_relations_for_packages(
 
 async fn latest_package_versions_for_add(
     client: &http::HttpClient,
-    repositories: &[PackageRepository],
+    repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
 ) -> RpxResult<BTreeMap<String, PackageVersion>> {
     if packages.is_empty() {
@@ -1310,7 +1356,7 @@ async fn latest_package_versions_for_add(
             repository
                 .packages(client)
                 .await
-                .map_err(|details| (repository.base_url(), details))
+                .map_err(|details| (repository.to_string(), details))
         }
     }))
     .await;
@@ -1455,7 +1501,7 @@ fn locked_root_from_relation(relation: &Relation) -> lockfile::LockedRoot {
 
 fn preferred_versions_from_lockfile(
     lockfile: Option<&Lockfile>,
-    repositories: &[PackageRepository],
+    repositories: &[Arc<dyn PackageRepository>],
     excluded_packages: &BTreeSet<String>,
 ) -> RpxResult<BTreeMap<String, PackageVersion>> {
     let Some(lockfile) = lockfile else {
@@ -1486,18 +1532,19 @@ fn preferred_versions_from_lockfile(
 }
 
 fn repository_for_locked_package(
-    repositories: &[PackageRepository],
+    repositories: &[Arc<dyn PackageRepository>],
     package: &LockedPackage,
-) -> RpxResult<Arc<PackageRepository>> {
+) -> RpxResult<Arc<dyn PackageRepository>> {
     if let Some(source_url) = package.source_url.as_deref()
-        && let Some(repository) = repositories
-            .iter()
-            .find(|repository| source_url.starts_with(repository.base_url().as_str()))
+        && let Some(repository) = repositories.iter().find(|repository| {
+            remote_repository_url(repository.as_ref())
+                .is_some_and(|url| source_url.starts_with(url.as_str()))
+        })
     {
-        return Ok(Arc::new(repository.clone()));
+        return Ok(Arc::clone(repository));
     }
 
-    repositories.first().cloned().map(Arc::new).ok_or_else(|| {
+    repositories.first().cloned().ok_or_else(|| {
         LockError::ResolveFailed {
             details: format!(
                 "no repository available for locked package {}",
@@ -1506,6 +1553,16 @@ fn repository_for_locked_package(
         }
         .into()
     })
+}
+
+fn remote_repository_url(repository: &dyn PackageRepository) -> Option<&reqwest::Url> {
+    if let Some(repository) = repository.downcast_ref::<RrepoRepository>() {
+        Some(repository.url())
+    } else {
+        repository
+            .downcast_ref::<CranRepository>()
+            .map(CranRepository::url)
+    }
 }
 
 fn apply_added_packages_to_description(
@@ -1691,49 +1748,35 @@ pub(crate) fn exit_with_status(code: Option<i32>) {
     }
 }
 
-async fn default_repository(client: &http::HttpClient) -> Result<PackageRepository, String> {
+async fn default_repository(
+    client: &http::HttpClient,
+) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
     match env::var("RPX_REGISTRY_BASE_URL") {
-        Ok(url) => {
-            let normalized_url = normalize_repository_url(&url);
-
-            PackageRepository::from_url(client, &normalized_url)
-                .await
-                .map_err(|details| {
-                    format!(
-                        "failed to classify RPX_REGISTRY_BASE_URL repository {}: {details}",
-                        normalized_url
-                    )
-                })
-        }
+        Ok(url) => <dyn PackageRepository>::from_url(client, &url).await,
 
         Err(_) => {
-            let url = reqwest::Url::parse(DEFAULT_REGISTRY_BASE_URL).map_err(|error| {
-                format!(
-                    "invalid default registry URL {}: {error}",
-                    DEFAULT_REGISTRY_BASE_URL
-                )
-            })?;
+            let url = parse_repository_url(DEFAULT_REGISTRY_BASE_URL)?;
 
-            Ok(PackageRepository::new(url, RepositoryType::Rrepo))
+            Ok(Arc::new(RrepoRepository::new(url)))
         }
     }
 }
 
-fn default_repository_base_url() -> String {
-    env::var("RPX_REGISTRY_BASE_URL")
-        .unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string())
-        .trim_end_matches('/')
-        .to_string()
+fn default_repository_base_url() -> Result<reqwest::Url, RepositoryError> {
+    let value =
+        env::var("RPX_REGISTRY_BASE_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string());
+    parse_repository_url(&value)
 }
 
 fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str {
-    let normalized_url = normalize_repository_url(url);
+    let Ok(url) = parse_repository_url(url) else {
+        return "unknown";
+    };
     lockfile
         .and_then(|lockfile| {
-            lockfile
-                .repositories
-                .iter()
-                .find(|repository| normalize_repository_url(&repository.url) == normalized_url)
+            lockfile.repositories.iter().find(|repository| {
+                parse_repository_url(&repository.url).is_ok_and(|repository| repository == url)
+            })
         })
         .map(|repository| match repository.kind {
             LockedRepositoryKind::Rrepo => "rrepo",
@@ -1744,7 +1787,7 @@ fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str
 
 async fn lockfile_from_roots(
     client: &http::HttpClient,
-    repositories: Vec<PackageRepository>,
+    repositories: Vec<Arc<dyn PackageRepository>>,
     roots: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
     existing_lockfile: Option<&Lockfile>,
@@ -1757,7 +1800,7 @@ async fn lockfile_from_roots(
         preferred_versions,
     )
     .await
-    .map_err(|details| LockError::ResolveFailed { details })?;
+    .map_err(|source| LockError::Resolution { source })?;
 
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile).await;
     lockfile_from_selected_versions(
@@ -1769,7 +1812,7 @@ async fn lockfile_from_roots(
         r_version,
     )
     .await
-    .map_err(|details| LockError::ResolveFailed { details }.into())
+    .map_err(Into::into)
 }
 
 async fn lockfile_from_selected_versions(
@@ -1777,9 +1820,9 @@ async fn lockfile_from_selected_versions(
     roots: BTreeSet<Relation>,
     selected: Vec<(String, PackageVersion)>,
     sysreq_db: &sysreqs::SysreqDbSnapshot,
-    repositories: &[PackageRepository],
+    repositories: &[Arc<dyn PackageRepository>],
     r_version: Option<&str>,
-) -> Result<Lockfile, String> {
+) -> Result<Lockfile, LockError> {
     let mut packages = BTreeMap::new();
     let mut sysreq_packages = BTreeMap::new();
 
@@ -1787,9 +1830,11 @@ async fn lockfile_from_selected_versions(
         let description = version
             .repository()
             .description(&client, &name, version.version())
-            .await?;
+            .await
+            .map_err(|source| LockError::Repository { source })?;
 
-        let dependencies = locked_dependencies_from_description(&description)?;
+        let dependencies = locked_dependencies_from_description(&description)
+            .map_err(|details| LockError::ResolveFailed { details })?;
 
         let rules = sysreqs::match_rules(&description, sysreq_db);
 
@@ -1803,7 +1848,7 @@ async fn lockfile_from_selected_versions(
                 package: name.clone(),
                 version: version.version().to_string(),
                 source: Some("repository".to_string()),
-                source_url: Some(version.source_url(&name)),
+                source_url: Some(package_source_url(&name, &version)?),
                 dependencies,
             },
         );
@@ -1827,7 +1872,7 @@ async fn lockfile_from_selected_versions(
     Ok(Lockfile {
         version: LOCKFILE_VERSION,
         revision: LOCKFILE_REVISION,
-        repositories: locked_package_repositories(repositories),
+        repositories: locked_package_repositories(repositories)?,
         r: LockedR {
             version: resolved_r_version,
             base_packages: required_base_packages,
@@ -1934,22 +1979,59 @@ fn relation_bounds(
     }
 }
 
-fn locked_package_repositories(repositories: &[PackageRepository]) -> Vec<LockedRepository> {
+fn package_source_url(name: &str, version: &PackageVersion) -> Result<String, LockError> {
+    let repository = version.repository().as_ref();
+    let mut url = if let Some(repository) = repository.downcast_ref::<RrepoRepository>() {
+        let mut url = repository.url().clone();
+        let version = version.version().to_string();
+        url.path_segments_mut()
+            .expect("repository base URL should support path segments")
+            .pop_if_empty()
+            .extend(["packages", name, "versions", &version, "source"]);
+        return Ok(url.to_string());
+    } else if let Some(repository) = repository.downcast_ref::<CranRepository>() {
+        repository.url().clone()
+    } else {
+        return Err(LockError::UnsupportedRepository {
+            repository: repository.to_string(),
+        });
+    };
+
+    let file_name = format!("{name}_{}.tar.gz", version.version());
+    url.path_segments_mut()
+        .expect("repository base URL should support path segments")
+        .pop_if_empty()
+        .extend(["src", "contrib", "Archive", name, &file_name]);
+    Ok(url.to_string())
+}
+
+fn locked_package_repositories(
+    repositories: &[Arc<dyn PackageRepository>],
+) -> Result<Vec<LockedRepository>, LockError> {
     repositories
         .iter()
         .map(|repository| {
-            let (kind, cran_archive_support) = match repository.repo_type() {
-                RepositoryType::Rrepo => (LockedRepositoryKind::Rrepo, None),
-                RepositoryType::Cran { archives } => {
-                    (LockedRepositoryKind::CranLike, Some(archives))
-                }
-            };
+            let repository = repository.as_ref();
+            let (url, kind, cran_archive_support) =
+                if let Some(repository) = repository.downcast_ref::<RrepoRepository>() {
+                    (repository.url(), LockedRepositoryKind::Rrepo, None)
+                } else if let Some(repository) = repository.downcast_ref::<CranRepository>() {
+                    (
+                        repository.url(),
+                        LockedRepositoryKind::CranLike,
+                        Some(repository.archive_support()),
+                    )
+                } else {
+                    return Err(LockError::UnsupportedRepository {
+                        repository: repository.to_string(),
+                    });
+                };
 
-            LockedRepository {
-                url: repository.base_url().to_string(),
+            Ok(LockedRepository {
+                url: url.to_string(),
                 kind,
                 cran_archive_support,
-            }
+            })
         })
         .collect()
 }
@@ -1974,13 +2056,6 @@ fn locked_base_packages_from_locked<'a>(
     );
 
     base_packages.into_iter().collect()
-}
-
-fn locked_repository_type(kind: LockedRepositoryKind, archives: ArchiveSupport) -> RepositoryType {
-    match kind {
-        LockedRepositoryKind::Rrepo => RepositoryType::Rrepo,
-        LockedRepositoryKind::CranLike => RepositoryType::Cran { archives: archives },
-    }
 }
 
 fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCompatibilityError> {
@@ -2985,20 +3060,38 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockfileCompatibilityError, apply_added_packages_to_description,
-        locked_dependencies_from_description, locked_install_order, package_not_found_help,
-        parse_add_package, pinned_package_relations, remove_packages_from_description_dependencies,
-        roots_from_description, validate_lockfile_compatibility,
+        LockError, LockfileCompatibilityError, apply_added_packages_to_description,
+        locked_dependencies_from_description, locked_install_order, locked_package_repositories,
+        package_not_found_help, parse_add_package, pinned_package_relations,
+        remove_packages_from_description_dependencies, roots_from_description,
+        validate_lockfile_compatibility,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
         LockedSystemRequirements, Lockfile,
     };
+    use crate::repository::{LocalRepository, PackageRepository};
     use r_description::{
         VersionConstraint,
         lossless::{RDescription, Relation},
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+        sync::Arc,
+    };
+
+    #[test]
+    fn rejects_local_repository_locking() {
+        let repositories: Vec<Arc<dyn PackageRepository>> = vec![Arc::new(LocalRepository::new(
+            PathBuf::from("vendor/example"),
+        ))];
+
+        let error = locked_package_repositories(&repositories)
+            .expect_err("local repositories should not be lockable");
+
+        assert!(matches!(error, LockError::UnsupportedRepository { .. }));
+    }
 
     #[test]
     fn builds_root_relations_from_description_constraints() {

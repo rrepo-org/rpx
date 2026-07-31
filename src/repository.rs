@@ -126,9 +126,7 @@ impl dyn PackageRepository {
         value: &str,
     ) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
         let value = value.trim();
-        let url = Url::parse(value).map_err(|_| RepositoryError::InvalidUrl {
-            value: value.to_string(),
-        })?;
+        let url = parse_repository_url(value)?;
 
         let rrepo_url = url.clone();
         let rrepo_probe = async {
@@ -232,6 +230,19 @@ impl dyn PackageRepository {
     }
 }
 
+pub fn parse_repository_url(value: &str) -> Result<Url, RepositoryError> {
+    let value = value.trim();
+    let mut url = Url::parse(value).map_err(|_| RepositoryError::InvalidUrl {
+        value: value.to_string(),
+    })?;
+    url.path_segments_mut()
+        .map_err(|_| RepositoryError::InvalidUrl {
+            value: value.to_string(),
+        })?
+        .pop_if_empty();
+    Ok(url)
+}
+
 impl PartialEq for dyn PackageRepository {
     fn eq(&self, other: &Self) -> bool {
         self.equals(other)
@@ -239,8 +250,3 @@ impl PartialEq for dyn PackageRepository {
 }
 
 impl Eq for dyn PackageRepository {}
-
-#[deprecated(note = "parse into Url and canonicalize with path_segments_mut().pop_if_empty()")]
-pub fn normalize_repository_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
-}
