@@ -76,6 +76,26 @@ pub async fn install_local_package(
         .await
         .expect("failed to run Rscript");
 
+    install_command_result(output)
+}
+
+pub async fn install_project_package(
+    project_root: &Path,
+    target_library: &Path,
+) -> Result<(), InstallFailure> {
+    let output = Command::with_venv("R")
+        .arg("CMD")
+        .arg("INSTALL")
+        .arg(format!("--library={}", target_library.display()))
+        .arg(project_root)
+        .output()
+        .await
+        .expect("failed to run R CMD INSTALL");
+
+    install_command_result(output)
+}
+
+fn install_command_result(output: std::process::Output) -> Result<(), InstallFailure> {
     if output.status.success() {
         return Ok(());
     }

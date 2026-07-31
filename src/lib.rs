@@ -54,9 +54,12 @@ use lockfile::{
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
     artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
-    project_library_root_path,
+    project_library_root_path, project_root,
 };
-use r::{InstallFailure, base_packages, install_local_package, installed_packages};
+use r::{
+    InstallFailure, base_packages, install_local_package, install_project_package,
+    installed_packages,
+};
 use repository::DEFAULT_REGISTRY_BASE_URL;
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
@@ -78,8 +81,8 @@ use crate::{
         remove_packages_from_venv,
     },
     repository::{
-        ArchiveSupport, CranRepository, PackageRepository, RepositoryError, RrepoRepository,
-        parse_repository_url,
+        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
+        RrepoRepository, parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -283,6 +286,10 @@ enum SyncError {
     #[error("failed to prepare source artifacts: {details}")]
     #[diagnostic(code(rpx::sync::download_failed))]
     DownloadArtifactsFailed { details: String },
+
+    #[error("failed to install project package: {details}")]
+    #[diagnostic(code(rpx::sync::project_install_failed))]
+    ProjectInstallFailed { details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -537,6 +544,7 @@ async fn cmd_add(
     )?;
     let lockfile = lockfile_from_roots(
         &client,
+        &description,
         repositories,
         desired_roots,
         preferred_versions,
@@ -623,6 +631,7 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     )?;
     let lockfile = lockfile_from_roots(
         &client,
+        &description,
         repositories,
         roots,
         preferred_versions,
@@ -680,6 +689,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     )?;
     let lockfile = lockfile_from_roots(
         &client,
+        &description,
         repositories,
         roots,
         preferred_versions,
@@ -779,6 +789,7 @@ async fn cmd_remove(
         .collect::<Vec<_>>();
     let lockfile = lockfile_from_roots(
         &client,
+        &description,
         repositories,
         desired_roots,
         preferred_versions,
@@ -838,6 +849,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
 
     let lockfile = lockfile_from_roots(
         &client,
+        &description,
         repositories,
         roots,
         preferred_versions,
@@ -875,6 +887,8 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<
 
 async fn cmd_status() -> RpxResult<()> {
     let description = read_description()?;
+    let project =
+        project_package(&description).map_err(|source| LockError::Repository { source })?;
     let lockfile = read_project_lockfile()?;
 
     match validate_lockfile_compatibility(&lockfile) {
@@ -882,19 +896,23 @@ async fn cmd_status() -> RpxResult<()> {
         Err(LockfileCompatibilityError::Older) => return Err(StatusError::LockfileOlder.into()),
         Err(LockfileCompatibilityError::Newer) => return Err(StatusError::LockfileNewer.into()),
     }
+    if !lockfile_supports_project(&lockfile, &project) {
+        return Err(StatusError::LockfileOlder.into());
+    }
 
     let manifest_requirements = manifest_requirement_names(&description);
     let lock_requirements = lockfile_requirement_names(&lockfile);
     let installed = installed_packages().await;
     let installed_names = installed
         .iter()
-        .map(|package| &package.package)
-        .collect::<BTreeSet<&String>>();
+        .map(|package| package.package.clone())
+        .collect::<BTreeSet<_>>();
     let installed_versions = installed
         .iter()
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let locked_names = lockfile.packages.keys().collect::<BTreeSet<&String>>();
+    let mut desired_names = lockfile.packages.keys().cloned().collect::<BTreeSet<_>>();
+    desired_names.insert(project.name.clone());
     let runtime_status = runtime_status(&lockfile).await;
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(&lockfile).ok()
@@ -910,15 +928,15 @@ async fn cmd_status() -> RpxResult<()> {
         .difference(&manifest_requirements)
         .cloned()
         .collect::<Vec<_>>();
-    let missing_from_library = locked_names
+    let missing_from_library = desired_names
         .difference(&installed_names)
-        .map(|package| (*package).clone())
+        .cloned()
         .collect::<Vec<_>>();
     let extra_in_library = installed_names
-        .difference(&locked_names)
-        .map(|package| (*package).clone())
+        .difference(&desired_names)
+        .cloned()
         .collect::<Vec<_>>();
-    let version_mismatches = lockfile
+    let mut version_mismatches = lockfile
         .packages
         .iter()
         .filter(|(name, _)| !is_base_package(name))
@@ -934,6 +952,16 @@ async fn cmd_status() -> RpxResult<()> {
                 })
         })
         .collect::<Vec<_>>();
+    let project_version = project.version.to_string();
+    if let Some(installed_version) = installed_versions
+        .get(&project.name)
+        .filter(|installed_version| *installed_version != &project_version)
+    {
+        version_mismatches.push(format!(
+            "{} ({installed_version} installed, {project_version} expected)",
+            project.name
+        ));
+    }
 
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()
@@ -985,10 +1013,10 @@ async fn cmd_status() -> RpxResult<()> {
         "Packages locked but no longer in DESCRIPTION:",
         &extra_in_lockfile,
     );
-    print_status_group("Packages locked but not installed:", &missing_from_library);
-    print_status_group("Packages installed but not locked:", &extra_in_library);
+    print_status_group("Required packages not installed:", &missing_from_library);
+    print_status_group("Unexpected packages installed:", &extra_in_library);
     print_status_group(
-        "Installed versions that differ from rpx.lock:",
+        "Installed versions that differ from expected versions:",
         &version_mismatches,
     );
     print_runtime_version_warning(&runtime_status);
@@ -1219,12 +1247,139 @@ fn roots_from_description(description: &RDescription) -> BTreeSet<Relation> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct ProjectPackage {
+    name: String,
+    version: Version,
+}
+
+fn project_package(description: &RDescription) -> Result<ProjectPackage, RepositoryError> {
+    let path = project_root().join("DESCRIPTION");
+    let name = description
+        .package()
+        .ok_or_else(|| RepositoryError::MissingField {
+            path: path.clone(),
+            field: "Package",
+        })?;
+    let version = description
+        .version()
+        .ok_or_else(|| RepositoryError::MissingField {
+            path,
+            field: "Version",
+        })?
+        .parse::<Version>()
+        .map_err(|details| RepositoryError::InvalidData {
+            resource: "project package version".to_string(),
+            details,
+        })?;
+
+    Ok(ProjectPackage { name, version })
+}
+
+fn project_package_version(
+    description: &RDescription,
+) -> Result<(ProjectPackage, PackageVersion), RepositoryError> {
+    let package = project_package(description)?;
+    let repository: Arc<dyn PackageRepository> =
+        Arc::new(LocalRepository::new(project_root()).with_description(description.clone()));
+    let version = PackageVersion::new(package.version.clone(), repository);
+    Ok((package, version))
+}
+
 fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
     roots_from_description(description)
         .into_iter()
         .map(|relation| relation.name())
         .filter(|package| !is_base_package(package))
         .collect()
+}
+
+fn project_hard_requirement_names(description: &RDescription) -> BTreeSet<String> {
+    description
+        .imports()
+        .into_iter()
+        .flat_map(|relations| relations.iter())
+        .chain(
+            description
+                .depends()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .chain(
+            description
+                .linking_to()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .map(|relation| relation.name())
+        .filter(|package| package != "R" && !is_base_package(package))
+        .collect()
+}
+
+fn lockfile_supports_project(lockfile: &Lockfile, project: &ProjectPackage) -> bool {
+    if lockfile.packages.contains_key(&project.name) {
+        return false;
+    }
+
+    lockfile.packages.values().all(|package| {
+        package
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.package == project.name)
+            .all(|dependency| locked_dependency_allows_version(dependency, &project.version))
+    })
+}
+
+fn locked_dependency_allows_version(
+    dependency: &lockfile::LockedDependency,
+    version: &Version,
+) -> bool {
+    let minimum_matches = dependency.min_version.as_deref().is_none_or(|minimum| {
+        minimum
+            .parse::<Version>()
+            .is_ok_and(|minimum| version >= &minimum)
+    });
+    let maximum_matches = dependency
+        .max_version_exclusive
+        .as_deref()
+        .is_none_or(|maximum| {
+            maximum
+                .parse::<Version>()
+                .is_ok_and(|maximum| version < &maximum)
+        });
+
+    minimum_matches && maximum_matches
+}
+
+fn project_install_partitions(
+    description: &RDescription,
+    lockfile: &Lockfile,
+) -> (Vec<LockedPackage>, Vec<LockedPackage>) {
+    let mut pending = project_hard_requirement_names(description);
+    let mut before_project = BTreeSet::new();
+
+    while let Some(package) = pending.pop_first() {
+        let Some(locked) = lockfile.packages.get(&package) else {
+            continue;
+        };
+        if !before_project.insert(package) {
+            continue;
+        }
+
+        pending.extend(
+            locked
+                .dependencies
+                .iter()
+                .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
+                .map(|dependency| dependency.package.clone()),
+        );
+    }
+
+    lockfile
+        .packages
+        .values()
+        .cloned()
+        .partition(|package| before_project.contains(&package.package))
 }
 
 fn lockfile_requirement_names(lockfile: &Lockfile) -> BTreeSet<String> {
@@ -1695,9 +1850,14 @@ async fn sync_from_lockfile(
     install_only_system: bool,
 ) -> RpxResult<SyncOutcome> {
     let description = read_description()?;
+    let project =
+        project_package(&description).map_err(|source| LockError::Repository { source })?;
     let manifest_requirements = manifest_requirement_names(&description);
     let lockfile = read_project_lockfile()?;
     validate_lockfile_compatibility_for_sync(&lockfile)?;
+    if !lockfile_supports_project(&lockfile, &project) {
+        return Err(SyncError::LockfileOlder.into());
+    }
     validate_runtime_for_sync(&lockfile).await?;
     if host_supports_system_sync() {
         let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
@@ -1718,9 +1878,13 @@ async fn sync_from_lockfile(
 
     let mut outcome = SyncOutcome::default();
 
-    let extra_packages = installed_packages()
-        .await
+    let installed = installed_packages().await;
+    let project_is_installed = installed
+        .iter()
+        .any(|package| package.package == project.name);
+    let extra_packages = installed
         .into_iter()
+        .filter(|package| package.package != project.name)
         .filter_map(|p| match lockfile.packages.get(&p.package) {
             Some(locked) if locked.version == p.version => None,
             _ => Some(p.package),
@@ -1729,15 +1893,26 @@ async fn sync_from_lockfile(
 
     outcome.removed = extra_packages.len();
     let _ = remove_packages_from_venv(&extra_packages);
+    if project_is_installed {
+        let _ = remove_packages_from_venv(std::slice::from_ref(&project.name));
+    }
 
     let client = http::client();
-    install_locked_packages(
-        client,
-        lockfile.packages.values().cloned().collect::<Vec<_>>(),
-        lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
-    )
-    .await
-    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    let repositories = lockfile.repositories.clone();
+    let (before_project, after_project) = project_install_partitions(&description, &lockfile);
+    install_locked_packages(client.clone(), before_project, repositories.clone())
+        .await
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+
+    install_project_package(&project_root(), &project_library_path())
+        .await
+        .map_err(|failure| SyncError::ProjectInstallFailed {
+            details: install_failure_message(&project.name, &project.version.to_string(), &failure),
+        })?;
+
+    install_locked_packages(client, after_project, repositories)
+        .await
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
 
     return Ok(outcome);
 }
@@ -1787,15 +1962,20 @@ fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str
 
 async fn lockfile_from_roots(
     client: &http::HttpClient,
+    description: &RDescription,
     repositories: Vec<Arc<dyn PackageRepository>>,
     roots: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
     existing_lockfile: Option<&Lockfile>,
     r_version: Option<&str>,
 ) -> RpxResult<Lockfile> {
+    let (root_package, root_version) =
+        project_package_version(description).map_err(|source| LockError::Repository { source })?;
     let selected = resolve_from_registry(
         client.clone(),
         repositories.clone(),
+        root_package.name,
+        root_version,
         roots.clone(),
         preferred_versions,
     )
@@ -3060,9 +3240,10 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockError, LockfileCompatibilityError, apply_added_packages_to_description,
+        LockError, LockfileCompatibilityError, ProjectPackage, apply_added_packages_to_description,
         locked_dependencies_from_description, locked_install_order, locked_package_repositories,
-        package_not_found_help, parse_add_package, pinned_package_relations,
+        lockfile_supports_project, package_not_found_help, parse_add_package,
+        pinned_package_relations, project_install_partitions,
         remove_packages_from_description_dependencies, roots_from_description,
         validate_lockfile_compatibility,
     };
@@ -3073,7 +3254,7 @@ mod tests {
     use crate::repository::{LocalRepository, PackageRepository};
     use r_description::{
         VersionConstraint,
-        lossless::{RDescription, Relation},
+        lossless::{RDescription, Relation, Version},
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -3091,6 +3272,98 @@ mod tests {
             .expect_err("local repositories should not be lockable");
 
         assert!(matches!(error, LockError::UnsupportedRepository { .. }));
+    }
+
+    #[test]
+    fn stages_project_hard_dependency_closure_before_project() {
+        let description: RDescription = "Package: project\nVersion: 1.0.1\nTitle: Project\nDescription: Test project.\nLicense: MIT\nImports: hard\nSuggests: testthat\n"
+            .parse()
+            .expect("description should parse");
+        let package = |name: &str, dependencies: Vec<LockedDependency>| LockedPackage {
+            package: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            source_url: None,
+            dependencies,
+        };
+        let dependency = |name: &str| LockedDependency {
+            package: name.to_string(),
+            kind: "Imports".to_string(),
+            min_version: None,
+            max_version_exclusive: None,
+        };
+        let lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            repositories: vec![],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "hard".to_string(),
+                    package("hard", vec![dependency("leaf")]),
+                ),
+                ("leaf".to_string(), package("leaf", vec![])),
+                (
+                    "testthat".to_string(),
+                    package("testthat", vec![dependency("project")]),
+                ),
+            ]),
+        };
+
+        let (before, after) = project_install_partitions(&description, &lockfile);
+
+        assert_eq!(
+            before
+                .into_iter()
+                .map(|package| package.package)
+                .collect::<Vec<_>>(),
+            vec!["hard", "leaf"]
+        );
+        assert_eq!(
+            after
+                .into_iter()
+                .map(|package| package.package)
+                .collect::<Vec<_>>(),
+            vec!["testthat"]
+        );
+    }
+
+    #[test]
+    fn validates_locked_reverse_dependencies_against_project_version() {
+        let project = ProjectPackage {
+            name: "project".to_string(),
+            version: "1.0.1".parse::<Version>().unwrap(),
+        };
+        let mut lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            repositories: vec![],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::from([(
+                "testthat".to_string(),
+                LockedPackage {
+                    package: "testthat".to_string(),
+                    version: "3.0.0".to_string(),
+                    source: None,
+                    source_url: None,
+                    dependencies: vec![LockedDependency {
+                        package: "project".to_string(),
+                        kind: "Imports".to_string(),
+                        min_version: Some("1.0.0".to_string()),
+                        max_version_exclusive: Some("1.1.0".to_string()),
+                    }],
+                },
+            )]),
+        };
+
+        assert!(lockfile_supports_project(&lockfile, &project));
+        lockfile.packages.get_mut("testthat").unwrap().dependencies[0].min_version =
+            Some("1.1.0".to_string());
+        assert!(!lockfile_supports_project(&lockfile, &project));
     }
 
     #[test]

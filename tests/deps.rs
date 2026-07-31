@@ -9,7 +9,7 @@ fn write_description(
     contents: &str,
 ) {
     let command = format!(
-        "mkdir -p {project_path} && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
+        "mkdir -p {project_path} && touch {project_path}/NAMESPACE && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -74,6 +74,7 @@ fn runs_rpx_add_inside_custom_r_image() {
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert_package_state(&container, working_path, "digest", "TRUE");
+    assert_package_state(&container, working_path, "testpkg", "TRUE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
@@ -89,6 +90,10 @@ fn runs_rpx_add_inside_custom_r_image() {
     assert!(
         lockfile.contains("\"packages\""),
         "lockfile was: {lockfile}"
+    );
+    assert!(
+        !lockfile.contains("\"testpkg\""),
+        "project package should not be locked: {lockfile}"
     );
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");

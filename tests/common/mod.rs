@@ -59,7 +59,7 @@ pub fn create_package_project(
     project_path: &str,
 ) {
     let command = format!(
-        "mkdir -p {project_path} && cat > {project_path}/DESCRIPTION <<'EOF'\nPackage: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for rpx integration tests.\nLicense: MIT\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\nEOF"
+        "mkdir -p {project_path} && touch {project_path}/NAMESPACE && cat > {project_path}/DESCRIPTION <<'EOF'\nPackage: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for rpx integration tests.\nLicense: MIT\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");

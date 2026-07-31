@@ -80,6 +80,13 @@ pub fn init_description() -> Result<String, DescriptionError> {
         path: path.clone(),
         source,
     })?;
+    let namespace_path = path.with_file_name("NAMESPACE");
+    if !namespace_path.exists() {
+        fs::write(&namespace_path, "").map_err(|source| DescriptionError::WriteFailed {
+            path: namespace_path,
+            source,
+        })?;
+    }
 
     Ok(path.display().to_string())
 }
@@ -92,7 +99,7 @@ fn initial_description(package_name: &str) -> RDescription {
     description.set_description("Add a package description.");
     description.set_license("MIT");
     description.set_authors(
-        &r#"person("First", "Last", role = c("aut", "cre"))"#
+        &r#"person("First", "Last", email = "you@example.com", role = c("aut", "cre"))"#
             .parse()
             .unwrap(),
     );

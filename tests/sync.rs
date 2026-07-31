@@ -8,7 +8,7 @@ fn write_description(
     contents: &str,
 ) {
     let command = format!(
-        "mkdir -p {project_path} && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
+        "mkdir -p {project_path} && touch {project_path}/NAMESPACE && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
