@@ -9,7 +9,7 @@ fn write_description(
     contents: &str,
 ) {
     let command = format!(
-        "mkdir -p {project_path} && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
+        "mkdir -p {project_path} && touch {project_path}/NAMESPACE && cat > {project_path}/DESCRIPTION <<'EOF'\n{contents}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -59,6 +59,38 @@ fn relation_names(relations: Option<r_description::lossless::Relations>) -> Vec<
 }
 
 #[test]
+fn reports_pubgrub_no_solution_explanation() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-no-solution";
+    write_description(
+        &container,
+        project_path,
+        "Package: rlang\nVersion: 1.0.1\nTitle: Local rlang\nDescription: Resolver conflict fixture.\nLicense: MIT\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>",
+    );
+
+    let command = format!("cd {project_path} && rpx add 'testthat@>=3.1.8'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::lock::no_solution"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("package requirements are incompatible"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("testthat") && stderr.contains("rlang"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("There is no solution"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add";
@@ -74,6 +106,7 @@ fn runs_rpx_add_inside_custom_r_image() {
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert_package_state(&container, working_path, "digest", "TRUE");
+    assert_package_state(&container, working_path, "testpkg", "TRUE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
@@ -89,6 +122,10 @@ fn runs_rpx_add_inside_custom_r_image() {
     assert!(
         lockfile.contains("\"packages\""),
         "lockfile was: {lockfile}"
+    );
+    assert!(
+        !lockfile.contains("\"testpkg\""),
+        "project package should not be locked: {lockfile}"
     );
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");
