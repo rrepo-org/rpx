@@ -12,7 +12,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct LocalRepository {
     path: PathBuf,
-    description_override: Option<Arc<RDescription>>,
+    description: Option<Arc<RDescription>>,
 }
 
 impl std::fmt::Display for LocalRepository {
@@ -25,21 +25,25 @@ impl LocalRepository {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            description_override: None,
+            description: None,
         }
     }
 
     pub fn with_description(mut self, description: RDescription) -> Self {
-        self.description_override = Some(Arc::new(description));
+        self.set_description(description);
         self
+    }
+
+    pub fn set_description(&mut self, description: RDescription) {
+        self.description = Some(Arc::new(description));
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    async fn effective_description(&self) -> Result<Arc<RDescription>, RepositoryError> {
-        if let Some(description) = &self.description_override {
+    pub async fn description(&self) -> Result<Arc<RDescription>, RepositoryError> {
+        if let Some(description) = &self.description {
             return Ok(Arc::clone(description));
         }
 
@@ -62,8 +66,8 @@ impl LocalRepository {
         Ok(Arc::new(description))
     }
 
-    async fn package_and_version(&self) -> Result<(String, Version), RepositoryError> {
-        let description = self.effective_description().await?;
+    pub async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
+        let description = self.description().await?;
         let package = description
             .package()
             .ok_or_else(|| RepositoryError::MissingField {
@@ -82,7 +86,8 @@ impl LocalRepository {
                 details,
             })?;
 
-        Ok((package, version))
+        let repository: Arc<dyn PackageRepository> = self.clone();
+        Ok((package, PackageVersion::new(version, repository)))
     }
 }
 
@@ -103,12 +108,9 @@ impl PackageRepository for LocalRepository {
         &self,
         _client: &http::HttpClient,
     ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let (package, version) = self.package_and_version().await?;
-        Ok(BTreeMap::from([(
-            package,
-            PackageVersion::new(version, repository),
-        )]))
+        let repository = Arc::new(self.clone());
+        let (package, version) = repository.package().await?;
+        Ok(BTreeMap::from([(package, version)]))
     }
 
     async fn versions(
@@ -116,11 +118,11 @@ impl PackageRepository for LocalRepository {
         _client: &http::HttpClient,
         package: &str,
     ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let (local_package, version) = self.package_and_version().await?;
+        let repository = Arc::new(self.clone());
+        let (local_package, version) = repository.package().await?;
 
         if package == local_package {
-            Ok(BTreeSet::from([PackageVersion::new(version, repository)]))
+            Ok(BTreeSet::from([version]))
         } else {
             Ok(BTreeSet::new())
         }
@@ -132,7 +134,7 @@ impl PackageRepository for LocalRepository {
         package: &str,
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {
-        let description = self.effective_description().await?;
+        let description = self.description().await?;
         let local_package = description
             .package()
             .ok_or_else(|| RepositoryError::MissingField {
@@ -160,5 +162,69 @@ impl PackageRepository for LocalRepository {
         }
 
         Ok(description)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn package_uses_staged_description_and_preserves_repository() {
+        let initial: RDescription = "Package: initial\nVersion: 0.1.0\n"
+            .parse()
+            .expect("description should parse");
+        let staged: RDescription = "Package: project\nVersion: 1.2.3\n"
+            .parse()
+            .expect("description should parse");
+        let mut repository =
+            LocalRepository::new(PathBuf::from("unused")).with_description(initial);
+        repository.set_description(staged);
+        let repository = Arc::new(repository);
+        let expected_repository: Arc<dyn PackageRepository> = repository.clone();
+
+        let description = repository
+            .description()
+            .await
+            .expect("description should load");
+        let (package, version) = repository.package().await.expect("package should load");
+
+        assert_eq!(description.package().as_deref(), Some("project"));
+        assert_eq!(package, "project");
+        assert_eq!(version.version().to_string(), "1.2.3");
+        assert!(Arc::ptr_eq(version.repository(), &expected_repository));
+    }
+
+    #[tokio::test]
+    async fn description_falls_back_to_disk() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rpx-local-repository-{}-{unique}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir(&path)
+            .await
+            .expect("test directory should be created");
+        tokio::fs::write(
+            path.join("DESCRIPTION"),
+            "Package: diskproject\nVersion: 2.0.0\n",
+        )
+        .await
+        .expect("description should be written");
+        let repository = LocalRepository::new(path.clone());
+
+        let description = repository
+            .description()
+            .await
+            .expect("description should load");
+
+        assert_eq!(description.package().as_deref(), Some("diskproject"));
+        tokio::fs::remove_dir_all(path)
+            .await
+            .expect("test directory should be removed");
     }
 }

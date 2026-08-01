@@ -564,7 +564,7 @@ async fn cmd_add(
     )?;
     let lockfile = lockfile_from_roots(
         &client,
-        &description,
+        project_repository(&description),
         repositories,
         desired_roots,
         preferred_versions,
@@ -651,7 +651,7 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     )?;
     let lockfile = lockfile_from_roots(
         &client,
-        &description,
+        project_repository(&description),
         repositories,
         roots,
         preferred_versions,
@@ -709,7 +709,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     )?;
     let lockfile = lockfile_from_roots(
         &client,
-        &description,
+        project_repository(&description),
         repositories,
         roots,
         preferred_versions,
@@ -809,7 +809,7 @@ async fn cmd_remove(
         .collect::<Vec<_>>();
     let lockfile = lockfile_from_roots(
         &client,
-        &description,
+        project_repository(&description),
         repositories,
         desired_roots,
         preferred_versions,
@@ -869,7 +869,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
 
     let lockfile = lockfile_from_roots(
         &client,
-        &description,
+        project_repository(&description),
         repositories,
         roots,
         preferred_versions,
@@ -1296,14 +1296,8 @@ fn project_package(description: &RDescription) -> Result<ProjectPackage, Reposit
     Ok(ProjectPackage { name, version })
 }
 
-fn project_package_version(
-    description: &RDescription,
-) -> Result<(ProjectPackage, PackageVersion), RepositoryError> {
-    let package = project_package(description)?;
-    let repository: Arc<dyn PackageRepository> =
-        Arc::new(LocalRepository::new(project_root()).with_description(description.clone()));
-    let version = PackageVersion::new(package.version.clone(), repository);
-    Ok((package, version))
+fn project_repository(description: &RDescription) -> Arc<LocalRepository> {
+    Arc::new(LocalRepository::new(project_root()).with_description(description.clone()))
 }
 
 fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
@@ -1982,20 +1976,17 @@ fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str
 
 async fn lockfile_from_roots(
     client: &http::HttpClient,
-    description: &RDescription,
+    root: Arc<LocalRepository>,
     repositories: Vec<Arc<dyn PackageRepository>>,
     roots: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
     existing_lockfile: Option<&Lockfile>,
     r_version: Option<&str>,
 ) -> RpxResult<Lockfile> {
-    let (root_package, root_version) =
-        project_package_version(description).map_err(|source| LockError::Repository { source })?;
     let selected = resolve_from_registry(
         client.clone(),
         repositories.clone(),
-        root_package.name,
-        root_version,
+        root,
         roots.clone(),
         preferred_versions,
     )

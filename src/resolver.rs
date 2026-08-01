@@ -17,7 +17,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     http,
-    repository::{PackageRepository, RepositoryError},
+    repository::{LocalRepository, PackageRepository, RepositoryError},
 };
 
 const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
@@ -52,6 +52,9 @@ pub(crate) enum ProviderError {
 
 #[derive(Debug, Error)]
 pub(crate) enum ResolutionError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+
     #[error(transparent)]
     PubGrub(#[from] PubGrubError<RDependencyProvider>),
 
@@ -117,8 +120,7 @@ impl std::fmt::Display for PackageVersion {
 pub(crate) struct RDependencyProvider {
     client: http::HttpClient,
     repositories: Vec<Arc<dyn PackageRepository>>,
-    root_package: String,
-    root_version: PackageVersion,
+    root: Arc<LocalRepository>,
     root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
     preferred_versions: BTreeMap<String, PackageVersion>,
     description_prefetch_permits: Arc<Semaphore>,
@@ -128,16 +130,14 @@ impl RDependencyProvider {
     fn new(
         client: http::HttpClient,
         repositories: Vec<Arc<dyn PackageRepository>>,
-        root_package: String,
-        root_version: PackageVersion,
+        root: Arc<LocalRepository>,
         root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
         preferred_versions: BTreeMap<String, PackageVersion>,
     ) -> Self {
         Self {
             client,
             repositories,
-            root_package,
-            root_version,
+            root,
             root_dependencies,
             preferred_versions,
             description_prefetch_permits: Arc::new(Semaphore::new(DESCRIPTION_PREFETCH_WORKERS)),
@@ -147,11 +147,12 @@ impl RDependencyProvider {
     fn prefetch_descriptions(
         &self,
         constraints: &DependencyConstraints<String, Ranges<PackageVersion>>,
-    ) {
+    ) -> Result<(), ProviderError> {
+        let (root_package, _) = self.root_package()?;
         let parent_span = tracing::Span::current();
 
         for (package, range) in constraints {
-            if package == &self.root_package {
+            if package == &root_package {
                 continue;
             }
 
@@ -221,6 +222,14 @@ impl RDependencyProvider {
                 .instrument(span),
             );
         }
+
+        Ok(())
+    }
+
+    fn root_package(&self) -> Result<(String, PackageVersion), ProviderError> {
+        tokio::runtime::Handle::current()
+            .block_on(self.root.package())
+            .map_err(Into::into)
     }
 }
 
@@ -246,10 +255,9 @@ impl DependencyProvider for RDependencyProvider {
         package: &Self::P,
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
-        if package == &self.root_package {
-            return Ok(range
-                .contains(&self.root_version)
-                .then(|| self.root_version.clone()));
+        let (root_package, root_version) = self.root_package()?;
+        if package == &root_package {
+            return Ok(range.contains(&root_version).then_some(root_version));
         }
 
         tokio::runtime::Handle::current().block_on(choose_package_version(
@@ -266,14 +274,15 @@ impl DependencyProvider for RDependencyProvider {
         package: &Self::P,
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
-        if package == &self.root_package {
+        let (root_package, _) = self.root_package()?;
+        if package == &root_package {
             let constraints = self
                 .root_dependencies
                 .iter()
                 .map(|(package, range)| (package.clone(), range.clone()))
                 .collect::<DependencyConstraints<_, _>>();
 
-            self.prefetch_descriptions(&constraints);
+            self.prefetch_descriptions(&constraints)?;
 
             return Ok(Dependencies::Available(constraints));
         }
@@ -296,7 +305,7 @@ impl DependencyProvider for RDependencyProvider {
         let constraints =
             dependency_constraints_from_description(Arc::clone(&version.repository), &description);
 
-        self.prefetch_descriptions(&constraints);
+        self.prefetch_descriptions(&constraints)?;
 
         Ok(Dependencies::Available(constraints))
     }
@@ -418,8 +427,7 @@ pub fn is_base_package(package: &str) -> bool {
 pub(crate) async fn resolve_from_registry(
     client: http::HttpClient,
     repositories: Vec<Arc<dyn PackageRepository>>,
-    root_package: String,
-    root_version: PackageVersion,
+    root: Arc<LocalRepository>,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
 ) -> Result<Vec<(String, PackageVersion)>, ResolutionError> {
@@ -428,8 +436,6 @@ pub(crate) async fn resolve_from_registry(
     }
 
     let root_count = root_relations.len();
-    let root_dependencies = root_dependency_ranges(&root_version, &root_relations);
-
     let span = tracing::info_span!(
         "resolve_dependencies",
         roots = root_count,
@@ -442,19 +448,22 @@ pub(crate) async fn resolve_from_registry(
     span.pb_set_message("resolve dependencies");
     span.pb_start();
 
-    let provider = RDependencyProvider::new(
-        client,
-        repositories,
-        root_package.clone(),
-        root_version.clone(),
-        root_dependencies,
-        preferred_versions,
-    );
-
     let resolve_span = span.clone();
     let selected = tokio::task::spawn_blocking(move || {
         let _enter = resolve_span.enter();
         resolve_span.record("stage", "solving");
+
+        let (root_package, root_version) = tokio::runtime::Handle::current()
+            .block_on(root.package())
+            .map_err(ProviderError::from)?;
+        let root_dependencies = root_dependency_ranges(&root_version, &root_relations);
+        let provider = RDependencyProvider::new(
+            client,
+            repositories,
+            root,
+            root_dependencies,
+            preferred_versions,
+        );
 
         let selected = resolve(&provider, root_package.clone(), root_version)?;
 
@@ -466,7 +475,7 @@ pub(crate) async fn resolve_from_registry(
         selected.sort_by(|left, right| left.0.cmp(&right.0));
         resolve_span.record("selected", selected.len());
 
-        Ok::<_, PubGrubError<RDependencyProvider>>(selected)
+        Ok::<_, ResolutionError>(selected)
     })
     .await??;
 
@@ -608,9 +617,18 @@ mod tests {
         )
     }
 
-    #[test]
-    fn root_name_is_reserved_for_the_supplied_version() {
-        let local_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository::empty("local"));
+    fn local_repository(package: &str, version: &str) -> Arc<LocalRepository> {
+        let description = format!("Package: {package}\nVersion: {version}\n")
+            .parse()
+            .expect("valid local DESCRIPTION");
+        Arc::new(
+            LocalRepository::new(std::path::PathBuf::from("unused")).with_description(description),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_name_is_reserved_for_the_supplied_version() {
+        let local_repository = local_repository("project", "1.0.0");
         let candidate_repository: Arc<dyn PackageRepository> =
             Arc::new(TestRepository::empty("candidate"));
         let mut packages = BTreeMap::new();
@@ -627,57 +645,65 @@ mod tests {
             version_queries: Mutex::new(Vec::new()),
             description_queries: Mutex::new(Vec::new()),
         });
-        let root_version = version("1.0.0", local_repository);
+        let (_, root_version) = local_repository.package().await.expect("root should load");
         let provider = RDependencyProvider::new(
             http::client(),
             vec![remote_repository.clone()],
-            "project".to_string(),
-            root_version.clone(),
+            local_repository,
             BTreeMap::new(),
             BTreeMap::new(),
         );
-
-        assert_eq!(
-            provider
-                .choose_version(&"project".to_string(), &Ranges::full())
-                .expect("root selection should succeed"),
-            Some(root_version.clone())
-        );
+        let expected = root_version.clone();
         let incompatible =
             Ranges::higher_than(version("2.0.0", Arc::clone(root_version.repository())));
-        assert_eq!(
-            provider
-                .choose_version(&"project".to_string(), &incompatible)
-                .expect("root selection should succeed"),
-            None
-        );
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                provider
+                    .choose_version(&"project".to_string(), &Ranges::full())
+                    .expect("root selection should succeed"),
+                Some(expected)
+            );
+            assert_eq!(
+                provider
+                    .choose_version(&"project".to_string(), &incompatible)
+                    .expect("root selection should succeed"),
+                None
+            );
+        })
+        .await
+        .expect("root selection task should join");
         assert_eq!(remote_repository.package_queries.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn prefetch_does_not_query_the_root_package() {
-        let local_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository::empty("local"));
+        let local_repository = local_repository("project", "1.0.0");
         let remote_repository = Arc::new(TestRepository::empty("remote"));
         let provider = RDependencyProvider::new(
             http::client(),
             vec![remote_repository.clone()],
-            "project".to_string(),
-            version("1.0.0", local_repository),
+            local_repository,
             BTreeMap::new(),
             BTreeMap::new(),
         );
         let constraints =
             DependencyConstraints::from_iter([("project".to_string(), Ranges::full())]);
 
-        provider.prefetch_descriptions(&constraints);
+        tokio::task::spawn_blocking(move || {
+            provider
+                .prefetch_descriptions(&constraints)
+                .expect("prefetch should succeed");
+        })
+        .await
+        .expect("prefetch task should join");
 
         assert_eq!(remote_repository.package_queries.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn root_dependencies_preserve_explicit_constraints() {
-        let local_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository::empty("local"));
-        let root_version = version("1.0.0", Arc::clone(&local_repository));
+        let local_repository = local_repository("project", "1.0.0");
+        let (_, root_version) = local_repository.package().await.expect("root should load");
         let suggested_version = Version::from_str("2.0.0").expect("valid test version");
         let suggested = Relation::new(
             "suggested",
@@ -688,35 +714,37 @@ mod tests {
         let provider = RDependencyProvider::new(
             http::client(),
             Vec::new(),
-            "project".to_string(),
-            root_version.clone(),
+            Arc::clone(&local_repository),
             root_dependencies,
             BTreeMap::new(),
         );
 
-        let Dependencies::Available(constraints) = provider
-            .get_dependencies(&"project".to_string(), &root_version)
-            .expect("root dependencies should be available")
-        else {
+        let Dependencies::Available(constraints) = tokio::task::spawn_blocking(move || {
+            provider
+                .get_dependencies(&"project".to_string(), &root_version)
+                .expect("root dependencies should be available")
+        })
+        .await
+        .expect("root dependency task should join") else {
             panic!("root dependencies should be available");
         };
         let range = constraints
             .get("suggested")
             .expect("caller-supplied relation should be preserved");
 
+        let local_repository: Arc<dyn PackageRepository> = local_repository;
         assert!(!range.contains(&version("1.9.9", Arc::clone(&local_repository))));
         assert!(range.contains(&version("2.0.0", local_repository)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolution_filters_the_actual_root_without_remote_queries() {
-        let local_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository::empty("local"));
+        let local_repository = local_repository("project", "1.0.0");
         let remote_repository = Arc::new(TestRepository::empty("remote"));
         let selected = resolve_from_registry(
             http::client(),
             vec![remote_repository.clone()],
-            "project".to_string(),
-            version("1.0.0", local_repository),
+            local_repository,
             BTreeSet::from([Relation::simple("base")]),
             BTreeMap::new(),
         )
@@ -729,7 +757,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn backtracks_instead_of_replacing_the_fixed_root() {
-        let local_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository::empty("local"));
+        let local_repository = local_repository("project", "1.0.1");
         let mut metadata_repository = TestRepository::empty("remote metadata");
         metadata_repository.descriptions.insert(
             (
@@ -777,8 +805,7 @@ mod tests {
         let selected = resolve_from_registry(
             http::client(),
             vec![remote_repository.clone()],
-            "project".to_string(),
-            version("1.0.1", local_repository),
+            local_repository,
             BTreeSet::from([Relation::new(
                 "testthat",
                 Some((
