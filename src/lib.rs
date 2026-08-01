@@ -88,8 +88,6 @@ use crate::{
     resolver::PackageVersion,
 };
 
-type RpxResult<T> = Result<T, RpxError>;
-
 const SYNC_SHARED_WORKERS: usize = 50;
 const SYNC_INSTALL_WORKERS: usize = 8;
 
@@ -391,7 +389,7 @@ fn read_project_lockfile_raw_optional() -> Result<Option<Lockfile>, ProjectError
 
 fn read_current_project_lockfile_optional(
     description: &RDescription,
-) -> RpxResult<Option<Lockfile>> {
+) -> Result<Option<Lockfile>, RpxError> {
     let Some(lockfile) = read_project_lockfile_raw_optional()? else {
         return Ok(None);
     };
@@ -462,7 +460,7 @@ fn progress_bar_style() -> ProgressStyle {
     .expect("progress bar style should be valid")
 }
 
-async fn run_inner() -> RpxResult<()> {
+async fn run_inner() -> Result<(), RpxError> {
     init_tracing();
 
     let cli = Cli::parse();
@@ -512,7 +510,7 @@ async fn run_inner() -> RpxResult<()> {
     }
 }
 
-fn cmd_init() -> RpxResult<()> {
+fn cmd_init() -> Result<(), RpxError> {
     let path = init_description()?;
     status(format_args!("Initialized project at {path}"));
     status("Next: run `rpx add <package>` or `rpx lock`");
@@ -522,7 +520,7 @@ fn cmd_init() -> RpxResult<()> {
 async fn cmd_add(
     packages: &[String],
     repository_preference: DefaultRepositoryPreference,
-) -> RpxResult<()> {
+) -> Result<(), RpxError> {
     let packages = packages
         .iter()
         .map(|package| parse_add_package(package))
@@ -574,7 +572,9 @@ async fn cmd_add(
 
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
-    let _ = sync_from_lockfile(false, false).await?;
+    let project = validate_project_for_sync(&description, &lockfile).await?;
+    sync_system_dependencies(&lockfile, false, false)?;
+    let _ = sync_locked_project(&description, &lockfile, &project).await?;
     status(format_args!(
         "Added {}",
         packages
@@ -586,7 +586,7 @@ async fn cmd_add(
     Ok(())
 }
 
-async fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
+async fn cmd_repo(command: RepoCommands) -> Result<(), RpxError> {
     match command {
         RepoCommands::Add { url } => cmd_repo_add(&url).await,
         RepoCommands::Remove {
@@ -597,7 +597,7 @@ async fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
     }
 }
 
-async fn cmd_repo_add(url: &str) -> RpxResult<()> {
+async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
@@ -661,7 +661,7 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     Ok(())
 }
 
-async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
+async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxError> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
@@ -723,7 +723,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     Ok(())
 }
 
-async fn cmd_repo_list() -> RpxResult<()> {
+async fn cmd_repo_list() -> Result<(), RpxError> {
     let description = read_description()?;
     let lockfile = read_current_project_lockfile_optional(&description)?;
     let additional_repositories = description.additional_repositories().unwrap_or_default();
@@ -762,7 +762,7 @@ async fn cmd_repo_list() -> RpxResult<()> {
 async fn cmd_remove(
     packages: &[String],
     repository_preference: DefaultRepositoryPreference,
-) -> RpxResult<()> {
+) -> Result<(), RpxError> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let repositories = repository_preference
@@ -811,7 +811,9 @@ async fn cmd_remove(
 
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
-    let _ = sync_from_lockfile(false, false).await?;
+    let project = validate_project_for_sync(&description, &lockfile).await?;
+    sync_system_dependencies(&lockfile, false, false)?;
+    let _ = sync_locked_project(&description, &lockfile, &project).await?;
 
     if !removed.is_empty() {
         status(format_args!("Removed {}", removed.join(", ")));
@@ -825,7 +827,7 @@ async fn cmd_remove(
     Ok(())
 }
 
-async fn cmd_run(command: &[String]) -> RpxResult<()> {
+async fn cmd_run(command: &[String]) -> Result<(), RpxError> {
     let (program, args) = command
         .split_first()
         .expect("run command requires at least one argument");
@@ -843,7 +845,7 @@ async fn cmd_run(command: &[String]) -> RpxResult<()> {
     Ok(())
 }
 
-async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResult<()> {
+async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<(), RpxError> {
     let description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let repositories = repository_preference
@@ -877,15 +879,17 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
     Ok(())
 }
 
-async fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
-    if (install_system || install_only_system) && !host_supports_system_sync() {
-        return Err(SyncError::UnsupportedSystemInstall.into());
-    }
+async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), RpxError> {
+    let description = read_description()?;
+    let lockfile = read_project_lockfile()?;
+    let project = validate_project_for_sync(&description, &lockfile).await?;
 
-    let outcome = sync_from_lockfile(install_system, install_only_system).await?;
+    sync_system_dependencies(&lockfile, install_system, install_only_system)?;
     if install_only_system {
         return Ok(());
     }
+
+    let outcome = sync_locked_project(&description, &lockfile, &project).await?;
     if outcome.installed == 0 && outcome.removed == 0 {
         status("Project library is already in sync");
     } else {
@@ -894,7 +898,7 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<
     Ok(())
 }
 
-async fn cmd_status() -> RpxResult<()> {
+async fn cmd_status() -> Result<(), RpxError> {
     let description = read_description()?;
     let project =
         project_package(&description).map_err(|source| LockError::Repository { source })?;
@@ -1047,7 +1051,7 @@ async fn cmd_status() -> RpxResult<()> {
     std::process::exit(1);
 }
 
-fn cmd_clean() -> RpxResult<()> {
+fn cmd_clean() -> Result<(), RpxError> {
     let mut removed_any = false;
 
     removed_any |= remove_dir_if_exists(&project_library_root_path(), "project library")?;
@@ -1061,7 +1065,7 @@ fn cmd_clean() -> RpxResult<()> {
     Ok(())
 }
 
-fn remove_dir_if_exists(path: &Path, label: &str) -> RpxResult<bool> {
+fn remove_dir_if_exists(path: &Path, label: &str) -> Result<bool, RpxError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -1211,7 +1215,7 @@ enum LockfileCompatibilityError {
 fn roots_from_lockfile_or_description(
     lockfile: Option<&Lockfile>,
     description: &RDescription,
-) -> RpxResult<BTreeSet<Relation>> {
+) -> Result<BTreeSet<Relation>, RpxError> {
     match lockfile {
         Some(lockfile) => roots_from_lockfile(lockfile)
             .map_err(|details| LockError::ResolveFailed { details }.into()),
@@ -1412,7 +1416,7 @@ fn invalid_add_constraint(package: &str, details: impl Into<String>) -> AddError
 async fn add_relations_for_packages(
     repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
-) -> RpxResult<BTreeSet<Relation>> {
+) -> Result<BTreeSet<Relation>, RpxError> {
     let non_base_packages = packages
         .iter()
         .filter(|package| !is_base_package(package))
@@ -1442,7 +1446,7 @@ async fn add_relations_for_packages(
 async fn latest_package_versions_for_add(
     repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
-) -> RpxResult<BTreeMap<String, PackageVersion>> {
+) -> Result<BTreeMap<String, PackageVersion>, RpxError> {
     if packages.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -1601,7 +1605,7 @@ fn preferred_versions_from_lockfile(
     lockfile: Option<&Lockfile>,
     repositories: &[Arc<dyn PackageRepository>],
     excluded_packages: &BTreeSet<String>,
-) -> RpxResult<BTreeMap<String, PackageVersion>> {
+) -> Result<BTreeMap<String, PackageVersion>, RpxError> {
     let Some(lockfile) = lockfile else {
         return Ok(BTreeMap::new());
     };
@@ -1632,7 +1636,7 @@ fn preferred_versions_from_lockfile(
 fn repository_for_locked_package(
     repositories: &[Arc<dyn PackageRepository>],
     package: &LockedPackage,
-) -> RpxResult<Arc<dyn PackageRepository>> {
+) -> Result<Arc<dyn PackageRepository>, RpxError> {
     if let Some(source_url) = package.source_url.as_deref()
         && let Some(repository) = repositories.iter().find(|repository| {
             remote_repository_url(repository.as_ref())
@@ -1666,7 +1670,7 @@ fn remote_repository_url(repository: &dyn PackageRepository) -> Option<&reqwest:
 fn apply_added_packages_to_description(
     description: &mut RDescription,
     added_relations: &BTreeSet<Relation>,
-) -> RpxResult<()> {
+) -> Result<(), RpxError> {
     let added_packages = added_relations
         .iter()
         .map(|relation| relation.name())
@@ -1788,32 +1792,27 @@ fn load_sysreq_snapshot_for_lock_blocking(
     empty_sysreq_snapshot()
 }
 
-async fn sync_from_lockfile(
-    install_system: bool,
-    install_only_system: bool,
-) -> RpxResult<SyncOutcome> {
-    let description = read_description()?;
+async fn validate_project_for_sync(
+    description: &RDescription,
+    lockfile: &Lockfile,
+) -> Result<ProjectPackage, RpxError> {
     let project =
-        project_package(&description).map_err(|source| LockError::Repository { source })?;
-    let manifest_requirements = manifest_requirement_names(&description);
-    let lockfile = read_project_lockfile()?;
-    validate_lockfile_compatibility_for_sync(&lockfile)?;
-    if !lockfile_supports_project(&lockfile, &project) {
+        project_package(description).map_err(|source| LockError::Repository { source })?;
+    validate_lockfile_compatibility_for_sync(lockfile)?;
+    if !lockfile_supports_project(lockfile, &project) {
         return Err(SyncError::LockfileOlder.into());
     }
-    validate_runtime_for_sync(&lockfile).await?;
-    if host_supports_system_sync() {
-        let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
-            warning(RpxWarning::SystemPlanFailed { details: error });
-            system_plan_without_db(&lockfile)
-        });
-        let proceed_with_r =
-            handle_system_requirements(&system_plan, install_system, install_only_system)?;
-        if install_only_system || !proceed_with_r {
-            return Ok(SyncOutcome::default());
-        }
-    }
-    let lock_requirements = lockfile_requirement_names(&lockfile);
+    validate_runtime_for_sync(lockfile).await?;
+    Ok(project)
+}
+
+async fn sync_locked_project(
+    description: &RDescription,
+    lockfile: &Lockfile,
+    project: &ProjectPackage,
+) -> Result<SyncOutcome, RpxError> {
+    let manifest_requirements = manifest_requirement_names(description);
+    let lock_requirements = lockfile_requirement_names(lockfile);
 
     if manifest_requirements != lock_requirements {
         return Err(SyncError::LockfileOlder.into());
@@ -1840,7 +1839,7 @@ async fn sync_from_lockfile(
         let _ = remove_packages_from_venv(std::slice::from_ref(&project.name));
     }
 
-    let root_dependencies = locked_dependencies_from_description(&description)
+    let root_dependencies = locked_dependencies_from_description(description)
         .map_err(|details| SyncError::ProjectInstallFailed { details })?;
     let root_package = LockedPackage {
         package: project.name.clone(),
@@ -1901,7 +1900,7 @@ async fn lockfile_from_roots(
     preferred_versions: BTreeMap<String, PackageVersion>,
     existing_lockfile: Option<&Lockfile>,
     r_version: Option<&str>,
-) -> RpxResult<Lockfile> {
+) -> Result<Lockfile, RpxError> {
     let selected = resolve_from_registry(
         repositories.clone(),
         root,
@@ -2169,7 +2168,7 @@ fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCo
     Ok(())
 }
 
-fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
+fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) -> Result<(), RpxError> {
     match validate_lockfile_compatibility(lockfile) {
         Ok(()) => Ok(()),
         Err(LockfileCompatibilityError::Older) => Err(SyncError::LockfileOlder.into()),
@@ -2258,11 +2257,30 @@ fn host_supports_system_sync() -> bool {
     matches!(current_host_platform(), sysreqs::HostPlatform::Linux { .. })
 }
 
+fn sync_system_dependencies(
+    lockfile: &Lockfile,
+    install_system: bool,
+    install_only_system: bool,
+) -> Result<(), RpxError> {
+    if !host_supports_system_sync() {
+        if install_system || install_only_system {
+            return Err(SyncError::UnsupportedSystemInstall.into());
+        }
+        return Ok(());
+    }
+
+    let plan = system_plan_from_lockfile(lockfile).unwrap_or_else(|error| {
+        warning(RpxWarning::SystemPlanFailed { details: error });
+        system_plan_without_db(lockfile)
+    });
+    handle_system_requirements(&plan, install_system, install_only_system)
+}
+
 fn handle_system_requirements(
     plan: &SystemDependencyPlan,
     install_system: bool,
     install_only_system: bool,
-) -> RpxResult<bool> {
+) -> Result<(), RpxError> {
     let explicit_install = install_system || install_only_system;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let mut plan = plan.clone();
@@ -2299,7 +2317,7 @@ fn handle_system_requirements(
         if install_only_system {
             status("System dependencies are already installed");
         }
-        return Ok(!install_only_system);
+        return Ok(());
     }
 
     if plan.installed_query_error.is_none() {
@@ -2330,14 +2348,13 @@ fn handle_system_requirements(
         ui.finish();
         if install_only_system {
             status("System dependency sync complete.");
-            return Ok(false);
         }
-        return Ok(true);
+        return Ok(());
     }
 
     if !interactive {
         warning(RpxWarning::ContinuingWithoutSystemDependencies);
-        return Ok(!install_only_system);
+        return Ok(());
     }
 
     match prompt_for_system_dependency_action() {
@@ -2348,9 +2365,9 @@ fn handle_system_requirements(
                 return Err(SyncError::SystemDependenciesFailed { details: error }.into());
             }
             ui.finish();
-            Ok(true)
+            Ok(())
         }
-        SyncSystemChoice::TryROnly => Ok(true),
+        SyncSystemChoice::TryROnly => Ok(()),
         SyncSystemChoice::Cancel => {
             status("Canceled");
             std::process::exit(1);
@@ -2431,7 +2448,7 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
     }
 }
 
-async fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
+async fn validate_runtime_for_sync(lockfile: &Lockfile) -> Result<(), RpxError> {
     let status = runtime_status(lockfile).await;
 
     if let Some(version_mismatch) = status.version_mismatch {
