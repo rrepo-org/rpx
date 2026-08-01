@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Cursor, IsTerminal, Read};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -26,11 +26,15 @@ use crate::output::try_prompt;
 pub type HttpClient = reqwest_middleware::ClientWithMiddleware;
 const KEYRING_SERVICE: &str = "rpx";
 
-pub fn client() -> HttpClient {
+static HTTP_CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
     ClientBuilder::new(reqwest::Client::new())
         .with(AuthMiddleware::new(AuthManager::new()))
         .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
         .build()
+});
+
+pub fn client() -> HttpClient {
+    HTTP_CLIENT.clone()
 }
 
 #[derive(Debug, Clone)]
@@ -586,19 +590,13 @@ fn parse_packages_relations_field(
         .map(Option::unwrap_or_default)
 }
 
-async fn get_response(
-    client: &HttpClient,
-    url: reqwest::Url,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    client.get(url.clone()).send().await
+async fn get_response(url: reqwest::Url) -> Result<reqwest::Response, reqwest_middleware::Error> {
+    client().get(url.clone()).send().await
 }
 
-async fn artifact_response(
-    client: &HttpClient,
-    url: reqwest::Url,
-) -> Result<ArtifactResponse, HttpError> {
+async fn artifact_response(url: reqwest::Url) -> Result<ArtifactResponse, HttpError> {
     let response =
-        client
+        client()
             .get(url.clone())
             .send()
             .await
@@ -620,7 +618,6 @@ async fn artifact_response(
 }
 
 pub async fn rrepo_repository_packages(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -629,11 +626,10 @@ pub async fn rrepo_repository_packages(
         .pop_if_empty()
         .push("packages");
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn rrepo_package_versions(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -643,11 +639,10 @@ pub async fn rrepo_package_versions(
         .pop_if_empty()
         .extend(["packages", package, "versions"]);
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn rrepo_package_description(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -658,11 +653,10 @@ pub async fn rrepo_package_description(
         .pop_if_empty()
         .extend(["packages", package, "versions", version, "description"]);
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn rrepo_source_artifact(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -673,11 +667,10 @@ pub async fn rrepo_source_artifact(
         .pop_if_empty()
         .extend(["packages", package, "versions", version, "source"]);
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn rrepo_windows_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -691,11 +684,10 @@ pub async fn rrepo_windows_binary(
             "packages", package, "versions", version, "binaries", "windows", r_minor,
         ]);
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn rrepo_macos_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -710,11 +702,10 @@ pub async fn rrepo_macos_binary(
             "packages", package, "versions", version, "binaries", "macos", target, r_minor,
         ]);
 
-    get_response(client, url).await
+    get_response(url).await
 }
 
 pub async fn cran_packages(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -723,11 +714,10 @@ pub async fn cran_packages(
         .pop_if_empty()
         .extend(["src", "contrib", "PACKAGES"]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_archive_root(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -736,11 +726,10 @@ pub async fn cran_archive_root(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", ""]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_package_archive_listing(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -750,11 +739,10 @@ pub async fn cran_package_archive_listing(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, ""]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_current_source_tarball(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -766,11 +754,10 @@ pub async fn cran_current_source_tarball(
         .pop_if_empty()
         .extend(["src", "contrib", &file_name]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_archive_source_tarball(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -782,11 +769,10 @@ pub async fn cran_archive_source_tarball(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, &file_name]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_latest_package_description(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -796,11 +782,10 @@ pub async fn cran_latest_package_description(
         .pop_if_empty()
         .extend(["web", "packages", package, "DESCRIPTION"]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_windows_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     r_minor: &str,
     package: &str,
@@ -813,11 +798,10 @@ pub async fn cran_windows_binary(
         .pop_if_empty()
         .extend(["bin", "windows", "contrib", r_minor, &file_name]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 pub async fn cran_macos_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     target: &str,
     r_minor: &str,
@@ -831,7 +815,7 @@ pub async fn cran_macos_binary(
         .pop_if_empty()
         .extend(["bin", "macosx", target, "contrib", r_minor, &file_name]);
 
-    client.get(url).send().await
+    get_response(url).await
 }
 
 async fn description_body_from_source_artifact(

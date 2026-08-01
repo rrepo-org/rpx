@@ -61,7 +61,6 @@ use r::{
     InstallFailure, base_packages, install_local_package, install_project_package,
     installed_packages,
 };
-use repository::DEFAULT_REGISTRY_BASE_URL;
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
@@ -82,8 +81,9 @@ use crate::{
         remove_packages_from_venv,
     },
     repository::{
-        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
-        RrepoRepository, parse_repository_url,
+        ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
+        PackageRepository, RepositoryError, RrepoRepository, built_in_repository,
+        parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -529,9 +529,8 @@ async fn cmd_add(
         .collect::<Result<Vec<_>, _>>()?;
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
     let repositories = repository_preference
-        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .package_repositories(&description, current_lockfile.as_ref())
         .await
         .map_err(|source| LockError::Repository { source })?;
 
@@ -543,8 +542,7 @@ async fn cmd_add(
         .filter(|package| !roots_contain_package(&desired_roots, &package.name))
         .map(|package| package.name.clone())
         .collect::<Vec<_>>();
-    let mut added_relations =
-        add_relations_for_packages(&client, &repositories, &new_packages).await?;
+    let mut added_relations = add_relations_for_packages(&repositories, &new_packages).await?;
     desired_roots.extend(added_relations.iter().cloned());
 
     for package in &packages {
@@ -563,7 +561,6 @@ async fn cmd_add(
         &new_packages.iter().cloned().collect::<BTreeSet<_>>(),
     )?;
     let lockfile = lockfile_from_roots(
-        &client,
         project_repository(&description),
         repositories,
         desired_roots,
@@ -603,12 +600,11 @@ async fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
 async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
-        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .package_repositories(&description, current_lockfile.as_ref())
         .await
         .map_err(|source| LockError::Repository { source })?;
-    let new_repo = <dyn PackageRepository>::from_url(&client, url)
+    let new_repo = <dyn PackageRepository>::from_url(url)
         .await
         .map_err(|source| RepoError::Add {
             url: url.trim().to_string(),
@@ -650,7 +646,6 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
         &BTreeSet::new(),
     )?;
     let lockfile = lockfile_from_roots(
-        &client,
         project_repository(&description),
         repositories,
         roots,
@@ -669,9 +664,8 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
 async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
-        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .package_repositories(&description, current_lockfile.as_ref())
         .await
         .map_err(|source| LockError::Repository { source })?;
     let base_url = parse_repository_url(url).map_err(|source| RepoError::Add {
@@ -708,7 +702,6 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
         &BTreeSet::new(),
     )?;
     let lockfile = lockfile_from_roots(
-        &client,
         project_repository(&description),
         repositories,
         roots,
@@ -772,9 +765,8 @@ async fn cmd_remove(
 ) -> RpxResult<()> {
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
     let repositories = repository_preference
-        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .package_repositories(&description, current_lockfile.as_ref())
         .await
         .map_err(|source| LockError::Repository { source })?;
 
@@ -808,7 +800,6 @@ async fn cmd_remove(
         .cloned()
         .collect::<Vec<_>>();
     let lockfile = lockfile_from_roots(
-        &client,
         project_repository(&description),
         repositories,
         desired_roots,
@@ -855,9 +846,8 @@ async fn cmd_run(command: &[String]) -> RpxResult<()> {
 async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResult<()> {
     let description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
-    let client = http::client();
     let repositories = repository_preference
-        .package_repositories(&client, &description, current_lockfile.as_ref())
+        .package_repositories(&description, current_lockfile.as_ref())
         .await
         .map_err(|source| LockError::Repository { source })?;
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
@@ -868,7 +858,6 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
     )?;
 
     let lockfile = lockfile_from_roots(
-        &client,
         project_repository(&description),
         repositories,
         roots,
@@ -1117,17 +1106,16 @@ impl DefaultRepositoryPreference {
 
     async fn package_repositories(
         self,
-        client: &http::HttpClient,
         description: &RDescription,
         lockfile: Option<&Lockfile>,
     ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
         let mut repos = match lockfile {
             Some(lockfile) => package_repositories_from_lockfile(lockfile)?,
-            None => package_repositories_from_description(client, description).await?,
+            None => package_repositories_from_description(description).await?,
         };
 
         if self == Self::Enabled || (self == Self::FromLockfileOrDefault && lockfile.is_none()) {
-            let default = default_repository(client).await?;
+            let default = default_repository().await?;
             if !repos
                 .iter()
                 .any(|repository| repository.as_ref() == default.as_ref())
@@ -1165,7 +1153,6 @@ fn package_repositories_from_lockfile(
 }
 
 async fn package_repositories_from_description(
-    client: &http::HttpClient,
     description: &RDescription,
 ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
     let additional_repositories = description.additional_repositories().unwrap_or_default();
@@ -1173,7 +1160,7 @@ async fn package_repositories_from_description(
     futures_util::future::join_all(
         additional_repositories
             .iter()
-            .map(|url| async move { <dyn PackageRepository>::from_url(client, url).await }),
+            .map(|url| async move { <dyn PackageRepository>::from_url(url).await }),
     )
     .await
     .into_iter()
@@ -1423,7 +1410,6 @@ fn invalid_add_constraint(package: &str, details: impl Into<String>) -> AddError
 }
 
 async fn add_relations_for_packages(
-    client: &http::HttpClient,
     repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
 ) -> RpxResult<BTreeSet<Relation>> {
@@ -1432,8 +1418,7 @@ async fn add_relations_for_packages(
         .filter(|package| !is_base_package(package))
         .cloned()
         .collect::<Vec<_>>();
-    let latest_versions =
-        latest_package_versions_for_add(client, repositories, &non_base_packages).await?;
+    let latest_versions = latest_package_versions_for_add(repositories, &non_base_packages).await?;
     let mut relations = BTreeSet::new();
 
     for package in packages {
@@ -1455,7 +1440,6 @@ async fn add_relations_for_packages(
 }
 
 async fn latest_package_versions_for_add(
-    client: &http::HttpClient,
     repositories: &[Arc<dyn PackageRepository>],
     packages: &[String],
 ) -> RpxResult<BTreeMap<String, PackageVersion>> {
@@ -1466,16 +1450,14 @@ async fn latest_package_versions_for_add(
     let requested = packages.iter().cloned().collect::<BTreeSet<_>>();
     let mut selected = BTreeMap::<String, PackageVersion>::new();
     let mut known_packages = BTreeSet::<String>::new();
-    let package_indexes = futures_util::future::join_all(repositories.iter().map(|repository| {
-        let client = &client;
-        async move {
+    let package_indexes =
+        futures_util::future::join_all(repositories.iter().map(|repository| async {
             repository
-                .packages(client)
+                .packages()
                 .await
                 .map_err(|details| (repository.to_string(), details))
-        }
-    }))
-    .await;
+        }))
+        .await;
 
     for result in package_indexes {
         let available = result.map_err(|(url, details)| LockError::ResolveFailed {
@@ -1870,13 +1852,7 @@ async fn sync_from_lockfile(
     let mut packages = lockfile.packages.values().cloned().collect::<Vec<_>>();
     packages.push(root_package);
 
-    install_locked_packages(
-        http::client(),
-        packages,
-        lockfile.repositories.clone(),
-        &project.name,
-    )
-    .await?;
+    install_locked_packages(packages, lockfile.repositories.clone(), &project.name).await?;
 
     return Ok(outcome);
 }
@@ -1887,23 +1863,17 @@ pub(crate) fn exit_with_status(code: Option<i32>) {
     }
 }
 
-async fn default_repository(
-    client: &http::HttpClient,
-) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+async fn default_repository() -> Result<Arc<dyn PackageRepository>, RepositoryError> {
     match env::var("RPX_REGISTRY_BASE_URL") {
-        Ok(url) => <dyn PackageRepository>::from_url(client, &url).await,
+        Ok(url) => <dyn PackageRepository>::from_url(&url).await,
 
-        Err(_) => {
-            let url = parse_repository_url(DEFAULT_REGISTRY_BASE_URL)?;
-
-            Ok(Arc::new(RrepoRepository::new(url)))
-        }
+        Err(_) => Ok(built_in_repository()),
     }
 }
 
 fn default_repository_base_url() -> Result<reqwest::Url, RepositoryError> {
-    let value =
-        env::var("RPX_REGISTRY_BASE_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string());
+    let value = env::var("RPX_REGISTRY_BASE_URL")
+        .unwrap_or_else(|_| BUILT_IN_REPOSITORY_BASE_URL.to_string());
     parse_repository_url(&value)
 }
 
@@ -1925,7 +1895,6 @@ fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str
 }
 
 async fn lockfile_from_roots(
-    client: &http::HttpClient,
     root: Arc<LocalRepository>,
     repositories: Vec<Arc<dyn PackageRepository>>,
     roots: BTreeSet<Relation>,
@@ -1934,7 +1903,6 @@ async fn lockfile_from_roots(
     r_version: Option<&str>,
 ) -> RpxResult<Lockfile> {
     let selected = resolve_from_registry(
-        client.clone(),
         repositories.clone(),
         root,
         roots.clone(),
@@ -1944,20 +1912,12 @@ async fn lockfile_from_roots(
     .map_err(lock_error_from_resolution)?;
 
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile).await;
-    lockfile_from_selected_versions(
-        client,
-        roots,
-        selected,
-        &sysreq_db,
-        &repositories,
-        r_version,
-    )
-    .await
-    .map_err(Into::into)
+    lockfile_from_selected_versions(roots, selected, &sysreq_db, &repositories, r_version)
+        .await
+        .map_err(Into::into)
 }
 
 async fn lockfile_from_selected_versions(
-    client: &http::HttpClient,
     roots: BTreeSet<Relation>,
     selected: Vec<(String, PackageVersion)>,
     sysreq_db: &sysreqs::SysreqDbSnapshot,
@@ -1970,7 +1930,7 @@ async fn lockfile_from_selected_versions(
     for (name, version) in selected {
         let description = version
             .repository()
-            .description(&client, &name, version.version())
+            .description(&name, version.version())
             .await
             .map_err(|source| LockError::Repository { source })?;
 
@@ -2496,7 +2456,6 @@ fn r_minor_version(version: &str) -> Option<String> {
 }
 
 async fn install_locked_packages(
-    client: http::HttpClient,
     packages: Vec<LockedPackage>,
     repositories: Vec<LockedRepository>,
     project_package: &str,
@@ -2556,7 +2515,6 @@ async fn install_locked_packages(
         }
     })?);
     let repositories = Arc::new(repositories);
-    let client = Arc::new(client);
     let locked_names = Arc::new(locked_names);
     let installed_packages = Arc::new(Mutex::new(installed_packages));
     let shared_pool = Arc::new(Semaphore::new(SYNC_SHARED_WORKERS));
@@ -2627,7 +2585,6 @@ async fn install_locked_packages(
         let prepare_package = package.clone();
         let prepare_cache_key = cache_key.clone();
         let prepare_repositories = Arc::clone(&repositories);
-        let prepare_client = Arc::clone(&client);
         let prepare_r_minor = Arc::clone(&r_minor);
         let prepare_shared_pool = Arc::clone(&shared_pool);
         prepare_tasks.spawn(
@@ -2635,7 +2592,6 @@ async fn install_locked_packages(
                 let prepared = match prepare_shared_pool.acquire_owned().await {
                     Ok(_permit) => {
                         prepare_locked_package_artifact(
-                            prepare_client,
                             prepare_package,
                             prepare_cache_key,
                             prepare_repositories,
@@ -2762,7 +2718,6 @@ fn package_dependencies_installed(
 }
 
 async fn prepare_locked_package_artifact(
-    client: Arc<http::HttpClient>,
     package: LockedPackage,
     cache_key: CompiledPackageCacheKey,
     repositories: Arc<Vec<LockedRepository>>,
@@ -2788,7 +2743,6 @@ async fn prepare_locked_package_artifact(
     span.pb_start();
 
     prepare_locked_package_artifact_inner(
-        &client,
         package,
         &cache_key,
         &repositories,
@@ -2800,7 +2754,6 @@ async fn prepare_locked_package_artifact(
 }
 
 async fn prepare_locked_package_artifact_inner(
-    client: &http::HttpClient,
     package: LockedPackage,
     cache_key: &CompiledPackageCacheKey,
     repositories: &[LockedRepository],
@@ -2842,35 +2795,26 @@ async fn prepare_locked_package_artifact_inner(
     record_package_stage(&span, &package, "downloading binary");
 
     let binary = match (std::env::consts::OS, repository.kind) {
-        ("windows", LockedRepositoryKind::Rrepo) => http::rrepo_windows_binary(
-            &client,
-            &base_url,
-            &package.package,
-            &package.version,
-            r_minor,
-        )
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(response_for_status)
-        .map(|response| (response, "zip", "win.binary".to_string())),
+        ("windows", LockedRepositoryKind::Rrepo) => {
+            http::rrepo_windows_binary(&base_url, &package.package, &package.version, r_minor)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(response_for_status)
+                .map(|response| (response, "zip", "win.binary".to_string()))
+        }
 
-        ("windows", LockedRepositoryKind::CranLike) => http::cran_windows_binary(
-            &client,
-            &base_url,
-            r_minor,
-            &package.package,
-            &package.version,
-        )
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(response_for_status)
-        .map(|response| (response, "zip", "win.binary".to_string())),
+        ("windows", LockedRepositoryKind::CranLike) => {
+            http::cran_windows_binary(&base_url, r_minor, &package.package, &package.version)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(response_for_status)
+                .map(|response| (response, "zip", "win.binary".to_string()))
+        }
 
         ("macos", LockedRepositoryKind::Rrepo) => {
             let target = macos_binary_target()?;
 
             http::rrepo_macos_binary(
-                &client,
                 &base_url,
                 &package.package,
                 &package.version,
@@ -2887,7 +2831,6 @@ async fn prepare_locked_package_artifact_inner(
             let target = macos_binary_target()?;
 
             http::cran_macos_binary(
-                &client,
                 &base_url,
                 &target,
                 r_minor,
@@ -2926,13 +2869,7 @@ async fn prepare_locked_package_artifact_inner(
 
             let response = match repository.kind {
                 LockedRepositoryKind::Rrepo => {
-                    http::rrepo_source_artifact(
-                        &client,
-                        &base_url,
-                        &package.package,
-                        &package.version,
-                    )
-                    .await
+                    http::rrepo_source_artifact(&base_url, &package.package, &package.version).await
                 }
 
                 LockedRepositoryKind::CranLike => {
@@ -2943,7 +2880,6 @@ async fn prepare_locked_package_artifact_inner(
 
                     if source_url.contains("/src/contrib/Archive/") {
                         http::cran_archive_source_tarball(
-                            &client,
                             &base_url,
                             &package.package,
                             &package.version,
@@ -2951,7 +2887,6 @@ async fn prepare_locked_package_artifact_inner(
                         .await
                     } else {
                         http::cran_current_source_tarball(
-                            &client,
                             &base_url,
                             &package.package,
                             &package.version,
