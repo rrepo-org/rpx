@@ -1308,28 +1308,6 @@ fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
         .collect()
 }
 
-fn project_hard_requirement_names(description: &RDescription) -> BTreeSet<String> {
-    description
-        .imports()
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .chain(
-            description
-                .depends()
-                .into_iter()
-                .flat_map(|relations| relations.iter()),
-        )
-        .chain(
-            description
-                .linking_to()
-                .into_iter()
-                .flat_map(|relations| relations.iter()),
-        )
-        .map(|relation| relation.name())
-        .filter(|package| package != "R" && !is_base_package(package))
-        .collect()
-}
-
 fn lockfile_supports_project(lockfile: &Lockfile, project: &ProjectPackage) -> bool {
     if lockfile.packages.contains_key(&project.name) {
         return false;
@@ -1363,37 +1341,6 @@ fn locked_dependency_allows_version(
         });
 
     minimum_matches && maximum_matches
-}
-
-fn project_install_partitions(
-    description: &RDescription,
-    lockfile: &Lockfile,
-) -> (Vec<LockedPackage>, Vec<LockedPackage>) {
-    let mut pending = project_hard_requirement_names(description);
-    let mut before_project = BTreeSet::new();
-
-    while let Some(package) = pending.pop_first() {
-        let Some(locked) = lockfile.packages.get(&package) else {
-            continue;
-        };
-        if !before_project.insert(package) {
-            continue;
-        }
-
-        pending.extend(
-            locked
-                .dependencies
-                .iter()
-                .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
-                .map(|dependency| dependency.package.clone()),
-        );
-    }
-
-    lockfile
-        .packages
-        .values()
-        .cloned()
-        .partition(|package| before_project.contains(&package.package))
 }
 
 fn lockfile_requirement_names(lockfile: &Lockfile) -> BTreeSet<String> {
@@ -1911,22 +1858,25 @@ async fn sync_from_lockfile(
         let _ = remove_packages_from_venv(std::slice::from_ref(&project.name));
     }
 
-    let client = http::client();
-    let repositories = lockfile.repositories.clone();
-    let (before_project, after_project) = project_install_partitions(&description, &lockfile);
-    install_locked_packages(client.clone(), before_project, repositories.clone())
-        .await
-        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    let root_dependencies = locked_dependencies_from_description(&description)
+        .map_err(|details| SyncError::ProjectInstallFailed { details })?;
+    let root_package = LockedPackage {
+        package: project.name.clone(),
+        version: project.version.to_string(),
+        source: None,
+        source_url: None,
+        dependencies: root_dependencies,
+    };
+    let mut packages = lockfile.packages.values().cloned().collect::<Vec<_>>();
+    packages.push(root_package);
 
-    install_project_package(&project_root(), &project_library_path())
-        .await
-        .map_err(|failure| SyncError::ProjectInstallFailed {
-            details: install_failure_message(&project.name, &project.version.to_string(), &failure),
-        })?;
-
-    install_locked_packages(client, after_project, repositories)
-        .await
-        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    install_locked_packages(
+        http::client(),
+        packages,
+        lockfile.repositories.clone(),
+        &project.name,
+    )
+    .await?;
 
     return Ok(outcome);
 }
@@ -2549,7 +2499,8 @@ async fn install_locked_packages(
     client: http::HttpClient,
     packages: Vec<LockedPackage>,
     repositories: Vec<LockedRepository>,
-) -> Result<(), String> {
+    project_package: &str,
+) -> Result<(), SyncError> {
     let total_packages = packages.len() as u64;
     let sync_span = tracing::info_span!(
         "sync_packages",
@@ -2565,7 +2516,8 @@ async fn install_locked_packages(
     sync_span.pb_set_length(total_packages);
     sync_span.pb_start();
 
-    locked_package_install_order(&packages)?;
+    locked_package_install_order(&packages)
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
 
     let locked_names = packages
         .iter()
@@ -2579,7 +2531,7 @@ async fn install_locked_packages(
 
     let pending_packages = packages
         .into_iter()
-        .filter(|p| !installed_packages.contains(&p.package))
+        .filter(|p| p.package == project_package || !installed_packages.contains(&p.package))
         .collect::<Vec<_>>();
     let mut completed = total_packages.saturating_sub(pending_packages.len() as u64);
     sync_span.record("completed", completed);
@@ -2593,11 +2545,16 @@ async fn install_locked_packages(
         return Ok(());
     }
 
-    let r_version = Arc::new(r_version_async().await?);
-    let r_minor = Arc::new(
-        r_minor_version(r_version.as_str())
-            .ok_or_else(|| format!("failed to parse R minor version from {r_version}"))?,
+    let r_version = Arc::new(
+        r_version_async()
+            .await
+            .map_err(|details| SyncError::DownloadArtifactsFailed { details })?,
     );
+    let r_minor = Arc::new(r_minor_version(r_version.as_str()).ok_or_else(|| {
+        SyncError::DownloadArtifactsFailed {
+            details: format!("failed to parse R minor version from {r_version}"),
+        }
+    })?);
     let repositories = Arc::new(repositories);
     let client = Arc::new(client);
     let locked_names = Arc::new(locked_names);
@@ -2610,6 +2567,59 @@ async fn install_locked_packages(
 
     for package in pending_packages {
         let package_name = package.package.clone();
+        if package_name == project_package {
+            let install_locked_names = Arc::clone(&locked_names);
+            let install_installed_packages = Arc::clone(&installed_packages);
+            let install_installed_rx = installed_rx.clone();
+            let install_installed_tx = installed_tx.clone();
+            let install_shared_pool = Arc::clone(&shared_pool);
+            let install_pool = Arc::clone(&install_pool);
+            install_tasks.spawn(
+                async move {
+                    wait_for_locked_package_dependencies(
+                        &package,
+                        install_locked_names,
+                        Arc::clone(&install_installed_packages),
+                        install_installed_rx,
+                    )
+                    .await
+                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+
+                    let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
+                        SyncError::DownloadArtifactsFailed {
+                            details: "install pool closed before project installation".to_string(),
+                        }
+                    })?;
+                    let _shared_permit =
+                        install_shared_pool.acquire_owned().await.map_err(|_| {
+                            SyncError::DownloadArtifactsFailed {
+                                details: "sync work pool closed before project installation"
+                                    .to_string(),
+                            }
+                        })?;
+
+                    install_project_package(&project_root(), &project_library_path())
+                        .await
+                        .map_err(|failure| SyncError::ProjectInstallFailed {
+                            details: install_failure_message(
+                                &package.package,
+                                &package.version,
+                                &failure,
+                            ),
+                        })?;
+                    {
+                        let mut installed_packages = install_installed_packages.lock().await;
+                        installed_packages.insert(package_name.clone());
+                    }
+                    let _ = install_installed_tx.send(());
+
+                    Ok::<_, SyncError>(package_name)
+                }
+                .instrument(sync_span.clone()),
+            );
+            continue;
+        }
+
         let cache_key =
             CompiledPackageCacheKey::new(&package.package, &package.version, r_version.as_str());
         let (prepared_tx, prepared_rx) = oneshot::channel();
@@ -2649,9 +2659,14 @@ async fn install_locked_packages(
         let install_pool = Arc::clone(&install_pool);
         install_tasks.spawn(
             async move {
-                let prepared_artifact = prepared_rx.await.map_err(|_| {
-                    format!("{package_name} artifact preparation task ended without a result")
-                })??;
+                let prepared_artifact = prepared_rx
+                    .await
+                    .map_err(|_| SyncError::DownloadArtifactsFailed {
+                        details: format!(
+                            "{package_name} artifact preparation task ended without a result"
+                        ),
+                    })?
+                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
 
                 // Keep package spans out of the progress UI while blocked on dependency installs.
                 wait_for_locked_package_dependencies(
@@ -2660,26 +2675,31 @@ async fn install_locked_packages(
                     Arc::clone(&install_installed_packages),
                     install_installed_rx,
                 )
-                .await?;
+                .await
+                .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
 
-                let _install_permit = install_pool
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| "install pool closed before package installation".to_string())?;
-                let _shared_permit = install_shared_pool
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| "sync work pool closed before package installation".to_string())?;
+                let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
+                    SyncError::DownloadArtifactsFailed {
+                        details: "install pool closed before package installation".to_string(),
+                    }
+                })?;
+                let _shared_permit = install_shared_pool.acquire_owned().await.map_err(|_| {
+                    SyncError::DownloadArtifactsFailed {
+                        details: "sync work pool closed before package installation".to_string(),
+                    }
+                })?;
 
                 let installed =
-                    install_prepared_locked_package(package, cache_key, prepared_artifact).await?;
+                    install_prepared_locked_package(package, cache_key, prepared_artifact)
+                        .await
+                        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
                 {
                     let mut installed_packages = install_installed_packages.lock().await;
                     installed_packages.insert(installed.clone());
                 }
                 let _ = install_installed_tx.send(());
 
-                Ok::<_, String>(installed)
+                Ok::<_, SyncError>(installed)
             }
             .instrument(sync_span.clone()),
         );
@@ -2688,7 +2708,9 @@ async fn install_locked_packages(
     sync_span.record("running", install_tasks.len() as u64);
 
     while let Some(result) = install_tasks.join_next().await {
-        result.map_err(|error| format!("install task failed to join: {error}"))??;
+        result.map_err(|error| SyncError::DownloadArtifactsFailed {
+            details: format!("install task failed to join: {error}"),
+        })??;
         completed += 1;
         sync_span.record("completed", completed);
         sync_span.record("running", install_tasks.len() as u64);
@@ -3253,8 +3275,8 @@ mod tests {
     use super::{
         LockError, LockfileCompatibilityError, ProjectPackage, apply_added_packages_to_description,
         lock_error_from_resolution, locked_dependencies_from_description, locked_install_order,
-        locked_package_repositories, lockfile_supports_project, package_not_found_help,
-        parse_add_package, pinned_package_relations, project_install_partitions,
+        locked_package_install_order, locked_package_repositories, lockfile_supports_project,
+        package_not_found_help, parse_add_package, pinned_package_relations,
         remove_packages_from_description_dependencies, roots_from_description,
         validate_lockfile_compatibility,
     };
@@ -3308,7 +3330,7 @@ mod tests {
     }
 
     #[test]
-    fn stages_project_hard_dependency_closure_before_project() {
+    fn install_graph_includes_project_dependencies_and_dependents() {
         let description: RDescription = "Package: project\nVersion: 1.0.1\nTitle: Project\nDescription: Test project.\nLicense: MIT\nImports: hard\nSuggests: testthat\n"
             .parse()
             .expect("description should parse");
@@ -3325,42 +3347,28 @@ mod tests {
             min_version: None,
             max_version_exclusive: None,
         };
-        let lockfile = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            repositories: vec![],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::from([
-                (
-                    "hard".to_string(),
-                    package("hard", vec![dependency("leaf")]),
-                ),
-                ("leaf".to_string(), package("leaf", vec![])),
-                (
-                    "testthat".to_string(),
-                    package("testthat", vec![dependency("project")]),
-                ),
-            ]),
+        let project = LockedPackage {
+            package: "project".to_string(),
+            version: "1.0.1".to_string(),
+            source: None,
+            source_url: None,
+            dependencies: locked_dependencies_from_description(&description).unwrap(),
         };
+        let packages = vec![
+            package("hard", vec![dependency("leaf")]),
+            package("leaf", vec![]),
+            project,
+            package("reverse", vec![dependency("project")]),
+            package("unrelated", vec![]),
+        ];
 
-        let (before, after) = project_install_partitions(&description, &lockfile);
+        let order = locked_package_install_order(&packages).unwrap();
+        let position = |name: &str| order.iter().position(|package| package == name).unwrap();
 
-        assert_eq!(
-            before
-                .into_iter()
-                .map(|package| package.package)
-                .collect::<Vec<_>>(),
-            vec!["hard", "leaf"]
-        );
-        assert_eq!(
-            after
-                .into_iter()
-                .map(|package| package.package)
-                .collect::<Vec<_>>(),
-            vec!["testthat"]
-        );
+        assert!(position("leaf") < position("hard"));
+        assert!(position("hard") < position("project"));
+        assert!(position("project") < position("reverse"));
+        assert!(order.contains(&"unrelated".to_string()));
     }
 
     #[test]
