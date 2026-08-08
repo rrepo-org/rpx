@@ -41,6 +41,7 @@ impl RVirtualEnv for tokio::process::Command {
 }
 
 static BASE_PACKAGES: OnceCell<Vec<String>> = OnceCell::const_new();
+static R_VERSION: OnceCell<String> = OnceCell::const_new();
 
 pub async fn install_local_package(
     artifact_path: &Path,
@@ -210,6 +211,10 @@ fn escape_r_string(value: &str) -> String {
 }
 
 pub async fn r_version_async() -> Result<String, String> {
+    R_VERSION.get_or_try_init(fetch_r_version).await.cloned()
+}
+
+async fn fetch_r_version() -> Result<String, String> {
     let output = tokio::process::Command::new("Rscript")
         .arg("-e")
         .arg("cat(as.character(getRversion()))")
@@ -232,6 +237,8 @@ pub async fn r_version_async() -> Result<String, String> {
 
     Ok(version)
 }
+
+#[deprecated]
 pub async fn fetch_runtime_info() -> RuntimeInfo {
     let output = Command::with_venv("Rscript")
         .arg("-e")

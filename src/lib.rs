@@ -54,8 +54,7 @@ use lockfile::{
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
-    DesiredPackagesError, LockfileReadError, ManifestReadError, Project, ProjectDiscoveryError,
-    artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
+    Project, artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
     project_library_root_path, project_root,
 };
 use r::{
@@ -96,19 +95,7 @@ const SYNC_INSTALL_WORKERS: usize = 8;
 enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    ProjectDiscovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ManifestRead(#[from] ManifestReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DesiredPackages(#[from] DesiredPackagesError),
+    Project(#[from] project::ProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -116,7 +103,7 @@ enum RpxError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Project(#[from] ProjectError),
+    LegacyProject(#[from] LegacyProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -144,7 +131,7 @@ enum RpxError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-enum ProjectError {
+enum LegacyProjectError {
     #[error("failed to read rpx.lock: {details}")]
     #[diagnostic(
         code(rpx::project::lockfile_read),
@@ -378,18 +365,18 @@ enum RpxWarning {
     ContinuingWithoutSystemDependencies,
 }
 
-fn read_project_lockfile() -> Result<Lockfile, ProjectError> {
-    read_lockfile().map_err(|details| ProjectError::LockfileRead { details })
+#[deprecated]
+fn read_project_lockfile() -> Result<Lockfile, LegacyProjectError> {
+    read_lockfile().map_err(|details| LegacyProjectError::LockfileRead { details })
 }
 
-fn read_project_lockfile_raw_optional() -> Result<Option<Lockfile>, ProjectError> {
-    read_lockfile_optional().map_err(|details| ProjectError::LockfileRead { details })
-}
-
+#[deprecated]
 fn read_current_project_lockfile_optional(
     description: &RDescription,
 ) -> Result<Option<Lockfile>, RpxError> {
-    let Some(lockfile) = read_project_lockfile_raw_optional()? else {
+    let Some(lockfile) =
+        read_lockfile_optional().map_err(|details| LegacyProjectError::LockfileRead { details })?
+    else {
         return Ok(None);
     };
 
@@ -410,8 +397,9 @@ fn read_current_project_lockfile_optional(
     Ok(Some(lockfile))
 }
 
-fn write_project_lockfile(lockfile: &Lockfile) -> Result<(), ProjectError> {
-    write_lockfile(lockfile).map_err(|details| ProjectError::LockfileWrite { details })
+#[deprecated]
+fn write_project_lockfile(lockfile: &Lockfile) -> Result<(), LegacyProjectError> {
+    write_lockfile(lockfile).map_err(|details| LegacyProjectError::LockfileWrite { details })
 }
 
 /// Runs the CLI application.
@@ -898,13 +886,18 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
 }
 
 async fn cmd_status() -> Result<(), RpxError> {
-    let project = Project::discover()?;
-    let description = project.description()?;
-    let lockfile = project.lockfile()?;
-    let desired_packages = project.desired_packages()?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let lockfile = project
+        .lockfile()
+        .map_err(project::ProjectError::Lockfile)?;
+    project
+        .validate_locked_resolution()
+        .await
+        .map_err(project::ProjectError::LockedResolution)?;
+    let desired_packages = project
+        .desired_packages()
+        .map_err(project::ProjectError::DesiredPackages)?;
 
-    let manifest_requirements = manifest_requirement_names(description);
-    let lock_requirements = lockfile_requirement_names(lockfile);
     let installed = installed_packages().await;
     let installed_names = installed
         .iter()
@@ -915,21 +908,12 @@ async fn cmd_status() -> Result<(), RpxError> {
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     let desired_names = desired_packages.keys().cloned().collect::<BTreeSet<_>>();
-    let runtime_status = runtime_status(lockfile).await;
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(lockfile).ok()
     } else {
         None
     };
 
-    let missing_from_lockfile = manifest_requirements
-        .difference(&lock_requirements)
-        .cloned()
-        .collect::<Vec<_>>();
-    let extra_in_lockfile = lock_requirements
-        .difference(&manifest_requirements)
-        .cloned()
-        .collect::<Vec<_>>();
     let missing_from_library = desired_names
         .difference(&installed_names)
         .cloned()
@@ -950,41 +934,22 @@ async fn cmd_status() -> Result<(), RpxError> {
         })
         .collect::<Vec<_>>();
 
-    if missing_from_lockfile.is_empty()
-        && extra_in_lockfile.is_empty()
-        && missing_from_library.is_empty()
+    if missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
-        && runtime_status.missing_base_packages.is_empty()
         && system_plan.as_ref().is_none_or(|plan| {
             plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty()
         })
     {
-        print_runtime_version_warning(&runtime_status);
         status("Project is in sync");
         return Ok(());
     }
 
-    let lockfile_out_of_date = !missing_from_lockfile.is_empty() || !extra_in_lockfile.is_empty();
-    let library_out_of_date = !missing_from_library.is_empty()
-        || !extra_in_library.is_empty()
-        || !version_mismatches.is_empty();
-    let runtime_out_of_date = !runtime_status.missing_base_packages.is_empty();
     let system_out_of_date = system_plan.as_ref().is_some_and(|plan| {
         !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty()
     });
 
-    if lockfile_out_of_date && library_out_of_date {
-        status("Project is out of sync");
-        blank_status_line();
-        status("Run: rpx lock && rpx sync");
-    } else if lockfile_out_of_date {
-        status("Lockfile is out of date");
-        blank_status_line();
-        status("Run: rpx lock");
-    } else if runtime_out_of_date {
-        status("R runtime is out of sync");
-    } else if system_out_of_date {
+    if system_out_of_date {
         status("System dependencies are out of sync");
     } else {
         status("Project library is out of sync");
@@ -992,24 +957,11 @@ async fn cmd_status() -> Result<(), RpxError> {
         status("Run: rpx sync");
     }
 
-    print_status_group(
-        "Packages in DESCRIPTION but not locked:",
-        &missing_from_lockfile,
-    );
-    print_status_group(
-        "Packages locked but no longer in DESCRIPTION:",
-        &extra_in_lockfile,
-    );
     print_status_group("Required packages not installed:", &missing_from_library);
     print_status_group("Unexpected packages installed:", &extra_in_library);
     print_status_group(
         "Installed versions that differ from expected versions:",
         &version_mismatches,
-    );
-    print_runtime_version_warning(&runtime_status);
-    print_status_group(
-        "R runtime is missing locked base packages:",
-        &runtime_status.missing_base_packages,
     );
     if let Some(plan) = system_plan {
         print_status_group(
@@ -2190,16 +2142,6 @@ async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
         version_mismatch,
         missing_base_packages,
     }
-}
-
-fn print_runtime_version_warning(runtime_status: &RuntimeStatus) {
-    let Some(version_mismatch) = &runtime_status.version_mismatch else {
-        return;
-    };
-
-    blank_status_line();
-    status("R runtime differs from lockfile:");
-    status(format_args!("- {version_mismatch}"));
 }
 
 fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {

@@ -1,9 +1,9 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::lossless::{RDescription, Version};
+use r_description::lossless::{RDescription, Relation, Version};
 use std::{
     cell::OnceCell,
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -12,6 +12,8 @@ use thiserror::Error;
 
 use crate::{
     lockfile::{LOCKFILE_VERSION, Lockfile},
+    r::r_version_async,
+    repository::BUILT_IN_REPOSITORY_BASE_URL,
     resolver::is_base_package,
 };
 
@@ -86,6 +88,42 @@ pub enum LockfileReadError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
+pub enum LockedResolutionError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Manifest(#[from] ManifestReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lockfile(#[from] LockfileReadError),
+
+    #[error("{details}")]
+    #[diagnostic(code(rpx::runtime::version_failed))]
+    RVersion { details: String },
+
+    #[error("repository configuration no longer matches rpx.lock")]
+    #[diagnostic(
+        code(rpx::project::repositories_changed),
+        help("Run `rpx lock` to update rpx.lock.")
+    )]
+    RepositoriesChanged,
+
+    #[error("package requirements in DESCRIPTION no longer match rpx.lock")]
+    #[diagnostic(
+        code(rpx::project::requirements_changed),
+        help("Run `rpx lock` to update rpx.lock.")
+    )]
+    PackageRequirementsChanged,
+
+    #[error("rpx.lock was generated for R {locked}, but current R is {current}")]
+    #[diagnostic(
+        code(rpx::project::r_version_changed),
+        help("Run `rpx lock` to update rpx.lock.")
+    )]
+    RVersionChanged { locked: String, current: String },
+}
+
+#[derive(Debug, Error, Diagnostic)]
 pub enum DesiredPackagesError {
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -102,6 +140,29 @@ pub enum DesiredPackagesError {
     #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
     #[diagnostic(code(rpx::project::manifest_invalid_version))]
     InvalidVersion { path: PathBuf, details: String },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum ProjectError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Discovery(#[from] ProjectDiscoveryError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Manifest(#[from] ManifestReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lockfile(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DesiredPackages(#[from] DesiredPackagesError),
 }
 
 pub struct Project {
@@ -214,6 +275,109 @@ impl Project {
 
         Ok(packages)
     }
+
+    pub async fn validate_locked_resolution(&self) -> Result<(), LockedResolutionError> {
+        let lockfile = self.lockfile()?;
+        let description = self.description()?;
+        let r_version = r_version_async()
+            .await
+            .map_err(|details| LockedResolutionError::RVersion { details })?;
+
+        if !repositories_match(description, lockfile) {
+            return Err(LockedResolutionError::RepositoriesChanged);
+        }
+        if !roots_match(description, lockfile) {
+            return Err(LockedResolutionError::PackageRequirementsChanged);
+        }
+        if lockfile.r.version != r_version {
+            return Err(LockedResolutionError::RVersionChanged {
+                locked: lockfile.r.version.clone(),
+                current: r_version,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn repositories_match(description: &RDescription, lockfile: &Lockfile) -> bool {
+    let Some(mut expected) = description
+        .additional_repositories()
+        .unwrap_or_default()
+        .iter()
+        .map(|repository| canonical_repository_url(repository))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(locked) = lockfile
+        .repositories
+        .iter()
+        .map(|repository| canonical_repository_url(&repository.url))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(default_repository) = canonical_repository_url(BUILT_IN_REPOSITORY_BASE_URL) else {
+        return false;
+    };
+
+    if locked.contains(&default_repository) && !expected.contains(&default_repository) {
+        expected.insert(0, default_repository);
+    }
+
+    locked == expected
+}
+
+fn canonical_repository_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value.trim()).ok()?;
+    url.path_segments_mut().ok()?.pop_if_empty();
+    Some(url.to_string())
+}
+
+fn roots_match(description: &RDescription, lockfile: &Lockfile) -> bool {
+    let description_roots = description_roots(description);
+    let lockfile_roots = lockfile
+        .roots
+        .iter()
+        .map(|root| {
+            let constraint = root.constraint.trim();
+            if constraint.is_empty() || constraint == "*" {
+                Some(Relation::simple(&root.package))
+            } else {
+                format!("{} ({constraint})", root.package).parse().ok()
+            }
+        })
+        .collect::<Option<BTreeSet<_>>>();
+
+    lockfile_roots.is_some_and(|roots| roots == description_roots)
+}
+
+fn description_roots(description: &RDescription) -> BTreeSet<Relation> {
+    description
+        .imports()
+        .into_iter()
+        .flat_map(|relations| relations.iter())
+        .chain(
+            description
+                .depends()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .chain(
+            description
+                .linking_to()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .chain(
+            description
+                .suggests()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .filter(|relation| relation.name() != "R")
+        .collect()
 }
 
 #[derive(Debug, Error, Diagnostic)]

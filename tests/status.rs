@@ -21,7 +21,7 @@ fn runs_rpx_status_for_clean_project() {
 }
 
 #[test]
-fn runs_rpx_status_for_lockfile_drift() {
+fn reports_declared_package_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-drift";
     create_package_project(&container, project_path);
@@ -31,7 +31,7 @@ fn runs_rpx_status_for_lockfile_drift() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 4,\n  \"revision\": 0,\n  \"repositories\": [\n    {{\n      \"url\": \"https://api.rrepo.org\",\n      \"kind\": \"rrepo\"\n    }}\n  ],\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 4,\n  \"revision\": 0,\n  \"repositories\": [],\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -40,19 +40,11 @@ fn runs_rpx_status_for_lockfile_drift() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project is out of sync"),
+        stderr.contains("package requirements in DESCRIPTION no longer match rpx.lock"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Run: rpx lock && rpx sync"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Packages in DESCRIPTION but not locked:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("- digest"),
+        stderr.contains("rpx::project::requirements_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -106,7 +98,7 @@ fn reports_unsupported_newer_lockfile_schema() {
 }
 
 #[test]
-fn runs_rpx_status_ignores_additional_repositories() {
+fn reports_repository_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-repo-drift";
     create_package_project(&container, project_path);
@@ -123,9 +115,13 @@ fn runs_rpx_status_ignores_additional_repositories() {
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project is in sync"),
+        stderr.contains("repository configuration no longer matches rpx.lock"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("rpx::project::repositories_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -249,7 +245,7 @@ fn runs_rpx_status_for_version_mismatch() {
 }
 
 #[test]
-fn reports_r_runtime_version_mismatch_without_failing_status() {
+fn reports_r_runtime_version_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-r-version-mismatch";
     create_package_project(&container, project_path);
@@ -266,17 +262,13 @@ fn reports_r_runtime_version_mismatch_without_failing_status() {
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("R runtime differs from lockfile:"),
+        stderr.contains("rpx.lock was generated for R 0.0.1, but current R is"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("R 0.0.1 locked"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Project is in sync"),
+        stderr.contains("rpx::project::r_version_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
