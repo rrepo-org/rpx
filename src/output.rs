@@ -6,10 +6,6 @@ pub(crate) fn status(message: impl fmt::Display) {
     println!("{message}");
 }
 
-pub(crate) fn blank_status_line() {
-    println!();
-}
-
 pub(crate) fn note(message: impl fmt::Display) {
     eprintln!("{message}");
 }

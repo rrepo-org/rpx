@@ -146,23 +146,23 @@ fn runs_rpx_status_for_missing_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
+        stderr.contains("project is out of sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Run: rpx sync"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Required packages not installed:"),
+        stderr.contains("Required packages not installed:"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("- digest"),
+        stderr.contains("digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("- testpkg"),
+        stderr.contains("testpkg"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -186,15 +186,19 @@ fn runs_rpx_status_for_extra_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
+        stderr.contains("project is out of sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Unexpected packages installed:"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("- jsonlite"),
+        stderr.contains("Unexpected packages installed:"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("jsonlite"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -223,23 +227,27 @@ fn runs_rpx_status_for_version_mismatch() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
+        stderr.contains("project is out of sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Installed versions that differ from expected versions:"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("- digest ("),
+        stderr.contains("Installed versions that differ from expected versions:"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("0.0.1 expected"),
+        stderr.contains("digest ("),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("- testpkg (0.1.0 installed, 0.2.0 expected)"),
+        stderr.contains("0.0.1 expected"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("testpkg (0.1.0 installed, 0.2.0 expected)"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

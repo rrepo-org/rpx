@@ -7,14 +7,21 @@ use std::{
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 
 use crate::{
-    lockfile::{LOCKFILE_VERSION, Lockfile},
-    r::r_version_async,
-    repository::BUILT_IN_REPOSITORY_BASE_URL,
-    resolver::is_base_package,
+    lockfile::{
+        LOCKFILE_VERSION, LockedRepository, LockedRepositoryKind, Lockfile,
+        locked_repository_for_source,
+    },
+    r::{RVersionError, r_version_async},
+    repository::{
+        ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
+        PackageRepository, RrepoRepository, parse_repository_url,
+    },
+    resolver::{PackageVersion, is_base_package},
 };
 
 pub const LOCKFILE_NAME: &str = "rpx.lock";
@@ -97,9 +104,9 @@ pub enum LockedResolutionError {
     #[diagnostic(transparent)]
     Lockfile(#[from] LockfileReadError),
 
-    #[error("{details}")]
-    #[diagnostic(code(rpx::runtime::version_failed))]
-    RVersion { details: String },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
 
     #[error("repository configuration no longer matches rpx.lock")]
     #[diagnostic(
@@ -124,7 +131,7 @@ pub enum LockedResolutionError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum DesiredPackagesError {
+pub enum LockedPackagesError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Manifest(#[from] ManifestReadError),
@@ -140,6 +147,28 @@ pub enum DesiredPackagesError {
     #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
     #[diagnostic(code(rpx::project::manifest_invalid_version))]
     InvalidVersion { path: PathBuf, details: String },
+
+    #[error("invalid locked version {version} for {package}: {details}")]
+    #[diagnostic(code(rpx::project::locked_package_invalid_version))]
+    InvalidLockedVersion {
+        package: String,
+        version: String,
+        details: String,
+    },
+
+    #[error("locked package {package} is missing source_url")]
+    #[diagnostic(code(rpx::project::locked_package_missing_source_url))]
+    MissingSourceUrl { package: String },
+
+    #[error(
+        "locked package {package} source URL does not match any locked repository: {source_url}"
+    )]
+    #[diagnostic(code(rpx::project::locked_package_repository_not_found))]
+    RepositoryNotFound { package: String, source_url: String },
+
+    #[error("invalid locked repository URL {url}: {details}")]
+    #[diagnostic(code(rpx::project::locked_repository_invalid_url))]
+    InvalidRepository { url: String, details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -162,7 +191,7 @@ pub enum ProjectError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DesiredPackages(#[from] DesiredPackagesError),
+    LockedPackages(#[from] LockedPackagesError),
 }
 
 pub struct Project {
@@ -246,34 +275,63 @@ impl Project {
         Ok(self.lockfile.get_or_init(|| lockfile))
     }
 
-    pub fn desired_packages(&self) -> Result<BTreeMap<String, String>, DesiredPackagesError> {
-        let mut packages = self
-            .lockfile()?
+    pub fn locked_packages(&self) -> Result<BTreeMap<String, PackageVersion>, LockedPackagesError> {
+        let lockfile = self.lockfile()?;
+        let mut packages = lockfile
             .packages
             .iter()
             .filter(|(name, _)| !is_base_package(name))
-            .map(|(name, package)| (name.clone(), package.version.clone()))
-            .collect::<BTreeMap<_, _>>();
+            .map(|(name, package)| {
+                let version = package.version.parse().map_err(|details| {
+                    LockedPackagesError::InvalidLockedVersion {
+                        package: name.clone(),
+                        version: package.version.clone(),
+                        details,
+                    }
+                })?;
+                let source_url = package.source_url.as_deref().ok_or_else(|| {
+                    LockedPackagesError::MissingSourceUrl {
+                        package: name.clone(),
+                    }
+                })?;
+                let repository = locked_repository_for_source(source_url, &lockfile.repositories)
+                    .ok_or_else(|| LockedPackagesError::RepositoryNotFound {
+                    package: name.clone(),
+                    source_url: source_url.to_string(),
+                })?;
+                let repository = package_repository(repository)?;
 
+                Ok((name.clone(), PackageVersion::new(version, repository)))
+            })
+            .collect::<Result<BTreeMap<_, _>, LockedPackagesError>>()?;
+
+        let (package, version) = self.root_package()?;
+        packages.insert(package, version);
+
+        Ok(packages)
+    }
+
+    fn root_package(&self) -> Result<(String, PackageVersion), LockedPackagesError> {
         let description = self.description()?;
         let path = self.path.join(DESCRIPTION_NAME);
         let package = description
             .package()
-            .ok_or_else(|| DesiredPackagesError::MissingField {
+            .ok_or_else(|| LockedPackagesError::MissingField {
                 path: path.clone(),
                 field: "Package",
             })?;
         let version = description
             .version()
-            .ok_or_else(|| DesiredPackagesError::MissingField {
+            .ok_or_else(|| LockedPackagesError::MissingField {
                 path: path.clone(),
                 field: "Version",
             })?
             .parse::<Version>()
-            .map_err(|details| DesiredPackagesError::InvalidVersion { path, details })?;
-        packages.insert(package, version.to_string());
+            .map_err(|details| LockedPackagesError::InvalidVersion { path, details })?;
+        let repository: Arc<dyn PackageRepository> =
+            Arc::new(LocalRepository::new(self.path.clone()).with_description(description.clone()));
 
-        Ok(packages)
+        Ok((package, PackageVersion::new(version, repository)))
     }
 
     pub async fn validate_locked_resolution(&self) -> Result<(), LockedResolutionError> {
@@ -281,7 +339,7 @@ impl Project {
         let description = self.description()?;
         let r_version = r_version_async()
             .await
-            .map_err(|details| LockedResolutionError::RVersion { details })?;
+            .map_err(LockedResolutionError::RVersion)?;
 
         if !repositories_match(description, lockfile) {
             return Err(LockedResolutionError::RepositoriesChanged);
@@ -298,6 +356,27 @@ impl Project {
 
         Ok(())
     }
+}
+
+fn package_repository(
+    repository: &LockedRepository,
+) -> Result<Arc<dyn PackageRepository>, LockedPackagesError> {
+    let url = parse_repository_url(&repository.url).map_err(|error| {
+        LockedPackagesError::InvalidRepository {
+            url: repository.url.clone(),
+            details: error.to_string(),
+        }
+    })?;
+
+    Ok(match repository.kind {
+        LockedRepositoryKind::Rrepo => Arc::new(RrepoRepository::new(url)),
+        LockedRepositoryKind::CranLike => Arc::new(CranRepository::new(
+            url,
+            repository
+                .cran_archive_support
+                .unwrap_or(ArchiveSupport::Unavailable),
+        )),
+    })
 }
 
 fn repositories_match(description: &RDescription, lockfile: &Lockfile) -> bool {
@@ -567,8 +646,8 @@ mod tests {
     }
 
     #[test]
-    fn desired_packages_adds_project_and_excludes_base_packages() {
-        let path = project_directory("desired-packages");
+    fn locked_packages_include_repository_provenance_and_project() {
+        let path = project_directory("locked-packages");
         fs::write(
             path.join(DESCRIPTION_NAME),
             "Package: project\nVersion: 2.0.0\n",
@@ -578,10 +657,22 @@ mod tests {
             path.join(LOCKFILE_NAME),
             r#"{
                 "version": 4,
+                "repositories": [
+                    {"url": "https://repo.test/example", "kind": "rrepo"},
+                    {"url": "https://repo.test/example2", "kind": "rrepo"}
+                ],
                 "roots": [],
                 "packages": {
-                    "digest": {"package": "digest", "version": "0.6.39"},
-                    "project": {"package": "project", "version": "1.0.0"},
+                    "digest": {
+                        "package": "digest",
+                        "version": "0.6.39",
+                        "source_url": "https://repo.test/example2/packages/digest/source"
+                    },
+                    "project": {
+                        "package": "project",
+                        "version": "1.0.0",
+                        "source_url": "https://repo.test/example/packages/project/source"
+                    },
                     "stats": {"package": "stats", "version": "4.5.0"}
                 }
             }"#,
@@ -590,12 +681,32 @@ mod tests {
         let project = Project::new(path.clone());
 
         let packages = project
-            .desired_packages()
-            .expect("desired packages should load");
+            .locked_packages()
+            .expect("locked packages should load");
 
         assert_eq!(packages.len(), 2);
-        assert_eq!(packages.get("digest").map(String::as_str), Some("0.6.39"));
-        assert_eq!(packages.get("project").map(String::as_str), Some("2.0.0"));
+        let digest = packages.get("digest").expect("digest should be locked");
+        assert_eq!(digest.version().to_string(), "0.6.39");
+        assert_eq!(
+            digest
+                .repository()
+                .as_ref()
+                .downcast_ref::<RrepoRepository>()
+                .expect("digest should use an rrepo repository")
+                .url()
+                .as_str(),
+            "https://repo.test/example2"
+        );
+        let root = packages.get("project").expect("project should be locked");
+        assert_eq!(root.version().to_string(), "2.0.0");
+        assert_eq!(
+            root.repository()
+                .as_ref()
+                .downcast_ref::<LocalRepository>()
+                .expect("project should use its local repository")
+                .path(),
+            path
+        );
         assert!(!packages.contains_key("stats"));
 
         fs::remove_dir_all(path).expect("project directory should be removed");

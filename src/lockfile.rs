@@ -91,6 +91,16 @@ pub struct LockedDependency {
     pub max_version_exclusive: Option<String>,
 }
 
+pub(crate) fn locked_repository_for_source<'a>(
+    source_url: &str,
+    repositories: &'a [LockedRepository],
+) -> Option<&'a LockedRepository> {
+    repositories
+        .iter()
+        .filter(|repository| source_url.starts_with(&repository.url))
+        .max_by_key(|repository| repository.url.len())
+}
+
 #[deprecated]
 pub fn read_lockfile() -> Result<Lockfile, String> {
     read_lockfile_optional()?.ok_or_else(|| format!("{LOCKFILE_NAME} not found in project root"))

@@ -50,17 +50,15 @@ use cli::{Cli, Commands, RepoCommands};
 use description::{init_description, read_description, write_description};
 use lockfile::{
     LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedRepository, LockedRepositoryKind,
-    LockedSystemRequirements, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
+    LockedSystemRequirements, Lockfile, locked_repository_for_source, read_lockfile,
+    read_lockfile_optional, write_lockfile,
 };
-use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
+use output::{blank_note_line, note, prompt, status, warning};
 use project::{
     Project, artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
     project_library_root_path, project_root,
 };
-use r::{
-    InstallFailure, base_packages, install_local_package, install_project_package,
-    installed_packages,
-};
+use r::{base_packages, install_local_package, install_project_package, installed_packages};
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
@@ -76,10 +74,7 @@ use ui::SystemDepsUi;
 use crate::{
     cache::CompiledPackageCacheKey,
     lockfile::LockedPackage,
-    r::{
-        RVirtualEnv, fetch_runtime_info, installed_packages_async, r_version_async,
-        remove_packages_from_venv,
-    },
+    r::{RVirtualEnv, fetch_runtime_info, r_version_async, remove_packages_from_venv},
     repository::{
         ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
         PackageRepository, RepositoryError, RrepoRepository, built_in_repository,
@@ -128,6 +123,14 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Clean(#[from] CleanError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    R(#[from] r::RError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Status(#[from] StatusError),
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -175,6 +178,90 @@ enum AddError {
         help("Use PACKAGE@OPERATORVERSION, for example digest@>=0.6.37.")
     )]
     InvalidConstraint { package: String, details: String },
+}
+
+#[derive(Debug)]
+struct PackageVersionMismatch {
+    package: String,
+    installed: Version,
+    expected: Version,
+}
+
+#[derive(Debug, Default)]
+struct StatusMismatches {
+    missing_packages: Vec<String>,
+    extra_packages: Vec<String>,
+    version_mismatches: Vec<PackageVersionMismatch>,
+    missing_system_packages: Vec<String>,
+    unsupported_system_rules: Vec<String>,
+}
+
+impl StatusMismatches {
+    fn is_empty(&self) -> bool {
+        self.missing_packages.is_empty()
+            && self.extra_packages.is_empty()
+            && self.version_mismatches.is_empty()
+            && self.missing_system_packages.is_empty()
+            && self.unsupported_system_rules.is_empty()
+    }
+}
+
+impl std::fmt::Display for StatusMismatches {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut groups = Vec::new();
+        if !self.missing_packages.is_empty() {
+            groups.push(format!(
+                "Required packages not installed:\n- {}",
+                self.missing_packages.join("\n- ")
+            ));
+        }
+        if !self.extra_packages.is_empty() {
+            groups.push(format!(
+                "Unexpected packages installed:\n- {}",
+                self.extra_packages.join("\n- ")
+            ));
+        }
+        if !self.version_mismatches.is_empty() {
+            let mismatches = self
+                .version_mismatches
+                .iter()
+                .map(|mismatch| {
+                    format!(
+                        "{} ({} installed, {} expected)",
+                        mismatch.package, mismatch.installed, mismatch.expected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            groups.push(format!(
+                "Installed versions that differ from expected versions:\n- {mismatches}"
+            ));
+        }
+        if !self.missing_system_packages.is_empty() {
+            groups.push(format!(
+                "Missing system packages for this host:\n- {}",
+                self.missing_system_packages.join("\n- ")
+            ));
+        }
+        if !self.unsupported_system_rules.is_empty() {
+            groups.push(format!(
+                "System requirement rules without a host mapping:\n- {}",
+                self.unsupported_system_rules.join("\n- ")
+            ));
+        }
+
+        formatter.write_str(&groups.join("\n\n"))
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum StatusError {
+    #[error("project is out of sync\n\n{mismatches}")]
+    #[diagnostic(
+        code(rpx::status::out_of_sync),
+        help("Run `rpx sync` to synchronize the project.")
+    )]
+    OutOfSync { mismatches: StatusMismatches },
 }
 
 impl From<SyncError> for RpxError {
@@ -294,6 +381,27 @@ enum SyncError {
     #[error("failed to install project package: {details}")]
     #[diagnostic(code(rpx::sync::project_install_failed))]
     ProjectInstallFailed { details: String },
+
+    #[error("failed to inspect installed R packages: {source}")]
+    #[diagnostic(code(rpx::sync::installed_packages_failed))]
+    InstalledPackages {
+        #[source]
+        source: r::InstalledPackagesError,
+    },
+
+    #[error("failed to inspect the R version: {source}")]
+    #[diagnostic(code(rpx::sync::r_version_failed))]
+    RVersion {
+        #[source]
+        source: r::RVersionError,
+    },
+
+    #[error("failed to install project package: {source}")]
+    #[diagnostic(code(rpx::sync::project_install_failed))]
+    ProjectPackageInstall {
+        #[source]
+        source: r::PackageInstallError,
+    },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -711,7 +819,10 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
 }
 
 async fn cmd_repo_list() -> Result<(), RpxError> {
-    let description = read_description()?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?;
     let lockfile = read_current_project_lockfile_optional(&description)?;
     let additional_repositories = description.additional_repositories().unwrap_or_default();
 
@@ -773,8 +884,8 @@ async fn cmd_remove(
     )?;
     let installed_before_sync = installed_packages()
         .await
-        .into_iter()
-        .map(|package| package.package)
+        .map_err(r::RError::InstalledPackages)?
+        .into_keys()
         .collect::<BTreeSet<_>>();
     let removed = packages
         .iter()
@@ -833,7 +944,10 @@ async fn cmd_run(command: &[String]) -> Result<(), RpxError> {
 }
 
 async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<(), RpxError> {
-    let description = read_description()?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let repositories = repository_preference
         .package_repositories(&description, current_lockfile.as_ref())
@@ -867,8 +981,13 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
 }
 
 async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), RpxError> {
-    let description = read_description()?;
-    let lockfile = read_project_lockfile()?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?;
+    let lockfile = project
+        .lockfile()
+        .map_err(project::ProjectError::Lockfile)?;
     let project = validate_project_for_sync(&description, &lockfile).await?;
 
     sync_system_dependencies(&lockfile, install_system, install_only_system)?;
@@ -894,87 +1013,59 @@ async fn cmd_status() -> Result<(), RpxError> {
         .validate_locked_resolution()
         .await
         .map_err(project::ProjectError::LockedResolution)?;
-    let desired_packages = project
-        .desired_packages()
-        .map_err(project::ProjectError::DesiredPackages)?;
+    let locked_packages = project
+        .locked_packages()
+        .map_err(project::ProjectError::LockedPackages)?;
 
-    let installed = installed_packages().await;
-    let installed_names = installed
+    let installed = installed_packages()
+        .await
+        .map_err(r::RError::InstalledPackages)?;
+    let missing_packages = locked_packages
+        .keys()
+        .filter(|package| !installed.contains_key(*package))
+        .cloned()
+        .collect();
+    let version_mismatches = locked_packages
         .iter()
-        .map(|package| package.package.clone())
-        .collect::<BTreeSet<_>>();
-    let installed_versions = installed
-        .iter()
-        .map(|package| (package.package.clone(), package.version.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let desired_names = desired_packages.keys().cloned().collect::<BTreeSet<_>>();
+        .filter_map(|(package, expected)| {
+            installed
+                .get(package)
+                .filter(|installed| *installed != expected)
+                .map(|installed| PackageVersionMismatch {
+                    package: package.clone(),
+                    installed: installed.version().clone(),
+                    expected: expected.version().clone(),
+                })
+        })
+        .collect();
+    let extra_packages = installed
+        .keys()
+        .filter(|package| !locked_packages.contains_key(*package))
+        .cloned()
+        .collect();
+    let mut mismatches = StatusMismatches {
+        missing_packages,
+        extra_packages,
+        version_mismatches,
+        ..StatusMismatches::default()
+    };
+
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(lockfile).ok()
     } else {
         None
     };
-
-    let missing_from_library = desired_names
-        .difference(&installed_names)
-        .cloned()
-        .collect::<Vec<_>>();
-    let extra_in_library = installed_names
-        .difference(&desired_names)
-        .cloned()
-        .collect::<Vec<_>>();
-    let version_mismatches = desired_packages
-        .iter()
-        .filter_map(|(name, expected_version)| {
-            installed_versions
-                .get(name)
-                .filter(|installed_version| *installed_version != expected_version)
-                .map(|installed_version| {
-                    format!("{name} ({installed_version} installed, {expected_version} expected)")
-                })
-        })
-        .collect::<Vec<_>>();
-
-    if missing_from_library.is_empty()
-        && extra_in_library.is_empty()
-        && version_mismatches.is_empty()
-        && system_plan.as_ref().is_none_or(|plan| {
-            plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty()
-        })
-    {
-        status("Project is in sync");
-        return Ok(());
-    }
-
-    let system_out_of_date = system_plan.as_ref().is_some_and(|plan| {
-        !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty()
-    });
-
-    if system_out_of_date {
-        status("System dependencies are out of sync");
-    } else {
-        status("Project library is out of sync");
-        blank_status_line();
-        status("Run: rpx sync");
-    }
-
-    print_status_group("Required packages not installed:", &missing_from_library);
-    print_status_group("Unexpected packages installed:", &extra_in_library);
-    print_status_group(
-        "Installed versions that differ from expected versions:",
-        &version_mismatches,
-    );
     if let Some(plan) = system_plan {
-        print_status_group(
-            "Missing system packages for this host:",
-            &plan.missing_packages,
-        );
-        print_status_group(
-            "System requirement rules without a host mapping:",
-            &plan.unsupported_rules,
-        );
+        mismatches.missing_system_packages = plan.missing_packages;
+        mismatches.unsupported_system_rules = plan.unsupported_rules;
     }
 
-    std::process::exit(1);
+    if !mismatches.is_empty() {
+        return Err(StatusError::OutOfSync { mismatches }.into());
+    }
+
+    status("Project is in sync");
+    Ok(())
 }
 
 fn cmd_clean() -> Result<(), RpxError> {
@@ -1002,18 +1093,6 @@ fn remove_dir_if_exists(path: &Path, label: &str) -> Result<bool, RpxError> {
         source,
     })?;
     Ok(true)
-}
-
-fn print_status_group(title: &str, items: &[String]) {
-    if items.is_empty() {
-        return;
-    }
-
-    blank_status_line();
-    status(title);
-    for item in items {
-        status(format_args!("- {item}"));
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1746,23 +1825,26 @@ async fn sync_locked_project(
 
     let mut outcome = SyncOutcome::default();
 
-    let installed = installed_packages().await;
-    let project_is_installed = installed
-        .iter()
-        .any(|package| package.package == project.name);
+    let installed = installed_packages()
+        .await
+        .map_err(r::RError::InstalledPackages)?;
+    let project_is_installed = installed.contains_key(&project.name);
     let extra_packages = installed
         .into_iter()
-        .filter(|package| package.package != project.name)
-        .filter_map(|p| match lockfile.packages.get(&p.package) {
-            Some(locked) if locked.version == p.version => None,
-            _ => Some(p.package),
-        })
+        .filter(|(package, _)| package != &project.name)
+        .filter_map(
+            |(package, installed)| match lockfile.packages.get(&package) {
+                Some(locked) if locked.version == installed.version().to_string() => None,
+                _ => Some(package),
+            },
+        )
         .collect::<Vec<_>>();
 
     outcome.removed = extra_packages.len();
-    let _ = remove_packages_from_venv(&extra_packages);
+    remove_packages_from_venv(&extra_packages).map_err(r::RError::Remove)?;
     if project_is_installed {
-        let _ = remove_packages_from_venv(std::slice::from_ref(&project.name));
+        remove_packages_from_venv(std::slice::from_ref(&project.name))
+            .map_err(r::RError::Remove)?;
     }
 
     let root_dependencies = locked_dependencies_from_description(description)
@@ -2108,7 +2190,7 @@ struct RuntimeStatus {
     missing_base_packages: Vec<String>,
 }
 
-async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
+async fn runtime_status(lockfile: &Lockfile) -> Result<RuntimeStatus, r::BasePackagesError> {
     let runtime = fetch_runtime_info().await;
     let version_mismatch =
         (!lockfile.r.version.is_empty() && lockfile.r.version != runtime.version).then(|| {
@@ -2117,7 +2199,7 @@ async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
                 runtime.version, lockfile.r.version
             )
         });
-    let available_base_packages = base_packages().await.into_iter().collect::<BTreeSet<_>>();
+    let available_base_packages = base_packages().await?.into_iter().collect::<BTreeSet<_>>();
     let locked_base_packages = lockfile
         .r
         .base_packages
@@ -2138,10 +2220,10 @@ async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
         .into_iter()
         .collect();
 
-    RuntimeStatus {
+    Ok(RuntimeStatus {
         version_mismatch,
         missing_base_packages,
-    }
+    })
 }
 
 fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {
@@ -2365,7 +2447,9 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
 }
 
 async fn validate_runtime_for_sync(lockfile: &Lockfile) -> Result<(), RpxError> {
-    let status = runtime_status(lockfile).await;
+    let status = runtime_status(lockfile)
+        .await
+        .map_err(r::RError::BasePackages)?;
 
     if let Some(version_mismatch) = status.version_mismatch {
         warning(RpxWarning::RuntimeVersionMismatch {
@@ -2415,10 +2499,10 @@ async fn install_locked_packages(
         .iter()
         .map(|p| p.package.clone())
         .collect::<BTreeSet<_>>();
-    let installed_packages = installed_packages_async()
+    let installed_packages = installed_packages()
         .await
-        .into_iter()
-        .map(|p| p.package)
+        .map_err(|source| SyncError::InstalledPackages { source })?
+        .into_keys()
         .collect::<BTreeSet<_>>();
 
     let pending_packages = packages
@@ -2440,7 +2524,7 @@ async fn install_locked_packages(
     let r_version = Arc::new(
         r_version_async()
             .await
-            .map_err(|details| SyncError::DownloadArtifactsFailed { details })?,
+            .map_err(|source| SyncError::RVersion { source })?,
     );
     let r_minor = Arc::new(r_minor_version(r_version.as_str()).ok_or_else(|| {
         SyncError::DownloadArtifactsFailed {
@@ -2491,13 +2575,7 @@ async fn install_locked_packages(
 
                     install_project_package(&project_root(), &project_library_path())
                         .await
-                        .map_err(|failure| SyncError::ProjectInstallFailed {
-                            details: install_failure_message(
-                                &package.package,
-                                &package.version,
-                                &failure,
-                            ),
-                        })?;
+                        .map_err(|source| SyncError::ProjectPackageInstall { source })?;
                     {
                         let mut installed_packages = install_installed_packages.lock().await;
                         installed_packages.insert(package_name.clone());
@@ -2710,9 +2788,7 @@ async fn prepare_locked_package_artifact_inner(
         .as_deref()
         .ok_or_else(|| format!("{} is missing source_url", package.package))?;
 
-    let repository = repositories
-        .iter()
-        .find(|repo| source_url.starts_with(&repo.url))
+    let repository = locked_repository_for_source(source_url, repositories)
         .cloned()
         .ok_or_else(|| {
             format!(
@@ -2922,7 +2998,7 @@ async fn install_downloaded_locked_package(
         &temp_library,
     )
     .await
-    .map_err(|failure| install_failure_message(&package.package, &package.version, &failure))?;
+    .map_err(|failure| failure.to_string())?;
 
     let built_package_path = temp_library.join(&package.package);
 
@@ -3044,14 +3120,6 @@ fn macos_binary_target() -> Result<String, String> {
             "unsupported macOS architecture for binary packages: {arch}"
         )),
     }
-}
-
-fn install_failure_message(package: &str, version: &str, failure: &InstallFailure) -> String {
-    format!(
-        "failed to install {package}@{version}: {} (log: {})",
-        failure.summary,
-        failure.log_path.display()
-    )
 }
 
 fn unique_build_token() -> String {
