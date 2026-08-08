@@ -91,10 +91,12 @@ pub struct LockedDependency {
     pub max_version_exclusive: Option<String>,
 }
 
+#[deprecated]
 pub fn read_lockfile() -> Result<Lockfile, String> {
     read_lockfile_optional()?.ok_or_else(|| format!("{LOCKFILE_NAME} not found in project root"))
 }
 
+#[deprecated]
 pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
     let path = lockfile_path_result()?;
 

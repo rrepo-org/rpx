@@ -49,6 +49,7 @@ pub enum DescriptionError {
     },
 }
 
+#[deprecated]
 pub fn read_description() -> Result<RDescription, DescriptionError> {
     let path = description_path()?;
     let contents = fs::read_to_string(&path).map_err(|source| DescriptionError::ReadFailed {
