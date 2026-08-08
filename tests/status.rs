@@ -58,7 +58,7 @@ fn runs_rpx_status_for_lockfile_drift() {
 }
 
 #[test]
-fn reports_old_lockfile_needs_update() {
+fn reports_unsupported_old_lockfile_schema() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-old-lockfile";
     create_package_project(&container, project_path);
@@ -72,21 +72,17 @@ fn reports_old_lockfile_needs_update() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is out of date"),
+        stderr.contains("unsupported rpx.lock schema version 3"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("rpx::lockfile::older"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("Run `rpx lock`"),
+        stderr.contains("rpx::project::lockfile_unsupported_version"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn reports_newer_lockfile_is_incompatible() {
+fn reports_unsupported_newer_lockfile_schema() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-newer-lockfile";
     create_package_project(&container, project_path);
@@ -100,15 +96,11 @@ fn reports_newer_lockfile_is_incompatible() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is incompatible"),
+        stderr.contains("unsupported rpx.lock schema version 999"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("rpx::lockfile::newer"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("Upgrade rpx or regenerate the lockfile with this version."),
+        stderr.contains("rpx::project::lockfile_unsupported_version"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

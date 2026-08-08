@@ -54,8 +54,9 @@ use lockfile::{
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
-    artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
-    project_library_root_path, project_root,
+    LockfileReadError, ManifestReadError, Project, ProjectDiscoveryError, artifact_cache_path,
+    build_temp_library_path, cache_dir_path, project_library_path, project_library_root_path,
+    project_root,
 };
 use r::{
     InstallFailure, base_packages, install_local_package, install_project_package,
@@ -93,6 +94,18 @@ const SYNC_INSTALL_WORKERS: usize = 8;
 
 #[derive(Debug, Error, Diagnostic)]
 enum RpxError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ManifestRead(#[from] ManifestReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
     #[error(transparent)]
     #[diagnostic(transparent)]
     Description(#[from] description::DescriptionError),
@@ -256,13 +269,6 @@ enum StatusError {
     #[error("lockfile is out of date")]
     #[diagnostic(code(rpx::lockfile::older), help("Run `rpx lock` to update rpx.lock."))]
     LockfileOlder,
-
-    #[error("lockfile is incompatible")]
-    #[diagnostic(
-        code(rpx::lockfile::newer),
-        help("Upgrade rpx or regenerate the lockfile with this version.")
-    )]
-    LockfileNewer,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -899,16 +905,12 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
 }
 
 async fn cmd_status() -> Result<(), RpxError> {
-    let description = read_description()?;
+    let project_location = Project::discover()?;
+    let description = project_location.read_manifest()?;
+    let lockfile = project_location.read_lockfile()?;
     let project =
         project_package(&description).map_err(|source| LockError::Repository { source })?;
-    let lockfile = read_project_lockfile()?;
 
-    match validate_lockfile_compatibility(&lockfile) {
-        Ok(()) => {}
-        Err(LockfileCompatibilityError::Older) => return Err(StatusError::LockfileOlder.into()),
-        Err(LockfileCompatibilityError::Newer) => return Err(StatusError::LockfileNewer.into()),
-    }
     if !lockfile_supports_project(&lockfile, &project) {
         return Err(StatusError::LockfileOlder.into());
     }
