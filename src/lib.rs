@@ -47,11 +47,10 @@ mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
-use description::{init_description, read_description, write_description};
+use description::init_description;
 use lockfile::{
     LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedRepository, LockedRepositoryKind,
-    LockedSystemRequirements, Lockfile, locked_repository_for_source, read_lockfile,
-    read_lockfile_optional, write_lockfile,
+    LockedSystemRequirements, Lockfile, locked_repository_for_source,
 };
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
@@ -76,9 +75,8 @@ use crate::{
     lockfile::LockedPackage,
     r::{RVirtualEnv, fetch_runtime_info, r_version_async, remove_packages_from_venv},
     repository::{
-        ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
-        PackageRepository, RepositoryError, RrepoRepository, built_in_repository,
-        parse_repository_url,
+        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
+        RrepoRepository, built_in_repository, parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -95,10 +93,6 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Description(#[from] description::DescriptionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LegacyProject(#[from] LegacyProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -131,20 +125,6 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Status(#[from] StatusError),
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum LegacyProjectError {
-    #[error("failed to read rpx.lock: {details}")]
-    #[diagnostic(
-        code(rpx::project::lockfile_read),
-        help("Run `rpx lock` to regenerate rpx.lock.")
-    )]
-    LockfileRead { details: String },
-
-    #[error("failed to write rpx.lock: {details}")]
-    #[diagnostic(code(rpx::project::lockfile_write))]
-    LockfileWrite { details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -283,13 +263,6 @@ enum RunError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum LockError {
-    #[error("lockfile is incompatible")]
-    #[diagnostic(
-        code(rpx::lockfile::newer),
-        help("Upgrade rpx or regenerate the lockfile with this version.")
-    )]
-    LockfileNewer,
-
     #[error("failed to resolve package set from registry: {details}")]
     #[diagnostic(
         code(rpx::lock::resolve_failed),
@@ -473,43 +446,6 @@ enum RpxWarning {
     ContinuingWithoutSystemDependencies,
 }
 
-#[deprecated]
-fn read_project_lockfile() -> Result<Lockfile, LegacyProjectError> {
-    read_lockfile().map_err(|details| LegacyProjectError::LockfileRead { details })
-}
-
-#[deprecated]
-fn read_current_project_lockfile_optional(
-    description: &RDescription,
-) -> Result<Option<Lockfile>, RpxError> {
-    let Some(lockfile) =
-        read_lockfile_optional().map_err(|details| LegacyProjectError::LockfileRead { details })?
-    else {
-        return Ok(None);
-    };
-
-    if lockfile.version > LOCKFILE_VERSION {
-        return Err(LockError::LockfileNewer.into());
-    }
-
-    let lockfile_roots =
-        roots_from_lockfile(&lockfile).map_err(|details| LockError::ResolveFailed { details })?;
-    if lockfile_roots != roots_from_description(description) {
-        return Ok(None);
-    }
-
-    if !lockfile_repositories_match_description(description, &lockfile) {
-        return Ok(None);
-    }
-
-    Ok(Some(lockfile))
-}
-
-#[deprecated]
-fn write_project_lockfile(lockfile: &Lockfile) -> Result<(), LegacyProjectError> {
-    write_lockfile(lockfile).map_err(|details| LegacyProjectError::LockfileWrite { details })
-}
-
 /// Runs the CLI application.
 ///
 /// # Errors
@@ -620,8 +556,35 @@ async fn cmd_add(
         .iter()
         .map(|package| parse_add_package(package))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut description = read_description()?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let mut description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?
+        .clone();
+    let current_lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let current_lockfile = if current_lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => current_lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let repositories = repository_preference
         .package_repositories(&description, current_lockfile.as_ref())
         .await
@@ -654,7 +617,7 @@ async fn cmd_add(
         &new_packages.iter().cloned().collect::<BTreeSet<_>>(),
     )?;
     let lockfile = lockfile_from_roots(
-        project_repository(&description),
+        project_repository(&project, &description),
         repositories,
         desired_roots,
         preferred_versions,
@@ -665,11 +628,15 @@ async fn cmd_add(
 
     apply_added_packages_to_description(&mut description, &added_relations)?;
 
-    write_description(&description)?;
-    write_project_lockfile(&lockfile)?;
-    let project = validate_project_for_sync(&description, &lockfile).await?;
+    project
+        .write_description(&description)
+        .map_err(project::ProjectError::ManifestWrite)?;
+    project
+        .write_lockfile(&lockfile)
+        .map_err(project::ProjectError::LockfileWrite)?;
+    let project_package = validate_project_for_sync(&description, &lockfile).await?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project).await?;
+    let _ = sync_locked_project(&description, &lockfile, &project_package).await?;
     status(format_args!(
         "Added {}",
         packages
@@ -693,8 +660,35 @@ async fn cmd_repo(command: RepoCommands) -> Result<(), RpxError> {
 }
 
 async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
-    let mut description = read_description()?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let mut description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?
+        .clone();
+    let current_lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let current_lockfile = if current_lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => current_lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
         .package_repositories(&description, current_lockfile.as_ref())
         .await
@@ -741,7 +735,7 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
         &BTreeSet::new(),
     )?;
     let lockfile = lockfile_from_roots(
-        project_repository(&description),
+        project_repository(&project, &description),
         repositories,
         roots,
         preferred_versions,
@@ -750,15 +744,46 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
     )
     .await?;
 
-    write_description(&description)?;
-    write_project_lockfile(&lockfile)?;
+    project
+        .write_description(&description)
+        .map_err(project::ProjectError::ManifestWrite)?;
+    project
+        .write_lockfile(&lockfile)
+        .map_err(project::ProjectError::LockfileWrite)?;
     status(format_args!("Added repository {new_repo_url}"));
     Ok(())
 }
 
 async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxError> {
-    let mut description = read_description()?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let mut description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?
+        .clone();
+    let current_lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let current_lockfile = if current_lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => current_lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
         .package_repositories(&description, current_lockfile.as_ref())
         .await
@@ -797,7 +822,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         &BTreeSet::new(),
     )?;
     let lockfile = lockfile_from_roots(
-        project_repository(&description),
+        project_repository(&project, &description),
         repositories,
         roots,
         preferred_versions,
@@ -812,8 +837,12 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         })?;
     }
 
-    write_description(&description)?;
-    write_project_lockfile(&lockfile)?;
+    project
+        .write_description(&description)
+        .map_err(project::ProjectError::ManifestWrite)?;
+    project
+        .write_lockfile(&lockfile)
+        .map_err(project::ProjectError::LockfileWrite)?;
     status(format_args!("Removed repository {normalized_url}"));
     Ok(())
 }
@@ -823,7 +852,30 @@ async fn cmd_repo_list() -> Result<(), RpxError> {
     let description = project
         .description()
         .map_err(project::ProjectError::Manifest)?;
-    let lockfile = read_current_project_lockfile_optional(&description)?;
+    let lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let lockfile = if lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let additional_repositories = description.additional_repositories().unwrap_or_default();
 
     if additional_repositories.is_empty() {
@@ -861,8 +913,35 @@ async fn cmd_remove(
     packages: &[String],
     repository_preference: DefaultRepositoryPreference,
 ) -> Result<(), RpxError> {
-    let mut description = read_description()?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
+    let mut description = project
+        .description()
+        .map_err(project::ProjectError::Manifest)?
+        .clone();
+    let current_lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let current_lockfile = if current_lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => current_lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let repositories = repository_preference
         .package_repositories(&description, current_lockfile.as_ref())
         .await
@@ -898,7 +977,7 @@ async fn cmd_remove(
         .cloned()
         .collect::<Vec<_>>();
     let lockfile = lockfile_from_roots(
-        project_repository(&description),
+        project_repository(&project, &description),
         repositories,
         desired_roots,
         preferred_versions,
@@ -907,11 +986,15 @@ async fn cmd_remove(
     )
     .await?;
 
-    write_description(&description)?;
-    write_project_lockfile(&lockfile)?;
-    let project = validate_project_for_sync(&description, &lockfile).await?;
+    project
+        .write_description(&description)
+        .map_err(project::ProjectError::ManifestWrite)?;
+    project
+        .write_lockfile(&lockfile)
+        .map_err(project::ProjectError::LockfileWrite)?;
+    let project_package = validate_project_for_sync(&description, &lockfile).await?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project).await?;
+    let _ = sync_locked_project(&description, &lockfile, &project_package).await?;
 
     if !removed.is_empty() {
         status(format_args!("Removed {}", removed.join(", ")));
@@ -948,7 +1031,30 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     let description = project
         .description()
         .map_err(project::ProjectError::Manifest)?;
-    let current_lockfile = read_current_project_lockfile_optional(&description)?;
+    let current_lockfile = project
+        .lockfile_optional()
+        .map_err(project::ProjectError::Lockfile)?
+        .cloned();
+    let current_lockfile = if current_lockfile.is_some() {
+        match project.validate_locked_resolution().await {
+            Ok(()) => current_lockfile,
+            Err(
+                project::LockedResolutionError::RepositoriesChanged
+                | project::LockedResolutionError::PackageRequirementsChanged
+                | project::LockedResolutionError::RVersionChanged { .. },
+            ) => None,
+            Err(project::LockedResolutionError::Lockfile(
+                project::LockfileReadError::UnsupportedVersion {
+                    version, supported, ..
+                },
+            )) if version < supported => None,
+            Err(source) => {
+                return Err(project::ProjectError::LockedResolution(source).into());
+            }
+        }
+    } else {
+        None
+    };
     let repositories = repository_preference
         .package_repositories(&description, current_lockfile.as_ref())
         .await
@@ -961,7 +1067,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     )?;
 
     let lockfile = lockfile_from_roots(
-        project_repository(&description),
+        project_repository(&project, description),
         repositories,
         roots,
         preferred_versions,
@@ -970,7 +1076,9 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     )
     .await?;
     let changed = current_lockfile.as_ref() != Some(&lockfile);
-    write_project_lockfile(&lockfile)?;
+    project
+        .write_lockfile(&lockfile)
+        .map_err(project::ProjectError::LockfileWrite)?;
 
     if changed {
         status("Updated rpx.lock");
@@ -1176,35 +1284,6 @@ async fn package_repositories_from_description(
     .collect()
 }
 
-fn lockfile_repositories_match_description(
-    description: &RDescription,
-    lockfile: &Lockfile,
-) -> bool {
-    let Some(description_repositories) = description
-        .additional_repositories()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|url| parse_repository_url(&url).ok())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let Ok(default_repository) = default_repository_base_url() else {
-        return false;
-    };
-    let Some(lockfile_repositories) = lockfile
-        .repositories
-        .iter()
-        .map(|repository| parse_repository_url(&repository.url).ok())
-        .filter(|url| url.as_ref() != Some(&default_repository))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-
-    description_repositories == lockfile_repositories
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SyncOutcome {
     installed: usize,
@@ -1292,8 +1371,10 @@ fn project_package(description: &RDescription) -> Result<ProjectPackage, Reposit
     Ok(ProjectPackage { name, version })
 }
 
-fn project_repository(description: &RDescription) -> Arc<LocalRepository> {
-    Arc::new(LocalRepository::new(project_root()).with_description(description.clone()))
+fn project_repository(project: &Project, description: &RDescription) -> Arc<LocalRepository> {
+    Arc::new(
+        LocalRepository::new(project.path().to_path_buf()).with_description(description.clone()),
+    )
 }
 
 fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
@@ -1876,12 +1957,6 @@ async fn default_repository() -> Result<Arc<dyn PackageRepository>, RepositoryEr
 
         Err(_) => Ok(built_in_repository()),
     }
-}
-
-fn default_repository_base_url() -> Result<reqwest::Url, RepositoryError> {
-    let value = env::var("RPX_REGISTRY_BASE_URL")
-        .unwrap_or_else(|_| BUILT_IN_REPOSITORY_BASE_URL.to_string());
-    parse_repository_url(&value)
 }
 
 fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str {

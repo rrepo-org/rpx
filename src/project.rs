@@ -95,6 +95,35 @@ pub enum LockfileReadError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
+pub enum ManifestWriteError {
+    #[error("failed to write DESCRIPTION at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::manifest_write_failed))]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum LockfileWriteError {
+    #[error("failed to serialize rpx.lock: {source}")]
+    #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("failed to write rpx.lock at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::lockfile_write_failed))]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
 pub enum LockedResolutionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -187,6 +216,14 @@ pub enum ProjectError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    ManifestWrite(#[from] ManifestWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     LockedResolution(#[from] LockedResolutionError),
 
     #[error(transparent)]
@@ -224,6 +261,10 @@ impl Project {
             .ok_or(ProjectDiscoveryError::NotFound)
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn description(&self) -> Result<&RDescription, ManifestReadError> {
         if let Some(description) = self.description.get() {
             return Ok(description);
@@ -242,6 +283,19 @@ impl Project {
     }
 
     pub fn lockfile(&self) -> Result<&Lockfile, LockfileReadError> {
+        let lockfile = self.read_lockfile()?;
+        if lockfile.version != LOCKFILE_VERSION {
+            return Err(LockfileReadError::UnsupportedVersion {
+                path: self.path.join(LOCKFILE_NAME),
+                version: lockfile.version,
+                supported: LOCKFILE_VERSION,
+            });
+        }
+
+        Ok(lockfile)
+    }
+
+    fn read_lockfile(&self) -> Result<&Lockfile, LockfileReadError> {
         if let Some(lockfile) = self.lockfile.get() {
             return Ok(lockfile);
         }
@@ -264,15 +318,36 @@ impl Project {
             }
         })?;
 
-        if lockfile.version != LOCKFILE_VERSION {
-            return Err(LockfileReadError::UnsupportedVersion {
-                path,
-                version: lockfile.version,
-                supported: LOCKFILE_VERSION,
-            });
+        Ok(self.lockfile.get_or_init(|| lockfile))
+    }
+
+    pub fn lockfile_optional(&self) -> Result<Option<&Lockfile>, LockfileReadError> {
+        let path = self.path.join(LOCKFILE_NAME);
+        if !path
+            .try_exists()
+            .map_err(|source| LockfileReadError::Read {
+                path: path.clone(),
+                source,
+            })?
+        {
+            return Ok(None);
         }
 
-        Ok(self.lockfile.get_or_init(|| lockfile))
+        self.read_lockfile().map(Some)
+    }
+
+    pub fn write_description(&self, description: &RDescription) -> Result<(), ManifestWriteError> {
+        let path = self.path.join(DESCRIPTION_NAME);
+        fs::write(&path, description.to_string())
+            .map_err(|source| ManifestWriteError::Write { path, source })
+    }
+
+    pub fn write_lockfile(&self, lockfile: &Lockfile) -> Result<(), LockfileWriteError> {
+        let contents = serde_json::to_string_pretty(lockfile)
+            .map_err(|source| LockfileWriteError::Serialize { source })?;
+        let path = self.path.join(LOCKFILE_NAME);
+        fs::write(&path, format!("{contents}\n"))
+            .map_err(|source| LockfileWriteError::Write { path, source })
     }
 
     pub fn locked_packages(&self) -> Result<BTreeMap<String, PackageVersion>, LockedPackagesError> {
@@ -477,16 +552,6 @@ pub fn new_project_description_path() -> Result<PathBuf, ProjectPathError> {
     Ok(current_dir()?.join(DESCRIPTION_NAME))
 }
 
-pub fn description_path() -> Result<PathBuf, ProjectPathError> {
-    Ok(project_root_result()?.join(DESCRIPTION_NAME))
-}
-
-pub fn lockfile_path_result() -> Result<PathBuf, String> {
-    Ok(project_root_result()
-        .map_err(|error| error.to_string())?
-        .join(LOCKFILE_NAME))
-}
-
 pub fn project_library_path() -> PathBuf {
     let library_path = project_library_root_path().join("library");
 
@@ -641,6 +706,75 @@ mod tests {
                 .revision,
             1
         );
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn reads_optional_lockfile_and_writes_project_files_at_root() {
+        let path = project_directory("project-files");
+        let project = Project::new(path.clone());
+        assert!(
+            project
+                .lockfile_optional()
+                .expect("missing lockfile should be allowed")
+                .is_none()
+        );
+
+        let description = "Package: project\nVersion: 1.0.0\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+        let lockfile = serde_json::from_str::<Lockfile>(
+            r#"{"version":4,"revision":1,"roots":[],"packages":{}}"#,
+        )
+        .expect("lockfile should parse");
+
+        project
+            .write_description(&description)
+            .expect("DESCRIPTION should be written");
+        project
+            .write_lockfile(&lockfile)
+            .expect("lockfile should be written");
+
+        assert_eq!(
+            fs::read_to_string(path.join(DESCRIPTION_NAME))
+                .expect("DESCRIPTION should be readable"),
+            description.to_string()
+        );
+        assert_eq!(
+            project
+                .lockfile_optional()
+                .expect("lockfile should load")
+                .expect("lockfile should exist")
+                .revision,
+            1
+        );
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn optional_lockfile_allows_migration_from_an_older_schema() {
+        let path = project_directory("old-optional-lockfile");
+        fs::write(
+            path.join(LOCKFILE_NAME),
+            r#"{"version":3,"roots":[],"packages":{}}"#,
+        )
+        .expect("lockfile should be written");
+        let project = Project::new(path.clone());
+
+        assert_eq!(
+            project
+                .lockfile_optional()
+                .expect("optional lockfile should load")
+                .expect("lockfile should exist")
+                .version,
+            3
+        );
+        assert!(matches!(
+            project.lockfile(),
+            Err(LockfileReadError::UnsupportedVersion { version: 3, .. })
+        ));
 
         fs::remove_dir_all(path).expect("project directory should be removed");
     }
