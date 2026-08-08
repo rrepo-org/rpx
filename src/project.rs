@@ -1,15 +1,19 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::lossless::RDescription;
+use r_description::lossless::{RDescription, Version};
 use std::{
-    collections::hash_map::DefaultHasher,
+    cell::OnceCell,
+    collections::{BTreeMap, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
 
-use crate::lockfile::{LOCKFILE_VERSION, Lockfile};
+use crate::{
+    lockfile::{LOCKFILE_VERSION, Lockfile},
+    resolver::is_base_package,
+};
 
 pub const LOCKFILE_NAME: &str = "rpx.lock";
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
@@ -81,9 +85,40 @@ pub enum LockfileReadError {
     },
 }
 
-pub struct Project(PathBuf);
+#[derive(Debug, Error, Diagnostic)]
+pub enum DesiredPackagesError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Manifest(#[from] ManifestReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lockfile(#[from] LockfileReadError),
+
+    #[error("DESCRIPTION at {} is missing required field {field}", path.display())]
+    #[diagnostic(code(rpx::project::manifest_missing_field))]
+    MissingField { path: PathBuf, field: &'static str },
+
+    #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
+    #[diagnostic(code(rpx::project::manifest_invalid_version))]
+    InvalidVersion { path: PathBuf, details: String },
+}
+
+pub struct Project {
+    path: PathBuf,
+    description: OnceCell<RDescription>,
+    lockfile: OnceCell<Lockfile>,
+}
 
 impl Project {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            description: OnceCell::new(),
+            lockfile: OnceCell::new(),
+        }
+    }
+
     pub fn discover() -> Result<Self, ProjectDiscoveryError> {
         let current_dir = env::current_dir()
             .map_err(|source| ProjectDiscoveryError::CurrentDirectory { source })?;
@@ -95,24 +130,33 @@ impl Project {
                     || directory.join(DESCRIPTION_NAME).is_file()
                     || directory.join(LOCKFILE_NAME).is_file()
             })
-            .map(|directory| Self(directory.to_path_buf()))
+            .map(|directory| Self::new(directory.to_path_buf()))
             .ok_or(ProjectDiscoveryError::NotFound)
     }
 
-    pub fn read_manifest(&self) -> Result<RDescription, ManifestReadError> {
-        let path = self.0.join(DESCRIPTION_NAME);
+    pub fn description(&self) -> Result<&RDescription, ManifestReadError> {
+        if let Some(description) = self.description.get() {
+            return Ok(description);
+        }
+
+        let path = self.path.join(DESCRIPTION_NAME);
         let contents = fs::read_to_string(&path).map_err(|source| ManifestReadError::Read {
             path: path.clone(),
             source,
         })?;
-
-        contents
+        let description = contents
             .parse()
-            .map_err(|source| ManifestReadError::Parse { path, source })
+            .map_err(|source| ManifestReadError::Parse { path, source })?;
+
+        Ok(self.description.get_or_init(|| description))
     }
 
-    pub fn read_lockfile(&self) -> Result<Lockfile, LockfileReadError> {
-        let path = self.0.join(LOCKFILE_NAME);
+    pub fn lockfile(&self) -> Result<&Lockfile, LockfileReadError> {
+        if let Some(lockfile) = self.lockfile.get() {
+            return Ok(lockfile);
+        }
+
+        let path = self.path.join(LOCKFILE_NAME);
         let contents = fs::read_to_string(&path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 LockfileReadError::NotFound { path: path.clone() }
@@ -138,7 +182,37 @@ impl Project {
             });
         }
 
-        Ok(lockfile)
+        Ok(self.lockfile.get_or_init(|| lockfile))
+    }
+
+    pub fn desired_packages(&self) -> Result<BTreeMap<String, String>, DesiredPackagesError> {
+        let mut packages = self
+            .lockfile()?
+            .packages
+            .iter()
+            .filter(|(name, _)| !is_base_package(name))
+            .map(|(name, package)| (name.clone(), package.version.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let description = self.description()?;
+        let path = self.path.join(DESCRIPTION_NAME);
+        let package = description
+            .package()
+            .ok_or_else(|| DesiredPackagesError::MissingField {
+                path: path.clone(),
+                field: "Package",
+            })?;
+        let version = description
+            .version()
+            .ok_or_else(|| DesiredPackagesError::MissingField {
+                path: path.clone(),
+                field: "Version",
+            })?
+            .parse::<Version>()
+            .map_err(|details| DesiredPackagesError::InvalidVersion { path, details })?;
+        packages.insert(package, version.to_string());
+
+        Ok(packages)
     }
 }
 
@@ -250,4 +324,116 @@ fn hash_path(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn project_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be valid")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "rpx-project-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("project directory should be created");
+        path
+    }
+
+    #[test]
+    fn caches_description_and_lockfile_after_first_read() {
+        let path = project_directory("cached-files");
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: initial\nVersion: 1.0.0\n",
+        )
+        .expect("DESCRIPTION should be written");
+        fs::write(
+            path.join(LOCKFILE_NAME),
+            r#"{"version":4,"revision":1,"roots":[],"packages":{}}"#,
+        )
+        .expect("lockfile should be written");
+        let project = Project::new(path.clone());
+
+        assert_eq!(
+            project
+                .description()
+                .expect("DESCRIPTION should load")
+                .package()
+                .as_deref(),
+            Some("initial")
+        );
+        assert_eq!(
+            project.lockfile().expect("lockfile should load").revision,
+            1
+        );
+
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: changed\nVersion: 2.0.0\n",
+        )
+        .expect("DESCRIPTION should be replaced");
+        fs::write(
+            path.join(LOCKFILE_NAME),
+            r#"{"version":4,"revision":2,"roots":[],"packages":{}}"#,
+        )
+        .expect("lockfile should be replaced");
+
+        assert_eq!(
+            project
+                .description()
+                .expect("cached DESCRIPTION should be returned")
+                .package()
+                .as_deref(),
+            Some("initial")
+        );
+        assert_eq!(
+            project
+                .lockfile()
+                .expect("cached lockfile should be returned")
+                .revision,
+            1
+        );
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn desired_packages_adds_project_and_excludes_base_packages() {
+        let path = project_directory("desired-packages");
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: project\nVersion: 2.0.0\n",
+        )
+        .expect("DESCRIPTION should be written");
+        fs::write(
+            path.join(LOCKFILE_NAME),
+            r#"{
+                "version": 4,
+                "roots": [],
+                "packages": {
+                    "digest": {"package": "digest", "version": "0.6.39"},
+                    "project": {"package": "project", "version": "1.0.0"},
+                    "stats": {"package": "stats", "version": "4.5.0"}
+                }
+            }"#,
+        )
+        .expect("lockfile should be written");
+        let project = Project::new(path.clone());
+
+        let packages = project
+            .desired_packages()
+            .expect("desired packages should load");
+
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages.get("digest").map(String::as_str), Some("0.6.39"));
+        assert_eq!(packages.get("project").map(String::as_str), Some("2.0.0"));
+        assert!(!packages.contains_key("stats"));
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
 }

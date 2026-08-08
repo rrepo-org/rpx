@@ -270,30 +270,6 @@ Status computation must not hide additional filesystem, R, repository, or host
 queries. Repository availability and credentials do not affect whether an
 already-locked project is in sync.
 
-Status should consume one expected package/version projection instead of
-special-casing the workspace package. Until locked resolution reconstruction
-owns this operation, use a pure helper conceptually shaped as:
-
-```text
-expected_package_versions(manifest, lockfile) -> package/version map
-```
-
-The projection contains every non-base locked package plus the package and
-version declared by the workspace manifest. The manifest entry replaces a
-legacy lock entry with the same package name. Its keys drive missing and extra
-package checks, and its values drive one generic installed-version mismatch
-check for both workspace and external packages.
-
-The path-only `Project` abstraction must not own this operation. It derives
-from already-loaded documents and will eventually belong to the reconstructed
-locked resolution.
-
-As part of that migration, remove status's legacy
-`lockfile_supports_project` check. Whether the workspace package was
-incorrectly serialized among external packages is repaired by relocking and
-does not require a dedicated status validation path. Sync will retain any
-structural validation needed before applying a lock.
-
 ## Modification Pipeline
 
 Add/remove package and add/remove repository commands follow one pipeline:

@@ -54,9 +54,9 @@ use lockfile::{
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
-    LockfileReadError, ManifestReadError, Project, ProjectDiscoveryError, artifact_cache_path,
-    build_temp_library_path, cache_dir_path, project_library_path, project_library_root_path,
-    project_root,
+    DesiredPackagesError, LockfileReadError, ManifestReadError, Project, ProjectDiscoveryError,
+    artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
+    project_library_root_path, project_root,
 };
 use r::{
     InstallFailure, base_packages, install_local_package, install_project_package,
@@ -108,6 +108,10 @@ enum RpxError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    DesiredPackages(#[from] DesiredPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     Description(#[from] description::DescriptionError),
 
     #[error(transparent)]
@@ -129,10 +133,6 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Lock(#[from] LockError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Status(#[from] StatusError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -262,13 +262,6 @@ fn lock_error_from_resolution(error: ResolutionError) -> LockError {
         }
         source => LockError::Resolution { source },
     }
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum StatusError {
-    #[error("lockfile is out of date")]
-    #[diagnostic(code(rpx::lockfile::older), help("Run `rpx lock` to update rpx.lock."))]
-    LockfileOlder,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -905,18 +898,13 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
 }
 
 async fn cmd_status() -> Result<(), RpxError> {
-    let project_location = Project::discover()?;
-    let description = project_location.read_manifest()?;
-    let lockfile = project_location.read_lockfile()?;
-    let project =
-        project_package(&description).map_err(|source| LockError::Repository { source })?;
+    let project = Project::discover()?;
+    let description = project.description()?;
+    let lockfile = project.lockfile()?;
+    let desired_packages = project.desired_packages()?;
 
-    if !lockfile_supports_project(&lockfile, &project) {
-        return Err(StatusError::LockfileOlder.into());
-    }
-
-    let manifest_requirements = manifest_requirement_names(&description);
-    let lock_requirements = lockfile_requirement_names(&lockfile);
+    let manifest_requirements = manifest_requirement_names(description);
+    let lock_requirements = lockfile_requirement_names(lockfile);
     let installed = installed_packages().await;
     let installed_names = installed
         .iter()
@@ -926,11 +914,10 @@ async fn cmd_status() -> Result<(), RpxError> {
         .iter()
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut desired_names = lockfile.packages.keys().cloned().collect::<BTreeSet<_>>();
-    desired_names.insert(project.name.clone());
-    let runtime_status = runtime_status(&lockfile).await;
+    let desired_names = desired_packages.keys().cloned().collect::<BTreeSet<_>>();
+    let runtime_status = runtime_status(lockfile).await;
     let system_plan = if host_supports_system_sync() {
-        system_plan_from_lockfile(&lockfile).ok()
+        system_plan_from_lockfile(lockfile).ok()
     } else {
         None
     };
@@ -951,32 +938,17 @@ async fn cmd_status() -> Result<(), RpxError> {
         .difference(&desired_names)
         .cloned()
         .collect::<Vec<_>>();
-    let mut version_mismatches = lockfile
-        .packages
+    let version_mismatches = desired_packages
         .iter()
-        .filter(|(name, _)| !is_base_package(name))
-        .filter_map(|(name, package)| {
+        .filter_map(|(name, expected_version)| {
             installed_versions
                 .get(name)
-                .filter(|installed_version| *installed_version != &package.version)
+                .filter(|installed_version| *installed_version != expected_version)
                 .map(|installed_version| {
-                    format!(
-                        "{name} ({installed_version} installed, {} locked)",
-                        package.version
-                    )
+                    format!("{name} ({installed_version} installed, {expected_version} expected)")
                 })
         })
         .collect::<Vec<_>>();
-    let project_version = project.version.to_string();
-    if let Some(installed_version) = installed_versions
-        .get(&project.name)
-        .filter(|installed_version| *installed_version != &project_version)
-    {
-        version_mismatches.push(format!(
-            "{} ({installed_version} installed, {project_version} expected)",
-            project.name
-        ));
-    }
 
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()

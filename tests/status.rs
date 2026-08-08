@@ -239,7 +239,7 @@ fn runs_rpx_status_for_version_mismatch() {
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("0.0.1 locked"),
+        stdout.contains("0.0.1 expected"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
