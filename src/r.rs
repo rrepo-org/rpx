@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Output,
@@ -291,7 +291,7 @@ pub async fn installed_packages() -> Result<BTreeMap<String, PackageVersion>, In
     parse_installed_packages(&stdout)
 }
 
-pub fn remove_packages_from_venv(packages: &[String]) -> Result<(), PackageRemovalError> {
+pub fn remove_packages_from_venv(packages: &BTreeSet<String>) -> Result<(), PackageRemovalError> {
     packages
         .iter()
         .try_for_each(|package| remove_package_from_venv(package))

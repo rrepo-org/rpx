@@ -277,7 +277,7 @@ fn adds_and_removes_multiple_packages() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Removed digest, cli"),
+        stdout.contains("Removed cli, digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert_package_state(&container, project_path, "digest", "FALSE");

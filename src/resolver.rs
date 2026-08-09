@@ -405,9 +405,9 @@ pub(crate) async fn resolve_from_registry(
     root: Arc<LocalRepository>,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
-) -> Result<Vec<(String, PackageVersion)>, ResolutionError> {
+) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
     if root_relations.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
 
     let root_count = root_relations.len();
@@ -437,12 +437,10 @@ pub(crate) async fn resolve_from_registry(
 
         let selected = resolve(&provider, root_package.clone(), root_version)?;
 
-        let mut selected = selected
+        let selected = selected
             .into_iter()
             .filter(|(package, _)| package != &root_package)
-            .collect::<Vec<_>>();
-
-        selected.sort_by(|left, right| left.0.cmp(&right.0));
+            .collect::<BTreeMap<_, _>>();
         resolve_span.record("selected", selected.len());
 
         Ok::<_, ResolutionError>(selected)
@@ -767,7 +765,10 @@ mod tests {
         .await
         .expect("resolution should backtrack to a root-compatible version");
 
-        assert_eq!(selected, vec![("testthat".to_string(), testthat_3_0)]);
+        assert_eq!(
+            selected,
+            BTreeMap::from([("testthat".to_string(), testthat_3_0)])
+        );
         assert!(
             !remote_repository
                 .version_queries

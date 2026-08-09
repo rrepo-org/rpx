@@ -169,7 +169,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 4,\n  \"revision\": 0,\n  \"repositories\": [\n    {{\n      \"url\": \"https://upstream.rrepo.dev/cran\",\n      \"kind\": \"rrepo\"\n    }}\n  ],\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"source_url\": \"https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && r_version=$(Rscript -e 'cat(as.character(getRversion()))') && cat > rpx.lock <<EOF\n{{\n  \"version\": 4,\n  \"revision\": 0,\n  \"repositories\": [\n    {{\n      \"url\": \"https://upstream.rrepo.dev/cran\",\n      \"kind\": \"rrepo\"\n    }}\n  ],\n  \"r\": {{\n    \"version\": \"$r_version\"\n  }},\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"source_url\": \"https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -204,11 +204,11 @@ fn refuses_to_sync_old_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is out of date"),
+        stderr.contains("unsupported rpx.lock schema version 3"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("Run `rpx lock`"),
+        stderr.contains("rpx::project::lockfile_unsupported_version"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -228,11 +228,11 @@ fn refuses_to_sync_newer_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is incompatible"),
+        stderr.contains("unsupported rpx.lock schema version 999"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("Upgrade rpx or regenerate the lockfile with this version."),
+        stderr.contains("rpx::project::lockfile_unsupported_version"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -279,7 +279,7 @@ Imports: digest, jsonlite",
 }
 
 #[test]
-fn runs_rpx_sync_ignores_repository_changes() {
+fn refuses_to_sync_repository_changes() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-repo-drift";
     create_package_project(&container, project_path);
@@ -296,5 +296,9 @@ fn runs_rpx_sync_ignores_repository_changes() {
 
     let sync_command = format!("cd {project_path} && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::project::repositories_changed"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 }

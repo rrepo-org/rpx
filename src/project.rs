@@ -25,6 +25,7 @@ use crate::{
 
 pub const LOCKFILE_NAME: &str = "rpx.lock";
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
+pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum ProjectDiscoveryError {
@@ -180,6 +181,10 @@ pub enum LockedPackagesError {
         details: String,
     },
 
+    #[error("locked package map key {key} does not match package field {package}")]
+    #[diagnostic(code(rpx::project::locked_package_name_mismatch))]
+    LockedPackageNameMismatch { key: String, package: String },
+
     #[error("locked package {package} is missing source_url")]
     #[diagnostic(code(rpx::project::locked_package_missing_source_url))]
     MissingSourceUrl { package: String },
@@ -193,6 +198,10 @@ pub enum LockedPackagesError {
     #[error("invalid locked repository URL {url}: {details}")]
     #[diagnostic(code(rpx::project::locked_repository_invalid_url))]
     InvalidRepository { url: String, details: String },
+
+    #[error("failed to reconstruct DESCRIPTION for locked package {package}: {details}")]
+    #[diagnostic(code(rpx::project::locked_package_description_invalid))]
+    InvalidLockedDescription { package: String, details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -346,12 +355,26 @@ impl Project {
     }
 
     pub fn locked_packages(&self) -> Result<BTreeMap<String, PackageVersion>, LockedPackagesError> {
+        Ok(self
+            .required_packages_from_lockfile()?
+            .into_iter()
+            .map(|(name, (version, _))| (name, version))
+            .collect())
+    }
+
+    pub fn required_packages_from_lockfile(&self) -> Result<RequiredPackages, LockedPackagesError> {
         let lockfile = self.lockfile()?;
         let mut packages = lockfile
             .packages
             .iter()
             .filter(|(name, _)| !is_base_package(name))
             .map(|(name, package)| {
+                if package.package != *name {
+                    return Err(LockedPackagesError::LockedPackageNameMismatch {
+                        key: name.clone(),
+                        package: package.package.clone(),
+                    });
+                }
                 let version = package.version.parse().map_err(|details| {
                     LockedPackagesError::InvalidLockedVersion {
                         package: name.clone(),
@@ -371,12 +394,20 @@ impl Project {
                 })?;
                 let repository = package_repository(repository)?;
 
-                Ok((name.clone(), PackageVersion::new(version, repository)))
+                let description = locked_package_description(name, package)?;
+
+                Ok((
+                    name.clone(),
+                    (
+                        PackageVersion::new(version, repository),
+                        Arc::new(description),
+                    ),
+                ))
             })
             .collect::<Result<BTreeMap<_, _>, LockedPackagesError>>()?;
 
         let (package, version) = self.root_package()?;
-        packages.insert(package, version);
+        packages.insert(package, (version, Arc::new(self.description()?.clone())));
 
         Ok(packages)
     }
@@ -423,6 +454,35 @@ impl Project {
 
         Ok(())
     }
+}
+
+fn locked_package_description(
+    name: &str,
+    package: &crate::lockfile::LockedPackage,
+) -> Result<RDescription, LockedPackagesError> {
+    let mut contents = format!("Package: {name}\nVersion: {}\n", package.version);
+
+    for kind in ["Depends", "Imports", "LinkingTo"] {
+        let dependencies = package
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind == kind)
+            .map(|dependency| dependency.package.as_str())
+            .collect::<BTreeSet<_>>();
+        if !dependencies.is_empty() {
+            contents.push_str(kind);
+            contents.push_str(": ");
+            contents.push_str(&dependencies.into_iter().collect::<Vec<_>>().join(", "));
+            contents.push('\n');
+        }
+    }
+
+    contents.parse::<RDescription>().map_err(|error| {
+        LockedPackagesError::InvalidLockedDescription {
+            package: name.to_string(),
+            details: error.to_string(),
+        }
+    })
 }
 
 fn package_repository(
@@ -901,7 +961,10 @@ mod tests {
                     "digest": {
                         "package": "digest",
                         "version": "0.6.39",
-                        "source_url": "https://repo.test/example2/packages/digest/source"
+                        "source_url": "https://repo.test/example2/packages/digest/source",
+                        "dependencies": [
+                            {"package": "cli", "kind": "Imports"}
+                        ]
                     },
                     "project": {
                         "package": "project",
@@ -916,12 +979,13 @@ mod tests {
         let project = Project::new(path.clone());
 
         let packages = project
-            .locked_packages()
-            .expect("locked packages should load");
+            .required_packages_from_lockfile()
+            .expect("required packages should load");
 
         assert_eq!(packages.len(), 2);
-        let digest = packages.get("digest").expect("digest should be locked");
+        let (digest, description) = packages.get("digest").expect("digest should be locked");
         assert_eq!(digest.version().to_string(), "0.6.39");
+        assert_eq!(description.imports().unwrap().to_string(), "cli");
         assert_eq!(
             digest
                 .repository()
@@ -932,7 +996,7 @@ mod tests {
                 .as_str(),
             "https://repo.test/example2"
         );
-        let root = packages.get("project").expect("project should be locked");
+        let (root, _) = packages.get("project").expect("project should be locked");
         assert_eq!(root.version().to_string(), "2.0.0");
         assert_eq!(
             root.repository()
