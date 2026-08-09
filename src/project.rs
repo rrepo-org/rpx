@@ -155,6 +155,21 @@ pub enum LockedResolutionError {
     RVersionChanged { locked: String, current: String },
 }
 
+impl LockedResolutionError {
+    pub fn allows_relock(&self) -> bool {
+        match self {
+            Self::RepositoriesChanged
+            | Self::PackageRequirementsChanged
+            | Self::RVersionChanged { .. }
+            | Self::Lockfile(LockfileReadError::NotFound { .. }) => true,
+            Self::Lockfile(LockfileReadError::UnsupportedVersion {
+                version, supported, ..
+            }) => version < supported,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum LockedPackagesError {
     #[error(transparent)]
@@ -355,14 +370,18 @@ impl Project {
     }
 
     pub fn locked_packages(&self) -> Result<BTreeMap<String, PackageVersion>, LockedPackagesError> {
+        let description = self.description()?;
         Ok(self
-            .required_packages_from_lockfile()?
+            .required_packages_from_lockfile(description)?
             .into_iter()
             .map(|(name, (version, _))| (name, version))
             .collect())
     }
 
-    pub fn required_packages_from_lockfile(&self) -> Result<RequiredPackages, LockedPackagesError> {
+    pub fn required_packages_from_lockfile(
+        &self,
+        root_description: &RDescription,
+    ) -> Result<RequiredPackages, LockedPackagesError> {
         let lockfile = self.lockfile()?;
         let mut packages = lockfile
             .packages
@@ -406,14 +425,16 @@ impl Project {
             })
             .collect::<Result<BTreeMap<_, _>, LockedPackagesError>>()?;
 
-        let (package, version) = self.root_package()?;
-        packages.insert(package, (version, Arc::new(self.description()?.clone())));
+        let (package, version) = self.root_package_for(root_description)?;
+        packages.insert(package, (version, Arc::new(root_description.clone())));
 
         Ok(packages)
     }
 
-    pub fn root_package(&self) -> Result<(String, PackageVersion), LockedPackagesError> {
-        let description = self.description()?;
+    fn root_package_for(
+        &self,
+        description: &RDescription,
+    ) -> Result<(String, PackageVersion), LockedPackagesError> {
         let path = self.path.join(DESCRIPTION_NAME);
         let package = description
             .package()
@@ -435,11 +456,15 @@ impl Project {
         Ok((package, PackageVersion::new(version, repository)))
     }
 
-    pub fn validate_locked_resolution(&self, r_version: &str) -> Result<(), LockedResolutionError> {
+    pub fn validate_locked_resolution(
+        &self,
+        description: &RDescription,
+        repositories: &[LockedRepository],
+        r_version: &str,
+    ) -> Result<&Lockfile, LockedResolutionError> {
         let lockfile = self.lockfile()?;
-        let description = self.description()?;
 
-        if !repositories_match(description, lockfile) {
+        if lockfile.repositories != repositories {
             return Err(LockedResolutionError::RepositoriesChanged);
         }
         if !roots_match(description, lockfile) {
@@ -452,7 +477,7 @@ impl Project {
             });
         }
 
-        Ok(())
+        Ok(lockfile)
     }
 }
 
@@ -504,10 +529,6 @@ fn package_repository(
                 .unwrap_or(ArchiveSupport::Unavailable),
         )),
     })
-}
-
-fn repositories_match(description: &RDescription, lockfile: &Lockfile) -> bool {
-    locked_default_repository_enabled(description, lockfile).is_some()
 }
 
 pub(crate) fn locked_default_repository_enabled(
@@ -850,14 +871,27 @@ mod tests {
         )
         .expect("lockfile should be written");
         let project = Project::new(path.clone());
+        let description = project.description().expect("description should load");
 
         project
-            .validate_locked_resolution("4.5.0")
+            .validate_locked_resolution(description, &[], "4.5.0")
             .expect("matching R version should validate");
         assert!(matches!(
-            project.validate_locked_resolution("4.4.0"),
+            project.validate_locked_resolution(description, &[], "4.4.0"),
             Err(LockedResolutionError::RVersionChanged { locked, current })
                 if locked == "4.5.0" && current == "4.4.0"
+        ));
+        assert!(matches!(
+            project.validate_locked_resolution(
+                description,
+                &[LockedRepository {
+                    url: "https://example.test/cran".to_string(),
+                    kind: LockedRepositoryKind::Rrepo,
+                    cran_archive_support: None,
+                }],
+                "4.5.0",
+            ),
+            Err(LockedResolutionError::RepositoriesChanged)
         ));
 
         fs::remove_dir_all(path).expect("project directory should be removed");
@@ -977,9 +1011,10 @@ mod tests {
         )
         .expect("lockfile should be written");
         let project = Project::new(path.clone());
+        let description = project.description().expect("description should load");
 
         let packages = project
-            .required_packages_from_lockfile()
+            .required_packages_from_lockfile(description)
             .expect("required packages should load");
 
         assert_eq!(packages.len(), 2);
