@@ -1,4 +1,6 @@
 mod cran;
+#[allow(dead_code)]
+mod git;
 mod local;
 mod rrepo;
 
@@ -18,6 +20,8 @@ use std::{
 use thiserror::Error;
 
 pub use cran::CranRepository;
+#[allow(unused_imports)]
+pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
@@ -87,6 +91,29 @@ pub enum RepositoryError {
     #[error("local repository at {path} does not contain {package} {version}")]
     PackageVersionNotFound {
         path: PathBuf,
+        package: String,
+        version: Version,
+    },
+
+    #[allow(dead_code)]
+    #[error("Git repository {repository} failed: {source}")]
+    Git {
+        repository: String,
+        #[source]
+        source: Arc<crate::git::GitError>,
+    },
+
+    #[allow(dead_code)]
+    #[error("DESCRIPTION from {repository} is missing {field}")]
+    MissingRepositoryField {
+        repository: String,
+        field: &'static str,
+    },
+
+    #[allow(dead_code)]
+    #[error("repository {repository} does not contain {package} {version}")]
+    RepositoryPackageVersionNotFound {
+        repository: String,
         package: String,
         version: Version,
     },
