@@ -174,13 +174,6 @@ pub enum RError {
     Remove(#[from] PackageRemovalError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeInfo {
-    pub version: String,
-    pub platform: String,
-    pub pkg_type: String,
-}
-
 pub(crate) trait RVirtualEnv {
     fn with_venv(program: impl AsRef<str>) -> Self;
 }
@@ -436,36 +429,6 @@ fn write_install_log(
         path: log_path.to_path_buf(),
         source,
     })
-}
-
-#[deprecated]
-pub async fn fetch_runtime_info() -> RuntimeInfo {
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg("cat(as.character(getRversion()), '\t', R.version$platform, '\t', .Platform$pkgType, sep = '')")
-        .output()
-        .await
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(output.status.code());
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parts = stdout.trim().splitn(3, '\t');
-
-    RuntimeInfo {
-        version: parts
-            .next()
-            .expect("R version should be present")
-            .to_string(),
-        platform: parts
-            .next()
-            .expect("R platform should be present")
-            .to_string(),
-        pkg_type: parts
-            .next()
-            .expect("R package type should be present")
-            .to_string(),
-    }
 }
 
 async fn fetch_base_packages() -> Result<Vec<String>, BasePackagesError> {

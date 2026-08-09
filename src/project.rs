@@ -16,7 +16,6 @@ use crate::{
         LOCKFILE_VERSION, LockedRepository, LockedRepositoryKind, Lockfile,
         locked_repository_for_source,
     },
-    r::{RVersionError, r_version_async},
     repository::{
         ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
         PackageRepository, RrepoRepository, parse_repository_url,
@@ -132,10 +131,6 @@ pub enum LockedResolutionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Lockfile(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
 
     #[error("repository configuration no longer matches rpx.lock")]
     #[diagnostic(
@@ -409,12 +404,9 @@ impl Project {
         Ok((package, PackageVersion::new(version, repository)))
     }
 
-    pub async fn validate_locked_resolution(&self) -> Result<(), LockedResolutionError> {
+    pub fn validate_locked_resolution(&self, r_version: &str) -> Result<(), LockedResolutionError> {
         let lockfile = self.lockfile()?;
         let description = self.description()?;
-        let r_version = r_version_async()
-            .await
-            .map_err(LockedResolutionError::RVersion)?;
 
         if !repositories_match(description, lockfile) {
             return Err(LockedResolutionError::RepositoriesChanged);
@@ -425,7 +417,7 @@ impl Project {
         if lockfile.r.version != r_version {
             return Err(LockedResolutionError::RVersionChanged {
                 locked: lockfile.r.version.clone(),
-                current: r_version,
+                current: r_version.to_string(),
             });
         }
 
@@ -774,6 +766,38 @@ mod tests {
         assert!(matches!(
             project.lockfile(),
             Err(LockfileReadError::UnsupportedVersion { version: 3, .. })
+        ));
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn validates_locked_resolution_against_supplied_r_version() {
+        let path = project_directory("locked-r-version");
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: project\nVersion: 1.0.0\n",
+        )
+        .expect("DESCRIPTION should be written");
+        fs::write(
+            path.join(LOCKFILE_NAME),
+            r#"{
+                "version": 4,
+                "r": {"version": "4.5.0"},
+                "roots": [],
+                "packages": {}
+            }"#,
+        )
+        .expect("lockfile should be written");
+        let project = Project::new(path.clone());
+
+        project
+            .validate_locked_resolution("4.5.0")
+            .expect("matching R version should validate");
+        assert!(matches!(
+            project.validate_locked_resolution("4.4.0"),
+            Err(LockedResolutionError::RVersionChanged { locked, current })
+                if locked == "4.5.0" && current == "4.4.0"
         ));
 
         fs::remove_dir_all(path).expect("project directory should be removed");

@@ -309,6 +309,301 @@ Sync follows a deliberately different path:
 
 Sync never resolves around drift and never advances a moving Git reference.
 
+## Command Migration Roadmap
+
+The command-first migration uses the `modify_and_sync` pseudocode discussed
+during implementation as inspiration, not as a literal Rust API. In
+particular, an unconstrained `add` must perform asynchronous repository lookup
+before it can finish mutating the manifest. Commands therefore prepare their
+specific mutation and then enter shared resolution, persistence, and sync
+layers.
+
+### Completed Checkpoints
+
+Phase 1 moved command-scoped project file access onto `Project`:
+
+- Add, remove, repository, lock, sync, and status commands discover one
+  `Project`.
+- `DESCRIPTION` and `rpx.lock` reads are cached by that project.
+- Optional lock reads and root-relative manifest and lock writes belong to the
+  project.
+- Superseded global manifest and lock readers and writers were removed.
+- Optional-lock consumers validate a present lock before deciding whether to
+  reuse it, and status validates its required lock. The consumer, not the error
+  type or `Project`, decides whether a particular validation failure makes the
+  lock unusable. Sync still has its older validation path pending Phase 11.
+
+Phase 2 made the R version an explicit command input without introducing a
+runtime snapshot structure:
+
+- `r_version_async()` remains asynchronous and is called at most once by each
+  command that needs the R version.
+- The resulting `String` is passed to lock validation, lock generation, sync
+  validation, R minor-version derivation, and compiled cache-key generation.
+- `RuntimeInfo` and its deprecated platform/package-type probe were removed.
+- Binary artifact selection continues to use `std::env::consts::OS` and
+  `std::env::consts::ARCH`; the selected artifact supplies the exact R install
+  type (`win.binary`, `mac.binary.*`, or `source`).
+- Base-package inspection remains a separate cached R query.
+
+### Phase 3: Effective Repositories
+
+Derive the repository runtime set from the mutated manifest and the effective
+default-repository decision. Do not reconstruct the runtime repository set
+from the old lock.
+
+The old lock supplies default-policy inheritance and resolution preferences.
+The effective base repository is the built-in repository unless overridden by
+`RPX_REGISTRY_BASE_URL`. Its presence or absence in the locked effective
+repository list represents whether the base repository was enabled; no
+additional policy field is planned.
+
+Required behavior:
+
+- No old lock defaults to the base repository being enabled.
+- `--default-repo` enables the current effective base repository.
+- `--no-default-repo` disables it, including an inherited base repository.
+- With no CLI override, a usable old lock supplies the previous decision.
+- A modifying resolution uses the current environment override.
+- Sync uses exactly the repositories in its valid lock and ignores the current
+  environment override.
+
+### Phase 4: Lock Matching And Reuse
+
+Make lock matching a side-effect-free comparison over explicit inputs:
+
+```text
+Lockfile + mutated manifest + effective repositories + R version
+    -> matching or drifted
+```
+
+Use the strongest facts supported by the current schema: roots and
+constraints, repository metadata and order, exact R version, schema
+compatibility, and current workspace compatibility.
+
+Consumer policy remains local:
+
+- Status and sync reject drift.
+- Lock and modifying commands repair drift by resolving a replacement lock.
+- Older readable schemas may be replaced.
+- Newer schemas and operational read/runtime failures are errors.
+
+When the requested mutation leaves the resolution inputs unchanged, retain the
+existing lock instead of resolving or rewriting it. A no-op modification still
+synchronizes the project library against that unchanged lock.
+
+### Phase 5: Source-Aware Preferences
+
+Separate an old lock as a possible preference source from a lock that is valid
+as the current runtime model.
+
+```text
+old_lock: possible source of eligible preferences
+current_lock: validated lock that may be reused directly
+```
+
+Preferences must retain source ownership. Remove the fallback that associates
+an unmatched locked package with the first remaining repository. Removing a
+repository invalidates preferences supplied by that repository. A same-name,
+same-version package from another repository must not silently satisfy a
+source-specific preference.
+
+### Phase 6: One Installed Snapshot And Package Sync Planning
+
+Read installed R package state once after resolution or locked reconstruction.
+Build explicit package actions from the installed and locked maps before
+executing them:
+
+- Packages to remove because they are extra or have the wrong version.
+- Correct installed packages to retain.
+- Locked packages that require installation.
+- Workspace package reinstallation.
+- Dependency ordering inputs.
+
+Pass the retained installed names into installation execution. Remove the
+second installed-package query currently hidden inside
+`install_locked_packages`.
+
+Artifact selection may remain in execution during this milestone. The eventual
+complete sync plan will also own artifact and cache decisions.
+
+### Phase 7: Shared Modification Orchestration
+
+Introduce shared orchestration that consumes command-prepared values rather
+than forcing every mutation into a synchronous closure:
+
+```text
+Project
++ original optional lock
++ mutated manifest
++ effective repositories
++ roots
++ preference exclusions
++ R version
+    -> reused or regenerated lock
+    -> installed snapshot
+    -> system and package actions
+    -> persisted desired state
+    -> applied actions
+```
+
+The shared layer should:
+
+1. Reuse or regenerate the lock.
+2. Read installed state once.
+3. Build package and system actions.
+4. Write the manifest only when changed.
+5. Write the lock only when changed.
+6. Apply system actions.
+7. Apply package actions.
+8. Return reporting information to the command.
+
+Desired manifest and lock state is persisted before external installation. If
+execution fails, the desired state remains for a later sync.
+
+### Phase 8: Package Add And Remove
+
+Migrate add and remove onto the shared orchestration.
+
+Add must resolve unconstrained package relations before finalizing the
+manifest mutation, then derive roots from the mutated manifest. Remove mutates
+the manifest first and derives roots from that result. Neither command should
+perform an early installed-state read solely for reporting.
+
+Duplicate add and missing remove requests reuse an unchanged lock when
+possible, but still run sync so they can repair an out-of-sync library.
+
+### Phase 9: Repository Add And Remove
+
+Migrate repository mutations onto the same resolve, persist, and sync path.
+Successful repository changes must synchronize immediately rather than only
+rewriting project files.
+
+Repository removal filters source-specific preferences before resolution.
+Credential removal remains an explicit command-specific side effect with a
+documented ordering relative to persistence.
+
+Duplicate add and missing remove requests may retain their existing reporting,
+but still synchronize against an unchanged valid lock.
+
+### Phase 10: Lock Command
+
+Reuse the project extraction, effective-repository, matching, preference, and
+resolution layers without entering modification sync orchestration.
+
+The lock command:
+
+1. Reads the manifest and optional old lock once.
+2. Uses the already-captured R version.
+3. Derives effective repositories.
+4. Retains an exactly matching lock.
+5. Otherwise resolves and projects a replacement lock.
+6. Writes only when changed.
+7. Never reads installed package state or synchronizes.
+
+### Phase 11: Sync Command
+
+Sync uses a required valid lock and never resolves or persists project
+declarations:
+
+1. Read manifest and lock once.
+2. Use the already-captured R version.
+3. Reject schema, repository, requirement, workspace, and R-version drift.
+4. Read installed package state once.
+5. Build system and package actions.
+6. Respect `--install-system` and `--install-only-system`.
+7. Apply the actions without rewriting manifest or lock.
+
+This intentionally replaces current behavior that warns on R-version drift or
+allows repository declaration drift.
+
+### Phase 12: Persistence And Cleanup
+
+After command orchestration is unified:
+
+- Remove superseded readers, matchers, validators, and command-specific
+  orchestration helpers.
+- Make individual manifest and lock writes use temporary files followed by
+  atomic replacement.
+- Write only files whose serialized state changed.
+- Do not claim a transaction spanning R installation, system package changes,
+  credentials, and other external side effects.
+- Add command-level regression tests for no-op lock reuse, repair behavior,
+  default-repository overrides, source-aware preferences, one installed-state
+  read, and persistence-before-installation failure behavior.
+
+### Settled Decisions
+
+- Do not introduce a runtime snapshot struct merely to carry the R version,
+  platform, or package type.
+- Keep R version acquisition asynchronous.
+- Use Rust OS and architecture constants for current binary selection and
+  cache platform identity.
+- Keep lock-acceptance policy in each consumer; do not add a generic
+  `is_repairable` classification to validation errors.
+- Repository add and remove eventually resolve and sync.
+- No-op modifications eventually reuse the lock and still sync.
+- Represent base-repository enablement through its presence in the locked
+  effective repository list rather than a new Boolean lock field.
+- Treat `modify_and_sync` as data-flow guidance rather than requiring one
+  literal generic closure.
+- Persist desired state before applying external package changes.
+- Do not introduce a misleading cross-system `Project::transaction` API.
+
+## Context Sources
+
+The following sources materially influenced the roadmap above and should be
+revisited after context compaction.
+
+- The `modify_and_sync` pseudocode supplied during implementation established
+  the target read, mutate, match-or-resolve, plan, persist, and apply ordering.
+- `RESOLUTION_AND_SYNC_PLAN.md`, especially **Extract Once**, **Effective
+  Repositories**, **Existing Lock Preferences**, **Lock Validity**,
+  **Modification Pipeline**, and **Sync Pipeline**, supplies the intended
+  invariants.
+- `GIT_PACKAGE_SOURCES.md` supplies downstream provenance, source identity,
+  and cache requirements that the registry-only migration must not block.
+- `src/project.rs` supplies `Project`, cached manifest/lock reads,
+  root-relative writes, locked package reconstruction, and strict lock
+  validation.
+- `src/lib.rs` command functions (`cmd_add`, `cmd_remove`, `cmd_repo_add`,
+  `cmd_repo_remove`, `cmd_lock`, `cmd_sync`, and `cmd_status`) exposed the
+  duplicated command pipelines and consumer-specific lock policies.
+- `src/lib.rs` repository helpers and `DefaultRepositoryPreference` exposed
+  the inherited-default and `--no-default-repo` behavior that Phase 3 must
+  correct.
+- `src/lib.rs` resolution and locking helpers (`lockfile_from_roots` and
+  `lockfile_from_selected_versions`) exposed hidden metadata and runtime reads.
+- `src/lib.rs` sync helpers (`validate_project_for_sync`,
+  `sync_locked_project`, `install_locked_packages`, and artifact preparation)
+  exposed repeated installed/runtime reads and interleaved planning and
+  execution.
+- `src/r.rs` supplies asynchronous R version and base-package queries, typed R
+  subprocess errors, installed package extraction, and package installation.
+- `src/lockfile.rs` defines the durable repository, root, package, dependency,
+  R, and system-requirement data currently available to matching and sync.
+- `src/resolver.rs` supplies `PackageVersion` and its version-based equality,
+  which enabled typed installed/locked comparisons while highlighting missing
+  source identity.
+- `src/repository.rs` and its adapters define repository identity, metadata
+  access, and source URL construction used by resolution and preference
+  filtering.
+- `src/cache.rs` shows that compiled cache identity already uses R version and
+  Rust host platform constants, while still lacking immutable source identity.
+- `src/sysreqs.rs` supplies the existing host discovery and
+  `SystemDependencyPlan`, and shows where system input capture and execution
+  remain coupled.
+- `tests/deps.rs` covers add, remove, lock, constraints, base packages, and
+  current-library exclusion from locking.
+- `tests/status.rs` covers strict validation and aggregate installed-state
+  mismatches; status is the closest current example of the intended command
+  shape.
+- `tests/sync.rs` covers lock immutability, exact-version restoration,
+  extra-package removal, schema handling, and current behaviors that conflict
+  with the target design, notably repository-drift acceptance.
+- `tests/cli.rs` covers project discovery, initialization, command execution,
+  and cleanup behavior across containerized command paths.
+
 ## Cache Invalidation
 
 Cache identity is separate from lock validity. At minimum it includes:

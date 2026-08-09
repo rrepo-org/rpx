@@ -73,7 +73,7 @@ use ui::SystemDepsUi;
 use crate::{
     cache::CompiledPackageCacheKey,
     lockfile::LockedPackage,
-    r::{RVirtualEnv, fetch_runtime_info, r_version_async, remove_packages_from_venv},
+    r::{RVirtualEnv, r_version_async, remove_packages_from_venv},
     repository::{
         ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
         RrepoRepository, built_in_repository, parse_repository_url,
@@ -362,13 +362,6 @@ enum SyncError {
         source: r::InstalledPackagesError,
     },
 
-    #[error("failed to inspect the R version: {source}")]
-    #[diagnostic(code(rpx::sync::r_version_failed))]
-    RVersion {
-        #[source]
-        source: r::RVersionError,
-    },
-
     #[error("failed to install project package: {source}")]
     #[diagnostic(code(rpx::sync::project_install_failed))]
     ProjectPackageInstall {
@@ -565,8 +558,9 @@ async fn cmd_add(
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     let current_lockfile = if current_lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(&r_version) {
             Ok(()) => current_lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -622,7 +616,7 @@ async fn cmd_add(
         desired_roots,
         preferred_versions,
         current_lockfile.as_ref(),
-        None,
+        &r_version,
     )
     .await?;
 
@@ -634,9 +628,9 @@ async fn cmd_add(
     project
         .write_lockfile(&lockfile)
         .map_err(project::ProjectError::LockfileWrite)?;
-    let project_package = validate_project_for_sync(&description, &lockfile).await?;
+    let project_package = validate_project_for_sync(&description, &lockfile, &r_version).await?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project_package).await?;
+    let _ = sync_locked_project(&description, &lockfile, &project_package, &r_version).await?;
     status(format_args!(
         "Added {}",
         packages
@@ -669,8 +663,9 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     let current_lockfile = if current_lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(&r_version) {
             Ok(()) => current_lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -740,7 +735,7 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
         roots,
         preferred_versions,
         current_lockfile.as_ref(),
-        None,
+        &r_version,
     )
     .await?;
 
@@ -764,8 +759,9 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     let current_lockfile = if current_lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(&r_version) {
             Ok(()) => current_lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -827,7 +823,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         roots,
         preferred_versions,
         current_lockfile.as_ref(),
-        None,
+        &r_version,
     )
     .await?;
 
@@ -856,8 +852,17 @@ async fn cmd_repo_list() -> Result<(), RpxError> {
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = if lockfile.is_some() {
+        Some(r_version_async().await.map_err(r::RError::Version)?)
+    } else {
+        None
+    };
     let lockfile = if lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(
+            r_version
+                .as_deref()
+                .expect("R version should be present when the lockfile exists"),
+        ) {
             Ok(()) => lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -922,8 +927,9 @@ async fn cmd_remove(
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     let current_lockfile = if current_lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(&r_version) {
             Ok(()) => current_lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -982,7 +988,7 @@ async fn cmd_remove(
         desired_roots,
         preferred_versions,
         current_lockfile.as_ref(),
-        None,
+        &r_version,
     )
     .await?;
 
@@ -992,9 +998,9 @@ async fn cmd_remove(
     project
         .write_lockfile(&lockfile)
         .map_err(project::ProjectError::LockfileWrite)?;
-    let project_package = validate_project_for_sync(&description, &lockfile).await?;
+    let project_package = validate_project_for_sync(&description, &lockfile, &r_version).await?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project_package).await?;
+    let _ = sync_locked_project(&description, &lockfile, &project_package, &r_version).await?;
 
     if !removed.is_empty() {
         status(format_args!("Removed {}", removed.join(", ")));
@@ -1035,8 +1041,9 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     let current_lockfile = if current_lockfile.is_some() {
-        match project.validate_locked_resolution().await {
+        match project.validate_locked_resolution(&r_version) {
             Ok(()) => current_lockfile,
             Err(
                 project::LockedResolutionError::RepositoriesChanged
@@ -1072,7 +1079,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
         roots,
         preferred_versions,
         current_lockfile.as_ref(),
-        None,
+        &r_version,
     )
     .await?;
     let changed = current_lockfile.as_ref() != Some(&lockfile);
@@ -1096,14 +1103,15 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
     let lockfile = project
         .lockfile()
         .map_err(project::ProjectError::Lockfile)?;
-    let project = validate_project_for_sync(&description, &lockfile).await?;
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
+    let project = validate_project_for_sync(&description, &lockfile, &r_version).await?;
 
     sync_system_dependencies(&lockfile, install_system, install_only_system)?;
     if install_only_system {
         return Ok(());
     }
 
-    let outcome = sync_locked_project(&description, &lockfile, &project).await?;
+    let outcome = sync_locked_project(&description, &lockfile, &project, &r_version).await?;
     if outcome.installed == 0 && outcome.removed == 0 {
         status("Project library is already in sync");
     } else {
@@ -1117,9 +1125,9 @@ async fn cmd_status() -> Result<(), RpxError> {
     let lockfile = project
         .lockfile()
         .map_err(project::ProjectError::Lockfile)?;
+    let r_version = r_version_async().await.map_err(r::RError::Version)?;
     project
-        .validate_locked_resolution()
-        .await
+        .validate_locked_resolution(&r_version)
         .map_err(project::ProjectError::LockedResolution)?;
     let locked_packages = project
         .locked_packages()
@@ -1881,6 +1889,7 @@ fn load_sysreq_snapshot_for_lock_blocking(
 async fn validate_project_for_sync(
     description: &RDescription,
     lockfile: &Lockfile,
+    r_version: &str,
 ) -> Result<ProjectPackage, RpxError> {
     let project =
         project_package(description).map_err(|source| LockError::Repository { source })?;
@@ -1888,7 +1897,7 @@ async fn validate_project_for_sync(
     if !lockfile_supports_project(lockfile, &project) {
         return Err(SyncError::LockfileOlder.into());
     }
-    validate_runtime_for_sync(lockfile).await?;
+    validate_runtime_for_sync(lockfile, r_version).await?;
     Ok(project)
 }
 
@@ -1896,6 +1905,7 @@ async fn sync_locked_project(
     description: &RDescription,
     lockfile: &Lockfile,
     project: &ProjectPackage,
+    r_version: &str,
 ) -> Result<SyncOutcome, RpxError> {
     let manifest_requirements = manifest_requirement_names(description);
     let lock_requirements = lockfile_requirement_names(lockfile);
@@ -1940,7 +1950,13 @@ async fn sync_locked_project(
     let mut packages = lockfile.packages.values().cloned().collect::<Vec<_>>();
     packages.push(root_package);
 
-    install_locked_packages(packages, lockfile.repositories.clone(), &project.name).await?;
+    install_locked_packages(
+        packages,
+        lockfile.repositories.clone(),
+        &project.name,
+        r_version,
+    )
+    .await?;
 
     return Ok(outcome);
 }
@@ -1982,7 +1998,7 @@ async fn lockfile_from_roots(
     roots: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
     existing_lockfile: Option<&Lockfile>,
-    r_version: Option<&str>,
+    r_version: &str,
 ) -> Result<Lockfile, RpxError> {
     let selected = resolve_from_registry(
         repositories.clone(),
@@ -2004,7 +2020,7 @@ async fn lockfile_from_selected_versions(
     selected: Vec<(String, PackageVersion)>,
     sysreq_db: &sysreqs::SysreqDbSnapshot,
     repositories: &[Arc<dyn PackageRepository>],
-    r_version: Option<&str>,
+    r_version: &str,
 ) -> Result<Lockfile, LockError> {
     let mut packages = BTreeMap::new();
     let mut sysreq_packages = BTreeMap::new();
@@ -2047,17 +2063,12 @@ async fn lockfile_from_selected_versions(
 
     let required_base_packages = locked_base_packages_from_locked(&roots, packages.values());
 
-    let resolved_r_version = match r_version {
-        Some(version) => version.to_string(),
-        None => fetch_runtime_info().await.version,
-    };
-
     Ok(Lockfile {
         version: LOCKFILE_VERSION,
         revision: LOCKFILE_REVISION,
         repositories: locked_package_repositories(repositories)?,
         r: LockedR {
-            version: resolved_r_version,
+            version: r_version.to_string(),
             base_packages: required_base_packages,
         },
         sysreqs: LockedSystemRequirements {
@@ -2265,15 +2276,12 @@ struct RuntimeStatus {
     missing_base_packages: Vec<String>,
 }
 
-async fn runtime_status(lockfile: &Lockfile) -> Result<RuntimeStatus, r::BasePackagesError> {
-    let runtime = fetch_runtime_info().await;
-    let version_mismatch =
-        (!lockfile.r.version.is_empty() && lockfile.r.version != runtime.version).then(|| {
-            format!(
-                "R {} installed, R {} locked",
-                runtime.version, lockfile.r.version
-            )
-        });
+async fn runtime_status(
+    lockfile: &Lockfile,
+    r_version: &str,
+) -> Result<RuntimeStatus, r::BasePackagesError> {
+    let version_mismatch = (!lockfile.r.version.is_empty() && lockfile.r.version != r_version)
+        .then(|| format!("R {} installed, R {} locked", r_version, lockfile.r.version));
     let available_base_packages = base_packages().await?.into_iter().collect::<BTreeSet<_>>();
     let locked_base_packages = lockfile
         .r
@@ -2521,8 +2529,8 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
     }
 }
 
-async fn validate_runtime_for_sync(lockfile: &Lockfile) -> Result<(), RpxError> {
-    let status = runtime_status(lockfile)
+async fn validate_runtime_for_sync(lockfile: &Lockfile, r_version: &str) -> Result<(), RpxError> {
+    let status = runtime_status(lockfile, r_version)
         .await
         .map_err(r::RError::BasePackages)?;
 
@@ -2551,6 +2559,7 @@ async fn install_locked_packages(
     packages: Vec<LockedPackage>,
     repositories: Vec<LockedRepository>,
     project_package: &str,
+    r_version: &str,
 ) -> Result<(), SyncError> {
     let total_packages = packages.len() as u64;
     let sync_span = tracing::info_span!(
@@ -2596,11 +2605,7 @@ async fn install_locked_packages(
         return Ok(());
     }
 
-    let r_version = Arc::new(
-        r_version_async()
-            .await
-            .map_err(|source| SyncError::RVersion { source })?,
-    );
+    let r_version = Arc::new(r_version.to_string());
     let r_minor = Arc::new(r_minor_version(r_version.as_str()).ok_or_else(|| {
         SyncError::DownloadArtifactsFailed {
             details: format!("failed to parse R minor version from {r_version}"),
