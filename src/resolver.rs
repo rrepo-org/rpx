@@ -15,10 +15,7 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use crate::{
-    http,
-    repository::{LocalRepository, PackageRepository, RepositoryError},
-};
+use crate::repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository};
 
 const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
 const BASE_PACKAGES: &[&str] = &[
@@ -118,7 +115,6 @@ impl std::fmt::Display for PackageVersion {
 
 #[derive(Debug)]
 pub(crate) struct RDependencyProvider {
-    client: http::HttpClient,
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
     root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
@@ -128,14 +124,12 @@ pub(crate) struct RDependencyProvider {
 
 impl RDependencyProvider {
     fn new(
-        client: http::HttpClient,
         repositories: Vec<Arc<dyn PackageRepository>>,
         root: Arc<LocalRepository>,
         root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
         preferred_versions: BTreeMap<String, PackageVersion>,
     ) -> Self {
         Self {
-            client,
             repositories,
             root,
             root_dependencies,
@@ -156,7 +150,6 @@ impl RDependencyProvider {
                 continue;
             }
 
-            let client = self.client.clone();
             let repositories = self.repositories.clone();
             let preferred_versions = self.preferred_versions.clone();
             let permits = Arc::clone(&self.description_prefetch_permits);
@@ -180,7 +173,6 @@ impl RDependencyProvider {
 
                     tracing::Span::current().record("stage", "selecting version");
                     let version = match choose_package_version(
-                        &client,
                         &repositories,
                         &preferred_versions,
                         &package,
@@ -209,7 +201,7 @@ impl RDependencyProvider {
 
                     if let Err(error) = version
                         .repository()
-                        .description(&client, &package, version.version())
+                        .description(&package, version.version())
                         .await
                     {
                         tracing::debug!(error = %error, "description prefetch failed");
@@ -261,7 +253,6 @@ impl DependencyProvider for RDependencyProvider {
         }
 
         tokio::runtime::Handle::current().block_on(choose_package_version(
-            &self.client,
             &self.repositories,
             &self.preferred_versions,
             package,
@@ -292,18 +283,13 @@ impl DependencyProvider for RDependencyProvider {
         }
 
         let description = tokio::runtime::Handle::current()
-            .block_on(
-                version
-                    .repository
-                    .description(&self.client, package, &version.version),
-            )
+            .block_on(version.repository.description(package, &version.version))
             .map_err(|source| ProviderError::DependencyMetadata {
                 repository: version.repository.to_string(),
                 source,
             })?;
 
-        let constraints =
-            dependency_constraints_from_description(Arc::clone(&version.repository), &description);
+        let constraints = dependency_constraints_from_description(&description);
 
         self.prefetch_descriptions(&constraints)?;
 
@@ -312,7 +298,6 @@ impl DependencyProvider for RDependencyProvider {
 }
 
 async fn choose_package_version(
-    client: &http::HttpClient,
     repositories: &[Arc<dyn PackageRepository>],
     preferred_versions: &BTreeMap<String, PackageVersion>,
     package: &str,
@@ -326,8 +311,7 @@ async fn choose_package_version(
 
     let candidates = futures_util::future::join_all(repositories.iter().enumerate().map(
         |(repository_index, repository)| async move {
-            let version =
-                choose_repository_version(client, repository.as_ref(), package, range).await?;
+            let version = choose_repository_version(repository.as_ref(), package, range).await?;
 
             Ok::<_, ProviderError>(version.map(|version| (version, repository_index)))
         },
@@ -351,12 +335,11 @@ async fn choose_package_version(
 }
 
 async fn choose_repository_version(
-    client: &http::HttpClient,
     repository: &dyn PackageRepository,
     package: &str,
     range: &Ranges<PackageVersion>,
 ) -> Result<Option<PackageVersion>, ProviderError> {
-    let packages = repository.packages(client).await?;
+    let packages = repository.packages().await?;
 
     let Some(latest) = packages.get(package) else {
         return Ok(None);
@@ -367,7 +350,7 @@ async fn choose_repository_version(
     }
 
     Ok(repository
-        .versions(client, package)
+        .versions(package)
         .await?
         .into_iter()
         .filter(|version| range.contains(version))
@@ -375,7 +358,6 @@ async fn choose_repository_version(
 }
 
 fn dependency_constraints_from_description(
-    repository: Arc<dyn PackageRepository>,
     description: &RDescription,
 ) -> DependencyConstraints<String, Ranges<PackageVersion>> {
     description
@@ -389,26 +371,20 @@ fn dependency_constraints_from_description(
         .map(|relation| {
             (
                 relation.name().to_string(),
-                relation_package_range(Arc::clone(&repository), &relation),
+                package_version_range_from_relation(&relation),
             )
         })
         .collect()
 }
 
-fn relation_package_range(
-    repository: Arc<dyn PackageRepository>,
-    relation: &Relation,
-) -> Ranges<PackageVersion> {
+fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
     let relation_version = relation.version();
 
     let Some((operator, version)) = relation_version.as_ref() else {
         return Ranges::full();
     };
 
-    let bound = PackageVersion {
-        version: version.clone(),
-        repository,
-    };
+    let bound = PackageVersion::new(version.clone(), built_in_repository());
 
     match operator {
         VersionConstraint::Equal => Ranges::singleton(bound),
@@ -425,14 +401,13 @@ pub fn is_base_package(package: &str) -> bool {
 }
 
 pub(crate) async fn resolve_from_registry(
-    client: http::HttpClient,
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
-) -> Result<Vec<(String, PackageVersion)>, ResolutionError> {
+) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
     if root_relations.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
 
     let root_count = root_relations.len();
@@ -456,23 +431,16 @@ pub(crate) async fn resolve_from_registry(
         let (root_package, root_version) = tokio::runtime::Handle::current()
             .block_on(root.package())
             .map_err(ProviderError::from)?;
-        let root_dependencies = root_dependency_ranges(&root_version, &root_relations);
-        let provider = RDependencyProvider::new(
-            client,
-            repositories,
-            root,
-            root_dependencies,
-            preferred_versions,
-        );
+        let root_dependencies = dependency_ranges_from_relations(&root_relations);
+        let provider =
+            RDependencyProvider::new(repositories, root, root_dependencies, preferred_versions);
 
         let selected = resolve(&provider, root_package.clone(), root_version)?;
 
-        let mut selected = selected
+        let selected = selected
             .into_iter()
             .filter(|(package, _)| package != &root_package)
-            .collect::<Vec<_>>();
-
-        selected.sort_by(|left, right| left.0.cmp(&right.0));
+            .collect::<BTreeMap<_, _>>();
         resolve_span.record("selected", selected.len());
 
         Ok::<_, ResolutionError>(selected)
@@ -486,31 +454,20 @@ pub(crate) async fn resolve_from_registry(
     Ok(selected)
 }
 
-fn root_dependency_ranges(
-    root_version: &PackageVersion,
-    roots: &BTreeSet<Relation>,
+fn dependency_ranges_from_relations(
+    relations: &BTreeSet<Relation>,
 ) -> BTreeMap<String, Ranges<PackageVersion>> {
-    let mut root_dependencies: BTreeMap<String, Ranges<PackageVersion>> = BTreeMap::new();
-
-    for relation in roots {
-        let package = relation.name();
-        if is_base_package(&package) {
-            continue;
-        }
-
-        let range = relation_package_range(Arc::clone(root_version.repository()), relation);
-        match root_dependencies.entry(package) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let combined = entry.get().intersection(&range);
-                entry.insert(combined);
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(range);
-            }
-        }
-    }
-
-    root_dependencies
+    relations
+        .iter()
+        .filter(|relation| !is_base_package(&relation.name()))
+        .fold(BTreeMap::new(), |mut dependencies, relation| {
+            let range = package_version_range_from_relation(relation);
+            dependencies
+                .entry(relation.name())
+                .and_modify(|existing| *existing = existing.intersection(&range))
+                .or_insert(range);
+            dependencies
+        })
 }
 
 #[cfg(test)]
@@ -570,17 +527,13 @@ mod tests {
                 .is_some_and(|other| self.name == other.name)
         }
 
-        async fn packages(
-            &self,
-            _client: &http::HttpClient,
-        ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+        async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
             self.package_queries.fetch_add(1, Ordering::SeqCst);
             Ok(self.packages.clone())
         }
 
         async fn versions(
             &self,
-            _client: &http::HttpClient,
             package: &str,
         ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
             self.version_queries
@@ -592,7 +545,6 @@ mod tests {
 
         async fn description(
             &self,
-            _client: &http::HttpClient,
             package: &str,
             version: &Version,
         ) -> Result<Arc<RDescription>, RepositoryError> {
@@ -647,7 +599,6 @@ mod tests {
         });
         let (_, root_version) = local_repository.package().await.expect("root should load");
         let provider = RDependencyProvider::new(
-            http::client(),
             vec![remote_repository.clone()],
             local_repository,
             BTreeMap::new(),
@@ -680,7 +631,6 @@ mod tests {
         let local_repository = local_repository("project", "1.0.0");
         let remote_repository = Arc::new(TestRepository::empty("remote"));
         let provider = RDependencyProvider::new(
-            http::client(),
             vec![remote_repository.clone()],
             local_repository,
             BTreeMap::new(),
@@ -710,9 +660,8 @@ mod tests {
             Some((VersionConstraint::GreaterThanEqual, suggested_version)),
         );
         let roots = BTreeSet::from([suggested]);
-        let root_dependencies = root_dependency_ranges(&root_version, &roots);
+        let root_dependencies = dependency_ranges_from_relations(&roots);
         let provider = RDependencyProvider::new(
-            http::client(),
             Vec::new(),
             Arc::clone(&local_repository),
             root_dependencies,
@@ -742,7 +691,6 @@ mod tests {
         let local_repository = local_repository("project", "1.0.0");
         let remote_repository = Arc::new(TestRepository::empty("remote"));
         let selected = resolve_from_registry(
-            http::client(),
             vec![remote_repository.clone()],
             local_repository,
             BTreeSet::from([Relation::simple("base")]),
@@ -803,7 +751,6 @@ mod tests {
         );
         let remote_repository = Arc::new(remote_repository);
         let selected = resolve_from_registry(
-            http::client(),
             vec![remote_repository.clone()],
             local_repository,
             BTreeSet::from([Relation::new(
@@ -818,7 +765,10 @@ mod tests {
         .await
         .expect("resolution should backtrack to a root-compatible version");
 
-        assert_eq!(selected, vec![("testthat".to_string(), testthat_3_0)]);
+        assert_eq!(
+            selected,
+            BTreeMap::from([("testthat".to_string(), testthat_3_0)])
+        );
         assert!(
             !remote_repository
                 .version_queries

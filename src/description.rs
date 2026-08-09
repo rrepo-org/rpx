@@ -3,29 +3,16 @@ use r_description::lossless::RDescription;
 use std::{
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 use thiserror::Error;
 
-use crate::project::{ProjectPathError, description_path, new_project_description_path};
+use crate::project::{ProjectPathError, new_project_description_path};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum DescriptionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     ProjectPath(#[from] ProjectPathError),
-
-    #[error("failed to read DESCRIPTION at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::description::read_failed))]
-    ReadFailed {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::description::parse_failed))]
-    ParseFailed { path: PathBuf, details: String },
 
     #[error("DESCRIPTION already exists at {}", path.display())]
     #[diagnostic(
@@ -47,24 +34,6 @@ pub enum DescriptionError {
         #[source]
         source: std::io::Error,
     },
-}
-
-pub fn read_description() -> Result<RDescription, DescriptionError> {
-    let path = description_path()?;
-    let contents = fs::read_to_string(&path).map_err(|source| DescriptionError::ReadFailed {
-        path: path.clone(),
-        source,
-    })?;
-    RDescription::from_str(&contents).map_err(|details| DescriptionError::ParseFailed {
-        path: path.clone(),
-        details: details.to_string(),
-    })
-}
-
-pub fn write_description(description: &RDescription) -> Result<(), DescriptionError> {
-    let path = description_path()?;
-    fs::write(&path, description.to_string())
-        .map_err(|source| DescriptionError::WriteFailed { path, source })
 }
 
 pub fn init_description() -> Result<String, DescriptionError> {

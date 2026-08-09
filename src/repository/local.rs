@@ -1,5 +1,5 @@
 use super::{PackageRepository, RepositoryError};
-use crate::{http, resolver::PackageVersion};
+use crate::resolver::PackageVersion;
 use async_trait::async_trait;
 use r_description::lossless::{RDescription, Version};
 use std::{
@@ -104,20 +104,13 @@ impl PackageRepository for LocalRepository {
             .is_some_and(|other| self.path == other.path)
     }
 
-    async fn packages(
-        &self,
-        _client: &http::HttpClient,
-    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
         let repository = Arc::new(self.clone());
         let (package, version) = repository.package().await?;
         Ok(BTreeMap::from([(package, version)]))
     }
 
-    async fn versions(
-        &self,
-        _client: &http::HttpClient,
-        package: &str,
-    ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
+    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
         let repository = Arc::new(self.clone());
         let (local_package, version) = repository.package().await?;
 
@@ -130,7 +123,6 @@ impl PackageRepository for LocalRepository {
 
     async fn description(
         &self,
-        _client: &http::HttpClient,
         package: &str,
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {

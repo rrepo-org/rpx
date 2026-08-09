@@ -1,14 +1,11 @@
-use crate::{
-    project::{LOCKFILE_NAME, lockfile_path_result},
-    repository::ArchiveSupport,
-};
+use crate::repository::ArchiveSupport;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs};
+use std::collections::BTreeMap;
 
 pub const LOCKFILE_VERSION: u32 = 4;
 pub const LOCKFILE_REVISION: u32 = 0;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
     #[serde(default)]
@@ -45,7 +42,7 @@ pub enum LockedCranArchiveSupport {
     Unavailable,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedR {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
@@ -53,7 +50,7 @@ pub struct LockedR {
     pub base_packages: Vec<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedSystemRequirements {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub db_commit: String,
@@ -63,7 +60,7 @@ pub struct LockedSystemRequirements {
     pub packages: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedRoot {
     pub package: String,
     pub constraint: String,
@@ -91,25 +88,14 @@ pub struct LockedDependency {
     pub max_version_exclusive: Option<String>,
 }
 
-pub fn read_lockfile() -> Result<Lockfile, String> {
-    read_lockfile_optional()?.ok_or_else(|| format!("{LOCKFILE_NAME} not found in project root"))
-}
-
-pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
-    let path = lockfile_path_result()?;
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let lockfile = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
-    Ok(Some(lockfile))
-}
-
-pub fn write_lockfile(lockfile: &Lockfile) -> Result<(), String> {
-    let contents = serde_json::to_string_pretty(lockfile).map_err(|error| error.to_string())?;
-    fs::write(lockfile_path_result()?, format!("{contents}\n")).map_err(|error| error.to_string())
+pub(crate) fn locked_repository_for_source<'a>(
+    source_url: &str,
+    repositories: &'a [LockedRepository],
+) -> Option<&'a LockedRepository> {
+    repositories
+        .iter()
+        .filter(|repository| source_url.starts_with(&repository.url))
+        .max_by_key(|repository| repository.url.len())
 }
 
 #[cfg(test)]

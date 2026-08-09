@@ -56,15 +56,12 @@ impl PackageRepository for RrepoRepository {
             .is_some_and(|other| self.url == other.url)
     }
 
-    async fn packages(
-        &self,
-        client: &http::HttpClient,
-    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let response = self
             .packages
             .try_get_with((), async {
-                let response = http::rrepo_repository_packages(client, &self.url)
+                let response = http::rrepo_repository_packages(&self.url)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -110,16 +107,12 @@ impl PackageRepository for RrepoRepository {
             .collect())
     }
 
-    async fn versions(
-        &self,
-        client: &http::HttpClient,
-        package: &str,
-    ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
+    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
-                let response = http::rrepo_package_versions(client, &self.url, package)
+                let response = http::rrepo_package_versions(&self.url, package)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -168,7 +161,6 @@ impl PackageRepository for RrepoRepository {
 
     async fn description(
         &self,
-        client: &http::HttpClient,
         package: &str,
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {
@@ -176,30 +168,26 @@ impl PackageRepository for RrepoRepository {
 
         self.descriptions
             .try_get_with(key, async {
-                let description = http::rrepo_package_description(
-                    client,
-                    &self.url,
-                    package,
-                    &version.to_string(),
-                )
-                .await
-                .map_err(|source| RepositoryError::Request {
-                    source: Arc::new(source),
-                })?
-                .error_for_status()
-                .map_err(|source| RepositoryError::Response {
-                    source: Arc::new(source),
-                })?
-                .text()
-                .await
-                .map_err(|source| RepositoryError::Response {
-                    source: Arc::new(source),
-                })?
-                .parse::<RDescription>()
-                .map_err(|source| RepositoryError::Description {
-                    location: format!("for {package} {version}"),
-                    source: Arc::new(source),
-                })?;
+                let description =
+                    http::rrepo_package_description(&self.url, package, &version.to_string())
+                        .await
+                        .map_err(|source| RepositoryError::Request {
+                            source: Arc::new(source),
+                        })?
+                        .error_for_status()
+                        .map_err(|source| RepositoryError::Response {
+                            source: Arc::new(source),
+                        })?
+                        .text()
+                        .await
+                        .map_err(|source| RepositoryError::Response {
+                            source: Arc::new(source),
+                        })?
+                        .parse::<RDescription>()
+                        .map_err(|source| RepositoryError::Description {
+                            location: format!("for {package} {version}"),
+                            source: Arc::new(source),
+                        })?;
 
                 tracing::trace!(
                     package,

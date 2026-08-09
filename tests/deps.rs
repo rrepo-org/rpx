@@ -174,6 +174,59 @@ fn constrained_add_replaces_default_dependency_bounds() {
 }
 
 #[test]
+fn duplicate_add_reuses_lock_and_restores_missing_package() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-add-reuse";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx add digest");
+    let reuse_command = format!("cd {project_path} && rpx add --default-repo digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+
+    let remove_package_dir = format!(
+        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_package_dir);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &reuse_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_eq!(
+        read_project_file(&container, project_path, "rpx.lock"),
+        lockfile
+    );
+}
+
+#[test]
+fn reused_add_synchronizes_with_the_updated_description() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-add-reuse-description";
+    create_package_project(&container, project_path);
+    let add_suggests = format!(
+        "cd {project_path} && cat >> DESCRIPTION <<'EOF'\nSuggests: digest (>= 0.6.37)\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_suggests);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+
+    let add_command = format!("cd {project_path} && rpx add 'digest@>=0.6.37'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_eq!(
+        read_project_file(&container, project_path, "rpx.lock"),
+        lockfile
+    );
+}
+
+#[test]
 fn records_base_package_as_runtime_requirement() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-base-package";
@@ -258,6 +311,36 @@ fn reports_when_removed_package_is_already_missing_from_library() {
 }
 
 #[test]
+fn undeclared_remove_reuses_lock_and_removes_installed_package() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-remove-reuse";
+    create_package_project(&container, project_path);
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+
+    let install_command =
+        format!("cd {project_path} && rpx run Rscript -e \"install.packages('jsonlite')\"");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &install_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let remove_command = format!("cd {project_path} && rpx remove jsonlite");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Removed jsonlite"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert_package_state(&container, project_path, "jsonlite", "FALSE");
+    assert_eq!(
+        read_project_file(&container, project_path, "rpx.lock"),
+        lockfile
+    );
+}
+
+#[test]
 fn adds_and_removes_multiple_packages() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-multi-deps";
@@ -277,7 +360,7 @@ fn adds_and_removes_multiple_packages() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Removed digest, cli"),
+        stdout.contains("Removed cli, digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert_package_state(&container, project_path, "digest", "FALSE");
@@ -314,6 +397,40 @@ Imports: digest",
     );
     assert!(
         lockfile.contains("https://upstream.rrepo.dev/cran/packages/digest/versions/"),
+        "lockfile was: {lockfile}"
+    );
+}
+
+#[test]
+fn inherits_and_overrides_default_repository_policy() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-default-repository-policy";
+    create_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx lock --no-default-repo");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        !lockfile.contains("https://upstream.rrepo.dev/cran"),
+        "lockfile was: {lockfile}"
+    );
+
+    let command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        !lockfile.contains("https://upstream.rrepo.dev/cran"),
+        "lockfile was: {lockfile}"
+    );
+
+    let command = format!("cd {project_path} && rpx lock --default-repo");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        lockfile.contains("https://upstream.rrepo.dev/cran"),
         "lockfile was: {lockfile}"
     );
 }

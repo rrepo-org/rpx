@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 use thiserror::Error;
 
@@ -21,7 +21,18 @@ pub use cran::CranRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
-pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
+pub const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
+
+static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
+    Arc::new(RrepoRepository::new(
+        parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
+            .expect("built-in repository URL should be valid"),
+    ))
+});
+
+pub fn built_in_repository() -> Arc<dyn PackageRepository> {
+    BUILT_IN_REPOSITORY.clone()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
@@ -97,20 +108,12 @@ pub trait PackageRepository: Any + Debug + Display + Send + Sync {
 
     fn equals(&self, other: &dyn PackageRepository) -> bool;
 
-    async fn packages(
-        &self,
-        client: &http::HttpClient,
-    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError>;
+    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError>;
 
-    async fn versions(
-        &self,
-        client: &http::HttpClient,
-        package: &str,
-    ) -> Result<BTreeSet<PackageVersion>, RepositoryError>;
+    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError>;
 
     async fn description(
         &self,
-        client: &http::HttpClient,
         package: &str,
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError>;
@@ -121,16 +124,13 @@ impl dyn PackageRepository {
         self.as_any().downcast_ref()
     }
 
-    pub async fn from_url(
-        client: &http::HttpClient,
-        value: &str,
-    ) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+    pub async fn from_url(value: &str) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
         let value = value.trim();
         let url = parse_repository_url(value)?;
 
         let rrepo_url = url.clone();
         let rrepo_probe = async {
-            http::rrepo_repository_packages(client, &rrepo_url)
+            http::rrepo_repository_packages(&rrepo_url)
                 .await
                 .map_err(|source| RepositoryError::Request {
                     source: Arc::new(source),
@@ -148,7 +148,7 @@ impl dyn PackageRepository {
         let cran_url = url;
         let cran_probe = async {
             let packages_probe = async {
-                http::cran_packages(client, &cran_url)
+                http::cran_packages(&cran_url)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -159,7 +159,7 @@ impl dyn PackageRepository {
                     })
             };
             let archive_probe = async {
-                http::cran_archive_root(client, &cran_url)
+                http::cran_archive_root(&cran_url)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),

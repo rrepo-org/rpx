@@ -50,13 +50,10 @@ impl CranRepository {
         self.archives
     }
 
-    async fn packages_index(
-        &self,
-        client: &http::HttpClient,
-    ) -> Result<Arc<http::CranPackagesIndex>, RepositoryError> {
+    async fn packages_index(&self) -> Result<Arc<http::CranPackagesIndex>, RepositoryError> {
         self.packages
             .try_get_with((), async {
-                let text = http::cran_packages(client, &self.url)
+                let text = http::cran_packages(&self.url)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -97,12 +94,9 @@ impl PackageRepository for CranRepository {
             .is_some_and(|other| self.url == other.url && self.archives == other.archives)
     }
 
-    async fn packages(
-        &self,
-        client: &http::HttpClient,
-    ) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
+    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let index = self.packages_index(client).await?;
+        let index = self.packages_index().await?;
 
         Ok(index
             .packages
@@ -130,13 +124,9 @@ impl PackageRepository for CranRepository {
             .collect())
     }
 
-    async fn versions(
-        &self,
-        client: &http::HttpClient,
-        package: &str,
-    ) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
+    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let index = self.packages_index(client).await?;
+        let index = self.packages_index().await?;
         let mut versions = index
             .packages
             .iter()
@@ -160,7 +150,7 @@ impl PackageRepository for CranRepository {
             let archived_versions = self
                 .archive_versions
                 .try_get_with(package.to_string(), async {
-                    let text = http::cran_package_archive_listing(client, &self.url, package)
+                    let text = http::cran_package_archive_listing(&self.url, package)
                         .await
                         .map_err(|source| RepositoryError::Request {
                             source: Arc::new(source),
@@ -204,7 +194,6 @@ impl PackageRepository for CranRepository {
 
     async fn description(
         &self,
-        client: &http::HttpClient,
         package: &str,
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {
@@ -212,7 +201,7 @@ impl PackageRepository for CranRepository {
 
         self.descriptions
             .try_get_with(key, async {
-                let index = self.packages_index(client).await?;
+                let index = self.packages_index().await?;
                 let version_string = version.to_string();
 
                 let description = if let Some(entry) = index
@@ -222,20 +211,16 @@ impl PackageRepository for CranRepository {
                 {
                     packages_entry_to_description(entry)
                 } else {
-                    let response = http::cran_archive_source_tarball(
-                        client,
-                        &self.url,
-                        package,
-                        &version_string,
-                    )
-                    .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
+                    let response =
+                        http::cran_archive_source_tarball(&self.url, package, &version_string)
+                            .await
+                            .map_err(|source| RepositoryError::Request {
+                                source: Arc::new(source),
+                            })?
+                            .error_for_status()
+                            .map_err(|source| RepositoryError::Response {
+                                source: Arc::new(source),
+                            })?;
 
                     description_from_source_tarball_response(response, package).await?
                 };

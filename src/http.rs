@@ -1,10 +1,6 @@
-#![allow(dead_code)]
-
 use async_trait::async_trait;
-use flate2::read::GzDecoder;
 use http::Extensions;
 use keyring::Entry;
-use miette::Diagnostic;
 use moka::future::Cache;
 use r_description::lossless::{Relations, Version};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -13,10 +9,9 @@ use reqwest_tracing::{
     ReqwestOtelSpanBackend, TracingMiddleware, default_on_request_end, reqwest_otel_span,
 };
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{Cursor, IsTerminal, Read};
-use std::pin::Pin;
+use std::io::{Cursor, IsTerminal};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -26,11 +21,15 @@ use crate::output::try_prompt;
 pub type HttpClient = reqwest_middleware::ClientWithMiddleware;
 const KEYRING_SERVICE: &str = "rpx";
 
-pub fn client() -> HttpClient {
+static HTTP_CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
     ClientBuilder::new(reqwest::Client::new())
         .with(AuthMiddleware::new(AuthManager::new()))
         .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
         .build()
+});
+
+pub fn client() -> HttpClient {
+    HTTP_CLIENT.clone()
 }
 
 #[derive(Debug, Clone)]
@@ -336,12 +335,6 @@ fn remove_credentials(url: &reqwest::Url) -> reqwest::Url {
     url
 }
 
-pub struct ArtifactResponse {
-    pub content_length: Option<u64>,
-    pub stream:
-        Pin<Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CranPackagesIndex {
     pub packages: Vec<CranPackageIndexEntry>,
@@ -470,65 +463,6 @@ pub struct RrepoVersionSummary {
     pub source_url: String,
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum HttpError {
-    #[error("failed to send request to {url}: {source}")]
-    #[diagnostic(code(rpx::http::request_failed))]
-    RequestFailed {
-        url: reqwest::Url,
-        #[source]
-        source: reqwest_middleware::Error,
-    },
-
-    #[error("unexpected response from {url}: {status}")]
-    #[diagnostic(code(rpx::http::unexpected_status))]
-    UnexpectedStatus {
-        url: reqwest::Url,
-        status: reqwest::StatusCode,
-        body: String,
-    },
-
-    #[error("failed to decode JSON response from {url}: {source}")]
-    #[diagnostic(code(rpx::http::json_decode_failed))]
-    JsonDecodeFailed {
-        url: reqwest::Url,
-        #[source]
-        source: reqwest::Error,
-    },
-
-    #[error("failed to extract source package from {url}: {details}")]
-    #[diagnostic(code(rpx::http::artifact_extract_failed))]
-    ArtifactExtractFailed { url: reqwest::Url, details: String },
-
-    #[error("failed to read response body from {url}: {source}")]
-    #[diagnostic(code(rpx::http::body_read_failed))]
-    BodyReadFailed {
-        url: reqwest::Url,
-        #[source]
-        source: reqwest::Error,
-    },
-
-    #[error("failed to parse DESCRIPTION response from {url}: {details}")]
-    #[diagnostic(code(rpx::http::description_parse_failed))]
-    DescriptionParseFailed { url: reqwest::Url, details: String },
-
-    #[error("failed to decompress PACKAGES.gz response from {url}: {source}")]
-    #[diagnostic(code(rpx::http::packages_decompress_failed))]
-    PackagesDecompressFailed {
-        url: reqwest::Url,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse PACKAGES response from {url}: {details}")]
-    #[diagnostic(code(rpx::http::packages_parse_failed))]
-    PackagesParseFailed { url: reqwest::Url, details: String },
-
-    #[error("failed to parse archive listing response from {url}: {details}")]
-    #[diagnostic(code(rpx::http::archive_listing_parse_failed))]
-    ArchiveListingParseFailed { url: reqwest::Url, details: String },
-}
-
 fn archive_listing_parts(listing: &str) -> impl Iterator<Item = &str> {
     listing.split(['"', '\'', '<', '>', ' ', '\n', '\r', '\t'])
 }
@@ -586,41 +520,7 @@ fn parse_packages_relations_field(
         .map(Option::unwrap_or_default)
 }
 
-async fn get_response(
-    client: &HttpClient,
-    url: reqwest::Url,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    client.get(url.clone()).send().await
-}
-
-async fn artifact_response(
-    client: &HttpClient,
-    url: reqwest::Url,
-) -> Result<ArtifactResponse, HttpError> {
-    let response =
-        client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|source| HttpError::RequestFailed {
-                url: url.clone(),
-                source,
-            })?;
-
-    let status = response.status();
-    if status != reqwest::StatusCode::OK {
-        let body = response.text().await.unwrap_or_default();
-        return Err(HttpError::UnexpectedStatus { url, status, body });
-    }
-
-    Ok(ArtifactResponse {
-        content_length: response.content_length(),
-        stream: Box::pin(response.bytes_stream()),
-    })
-}
-
 pub async fn rrepo_repository_packages(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -629,11 +529,10 @@ pub async fn rrepo_repository_packages(
         .pop_if_empty()
         .push("packages");
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn rrepo_package_versions(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -643,11 +542,10 @@ pub async fn rrepo_package_versions(
         .pop_if_empty()
         .extend(["packages", package, "versions"]);
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn rrepo_package_description(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -658,11 +556,10 @@ pub async fn rrepo_package_description(
         .pop_if_empty()
         .extend(["packages", package, "versions", version, "description"]);
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn rrepo_source_artifact(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -673,11 +570,10 @@ pub async fn rrepo_source_artifact(
         .pop_if_empty()
         .extend(["packages", package, "versions", version, "source"]);
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn rrepo_windows_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -691,11 +587,10 @@ pub async fn rrepo_windows_binary(
             "packages", package, "versions", version, "binaries", "windows", r_minor,
         ]);
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn rrepo_macos_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -710,11 +605,10 @@ pub async fn rrepo_macos_binary(
             "packages", package, "versions", version, "binaries", "macos", target, r_minor,
         ]);
 
-    get_response(client, url).await
+    client().get(url).send().await
 }
 
 pub async fn cran_packages(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -723,11 +617,10 @@ pub async fn cran_packages(
         .pop_if_empty()
         .extend(["src", "contrib", "PACKAGES"]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_archive_root(
-    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
@@ -736,11 +629,10 @@ pub async fn cran_archive_root(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", ""]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_package_archive_listing(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -750,11 +642,10 @@ pub async fn cran_package_archive_listing(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, ""]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_current_source_tarball(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -766,11 +657,10 @@ pub async fn cran_current_source_tarball(
         .pop_if_empty()
         .extend(["src", "contrib", &file_name]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_archive_source_tarball(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -782,11 +672,11 @@ pub async fn cran_archive_source_tarball(
         .pop_if_empty()
         .extend(["src", "contrib", "Archive", package, &file_name]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
+#[allow(dead_code)]
 pub async fn cran_latest_package_description(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -796,11 +686,10 @@ pub async fn cran_latest_package_description(
         .pop_if_empty()
         .extend(["web", "packages", package, "DESCRIPTION"]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_windows_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     r_minor: &str,
     package: &str,
@@ -813,11 +702,10 @@ pub async fn cran_windows_binary(
         .pop_if_empty()
         .extend(["bin", "windows", "contrib", r_minor, &file_name]);
 
-    client.get(url).send().await
+    client().get(url).send().await
 }
 
 pub async fn cran_macos_binary(
-    client: &HttpClient,
     base_url: &reqwest::Url,
     target: &str,
     r_minor: &str,
@@ -831,131 +719,5 @@ pub async fn cran_macos_binary(
         .pop_if_empty()
         .extend(["bin", "macosx", target, "contrib", r_minor, &file_name]);
 
-    client.get(url).send().await
-}
-
-async fn description_body_from_source_artifact(
-    mut artifact: ArtifactResponse,
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-) -> Result<String, HttpError> {
-    use futures_util::TryStreamExt;
-
-    let mut bytes = Vec::with_capacity(artifact.content_length.unwrap_or_default() as usize);
-
-    while let Some(chunk) =
-        artifact
-            .stream
-            .try_next()
-            .await
-            .map_err(|source| HttpError::BodyReadFailed {
-                url: cran_archive_source_url_for_error(base_url, package, version),
-                source,
-            })?
-    {
-        bytes.extend_from_slice(&chunk);
-    }
-
-    description_body_from_tar_gz_bytes(&bytes, base_url, package, version)
-}
-
-fn description_body_from_tar_gz_bytes(
-    bytes: &[u8],
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-) -> Result<String, HttpError> {
-    let url = cran_archive_source_url_for_error(base_url, package, version);
-    let decoder = GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-
-    let entries = archive
-        .entries()
-        .map_err(|source| HttpError::ArtifactExtractFailed {
-            url: url.clone(),
-            details: format!("failed to read source package archive: {source}"),
-        })?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|source| HttpError::ArtifactExtractFailed {
-            url: url.clone(),
-            details: format!("failed to read archive entry: {source}"),
-        })?;
-
-        let is_description = {
-            let path = entry
-                .path()
-                .map_err(|source| HttpError::ArtifactExtractFailed {
-                    url: url.clone(),
-                    details: format!("failed to read archive entry path: {source}"),
-                })?;
-
-            path_is_top_level_description(&path, package)
-        };
-
-        if !is_description {
-            continue;
-        }
-
-        let mut body = String::new();
-        entry
-            .read_to_string(&mut body)
-            .map_err(|source| HttpError::ArtifactExtractFailed {
-                url: url.clone(),
-                details: format!("failed to read DESCRIPTION from source package: {source}"),
-            })?;
-
-        return Ok(body);
-    }
-
-    Err(HttpError::ArtifactExtractFailed {
-        url,
-        details: format!("source package does not contain {package}/DESCRIPTION"),
-    })
-}
-
-fn parse_cran_description_body(
-    body: &str,
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-) -> Result<r_description::lossy::RDescription, HttpError> {
-    let url = cran_archive_source_url_for_error(base_url, package, version);
-
-    let description = r_description::lossy::RDescription::from_str(body).map_err(|details| {
-        HttpError::DescriptionParseFailed {
-            url: url.clone(),
-            details,
-        }
-    })?;
-
-    Ok(description)
-}
-
-fn path_is_top_level_description(path: &std::path::Path, package: &str) -> bool {
-    let mut components = path.components().filter_map(|component| {
-        let component = component.as_os_str().to_str()?;
-        (component != ".").then_some(component)
-    });
-
-    components.next() == Some(package)
-        && components.next() == Some("DESCRIPTION")
-        && components.next().is_none()
-}
-
-fn cran_archive_source_url_for_error(
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-) -> reqwest::Url {
-    let file_name = format!("{package}_{version}.tar.gz");
-    let mut url = base_url.clone();
-
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend(["src", "contrib", "Archive", package, &file_name]);
-
-    url
+    client().get(url).send().await
 }
