@@ -381,7 +381,7 @@ impl Project {
         Ok(packages)
     }
 
-    fn root_package(&self) -> Result<(String, PackageVersion), LockedPackagesError> {
+    pub fn root_package(&self) -> Result<(String, PackageVersion), LockedPackagesError> {
         let description = self.description()?;
         let path = self.path.join(DESCRIPTION_NAME);
         let package = description

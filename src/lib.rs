@@ -58,7 +58,7 @@ use project::{
     locked_default_repository_enabled, project_library_path, project_library_root_path,
     project_root,
 };
-use r::{base_packages, install_local_package, install_project_package, installed_packages};
+use r::{install_local_package, install_project_package, installed_packages};
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
@@ -314,31 +314,11 @@ fn lock_error_from_resolution(error: ResolutionError) -> LockError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum SyncError {
-    #[error("lockfile is out of date")]
-    #[diagnostic(code(rpx::lockfile::older), help("Run `rpx lock` to update rpx.lock."))]
-    LockfileOlder,
-
-    #[error("lockfile is incompatible")]
-    #[diagnostic(
-        code(rpx::lockfile::newer),
-        help("Upgrade rpx or regenerate the lockfile with this version.")
-    )]
-    LockfileNewer,
-
     #[error(
         "system dependency installation is currently supported only on supported Linux distributions/package managers"
     )]
     #[diagnostic(code(rpx::sync::unsupported_system_install))]
     UnsupportedSystemInstall,
-
-    #[error("R runtime is missing required base packages: {packages}")]
-    #[diagnostic(
-        code(rpx::sync::runtime_missing_base_packages),
-        help(
-            "These packages are part of R itself. Use a complete R installation compatible with this project."
-        )
-    )]
-    RuntimeMissingBasePackages { packages: String },
 
     #[error("failed to refresh package metadata: {details}")]
     #[diagnostic(code(rpx::sync::metadata_refresh_failed))]
@@ -422,14 +402,6 @@ enum RpxWarning {
     #[error("some system requirement rules do not have an install mapping for {host}: {rules}")]
     #[diagnostic(severity(Warning), code(rpx::sysreqs::unsupported_rules))]
     UnsupportedSystemRequirementRules { host: String, rules: String },
-
-    #[error("{details}")]
-    #[diagnostic(
-        severity(Warning),
-        code(rpx::runtime::version_mismatch),
-        help("Use the R version recorded in rpx.lock for the most reproducible install.")
-    )]
-    RuntimeVersionMismatch { details: String },
 
     #[error("continuing with R package sync without installing system dependencies")]
     #[diagnostic(
@@ -630,9 +602,11 @@ async fn cmd_add(
     project
         .write_lockfile(&lockfile)
         .map_err(project::ProjectError::LockfileWrite)?;
-    let project_package = validate_project_for_sync(&description, &lockfile, &r_version).await?;
+    let root_package = project
+        .root_package()
+        .map_err(project::ProjectError::LockedPackages)?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project_package, &r_version).await?;
+    let _ = sync_locked_project(&description, &lockfile, &root_package, &r_version).await?;
     status(format_args!(
         "Added {}",
         packages
@@ -987,9 +961,11 @@ async fn cmd_remove(
     project
         .write_lockfile(&lockfile)
         .map_err(project::ProjectError::LockfileWrite)?;
-    let project_package = validate_project_for_sync(&description, &lockfile, &r_version).await?;
+    let root_package = project
+        .root_package()
+        .map_err(project::ProjectError::LockedPackages)?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let _ = sync_locked_project(&description, &lockfile, &project_package, &r_version).await?;
+    let _ = sync_locked_project(&description, &lockfile, &root_package, &r_version).await?;
 
     if !removed.is_empty() {
         status(format_args!("Removed {}", removed.join(", ")));
@@ -1094,14 +1070,19 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
         .lockfile()
         .map_err(project::ProjectError::Lockfile)?;
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let project = validate_project_for_sync(&description, &lockfile, &r_version).await?;
+    project
+        .validate_locked_resolution(&r_version)
+        .map_err(project::ProjectError::LockedResolution)?;
 
     sync_system_dependencies(&lockfile, install_system, install_only_system)?;
     if install_only_system {
         return Ok(());
     }
 
-    let outcome = sync_locked_project(&description, &lockfile, &project, &r_version).await?;
+    let root_package = project
+        .root_package()
+        .map_err(project::ProjectError::LockedPackages)?;
+    let outcome = sync_locked_project(&description, &lockfile, &root_package, &r_version).await?;
     if outcome.installed == 0 && outcome.removed == 0 {
         status("Project library is already in sync");
     } else {
@@ -1257,12 +1238,6 @@ struct SyncOutcome {
     removed: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum LockfileCompatibilityError {
-    Older,
-    Newer,
-}
-
 fn roots_from_lockfile_or_description(
     lockfile: Option<&Lockfile>,
     description: &RDescription,
@@ -1309,91 +1284,10 @@ fn roots_from_description(description: &RDescription) -> BTreeSet<Relation> {
         .collect()
 }
 
-#[derive(Debug, Clone)]
-struct ProjectPackage {
-    name: String,
-    version: Version,
-}
-
-fn project_package(description: &RDescription) -> Result<ProjectPackage, RepositoryError> {
-    let path = project_root().join("DESCRIPTION");
-    let name = description
-        .package()
-        .ok_or_else(|| RepositoryError::MissingField {
-            path: path.clone(),
-            field: "Package",
-        })?;
-    let version = description
-        .version()
-        .ok_or_else(|| RepositoryError::MissingField {
-            path,
-            field: "Version",
-        })?
-        .parse::<Version>()
-        .map_err(|details| RepositoryError::InvalidData {
-            resource: "project package version".to_string(),
-            details,
-        })?;
-
-    Ok(ProjectPackage { name, version })
-}
-
 fn project_repository(project: &Project, description: &RDescription) -> Arc<LocalRepository> {
     Arc::new(
         LocalRepository::new(project.path().to_path_buf()).with_description(description.clone()),
     )
-}
-
-fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
-    roots_from_description(description)
-        .into_iter()
-        .map(|relation| relation.name())
-        .filter(|package| !is_base_package(package))
-        .collect()
-}
-
-fn lockfile_supports_project(lockfile: &Lockfile, project: &ProjectPackage) -> bool {
-    if lockfile.packages.contains_key(&project.name) {
-        return false;
-    }
-
-    lockfile.packages.values().all(|package| {
-        package
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.package == project.name)
-            .all(|dependency| locked_dependency_allows_version(dependency, &project.version))
-    })
-}
-
-fn locked_dependency_allows_version(
-    dependency: &lockfile::LockedDependency,
-    version: &Version,
-) -> bool {
-    let minimum_matches = dependency.min_version.as_deref().is_none_or(|minimum| {
-        minimum
-            .parse::<Version>()
-            .is_ok_and(|minimum| version >= &minimum)
-    });
-    let maximum_matches = dependency
-        .max_version_exclusive
-        .as_deref()
-        .is_none_or(|maximum| {
-            maximum
-                .parse::<Version>()
-                .is_ok_and(|maximum| version < &maximum)
-        });
-
-    minimum_matches && maximum_matches
-}
-
-fn lockfile_requirement_names(lockfile: &Lockfile) -> BTreeSet<String> {
-    lockfile
-        .roots
-        .iter()
-        .map(|root| root.package.clone())
-        .filter(|package| !is_base_package(package))
-        .collect()
 }
 
 fn roots_contain_package(roots: &BTreeSet<Relation>, package: &str) -> bool {
@@ -1845,43 +1739,23 @@ fn load_sysreq_snapshot_for_lock_blocking(
     empty_sysreq_snapshot()
 }
 
-async fn validate_project_for_sync(
-    description: &RDescription,
-    lockfile: &Lockfile,
-    r_version: &str,
-) -> Result<ProjectPackage, RpxError> {
-    let project =
-        project_package(description).map_err(|source| LockError::Repository { source })?;
-    validate_lockfile_compatibility_for_sync(lockfile)?;
-    if !lockfile_supports_project(lockfile, &project) {
-        return Err(SyncError::LockfileOlder.into());
-    }
-    validate_runtime_for_sync(lockfile, r_version).await?;
-    Ok(project)
-}
-
 async fn sync_locked_project(
     description: &RDescription,
     lockfile: &Lockfile,
-    project: &ProjectPackage,
+    root_package: &(String, PackageVersion),
     r_version: &str,
 ) -> Result<SyncOutcome, RpxError> {
-    let manifest_requirements = manifest_requirement_names(description);
-    let lock_requirements = lockfile_requirement_names(lockfile);
-
-    if manifest_requirements != lock_requirements {
-        return Err(SyncError::LockfileOlder.into());
-    }
+    let (project_name, project_version) = root_package;
 
     let mut outcome = SyncOutcome::default();
 
     let installed = installed_packages()
         .await
         .map_err(r::RError::InstalledPackages)?;
-    let project_is_installed = installed.contains_key(&project.name);
+    let project_is_installed = installed.contains_key(project_name);
     let extra_packages = installed
         .into_iter()
-        .filter(|(package, _)| package != &project.name)
+        .filter(|(package, _)| package != project_name)
         .filter_map(
             |(package, installed)| match lockfile.packages.get(&package) {
                 Some(locked) if locked.version == installed.version().to_string() => None,
@@ -1893,15 +1767,14 @@ async fn sync_locked_project(
     outcome.removed = extra_packages.len();
     remove_packages_from_venv(&extra_packages).map_err(r::RError::Remove)?;
     if project_is_installed {
-        remove_packages_from_venv(std::slice::from_ref(&project.name))
-            .map_err(r::RError::Remove)?;
+        remove_packages_from_venv(std::slice::from_ref(project_name)).map_err(r::RError::Remove)?;
     }
 
     let root_dependencies = locked_dependencies_from_description(description)
         .map_err(|details| SyncError::ProjectInstallFailed { details })?;
     let root_package = LockedPackage {
-        package: project.name.clone(),
-        version: project.version.to_string(),
+        package: project_name.clone(),
+        version: project_version.version().to_string(),
         source: None,
         source_url: None,
         dependencies: root_dependencies,
@@ -1912,7 +1785,7 @@ async fn sync_locked_project(
     install_locked_packages(
         packages,
         lockfile.repositories.clone(),
-        &project.name,
+        project_name,
         r_version,
     )
     .await?;
@@ -2211,63 +2084,6 @@ fn locked_base_packages_from_locked<'a>(
     base_packages.into_iter().collect()
 }
 
-fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCompatibilityError> {
-    if lockfile.version < LOCKFILE_VERSION {
-        return Err(LockfileCompatibilityError::Older);
-    }
-    if lockfile.version > LOCKFILE_VERSION {
-        return Err(LockfileCompatibilityError::Newer);
-    }
-    Ok(())
-}
-
-fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) -> Result<(), RpxError> {
-    match validate_lockfile_compatibility(lockfile) {
-        Ok(()) => Ok(()),
-        Err(LockfileCompatibilityError::Older) => Err(SyncError::LockfileOlder.into()),
-        Err(LockfileCompatibilityError::Newer) => Err(SyncError::LockfileNewer.into()),
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RuntimeStatus {
-    version_mismatch: Option<String>,
-    missing_base_packages: Vec<String>,
-}
-
-async fn runtime_status(
-    lockfile: &Lockfile,
-    r_version: &str,
-) -> Result<RuntimeStatus, r::BasePackagesError> {
-    let version_mismatch = (!lockfile.r.version.is_empty() && lockfile.r.version != r_version)
-        .then(|| format!("R {} installed, R {} locked", r_version, lockfile.r.version));
-    let available_base_packages = base_packages().await?.into_iter().collect::<BTreeSet<_>>();
-    let locked_base_packages = lockfile
-        .r
-        .base_packages
-        .iter()
-        .chain(lockfile.roots.iter().map(|root| &root.package))
-        .chain(lockfile.packages.keys())
-        .filter(|package| is_base_package(package))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let missing_base_packages = lockfile
-        .r
-        .base_packages
-        .iter()
-        .chain(locked_base_packages.iter())
-        .filter(|package| !available_base_packages.contains(*package))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    Ok(RuntimeStatus {
-        version_mismatch,
-        missing_base_packages,
-    })
-}
-
 fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {
     if lockfile.sysreqs.db_commit.is_empty() {
         return Ok(system_plan_without_db(lockfile));
@@ -2486,27 +2302,6 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
         "2" | "r" | "R" => SyncSystemChoice::TryROnly,
         _ => SyncSystemChoice::Cancel,
     }
-}
-
-async fn validate_runtime_for_sync(lockfile: &Lockfile, r_version: &str) -> Result<(), RpxError> {
-    let status = runtime_status(lockfile, r_version)
-        .await
-        .map_err(r::RError::BasePackages)?;
-
-    if let Some(version_mismatch) = status.version_mismatch {
-        warning(RpxWarning::RuntimeVersionMismatch {
-            details: version_mismatch,
-        });
-    }
-
-    if status.missing_base_packages.is_empty() {
-        return Ok(());
-    }
-
-    Err(SyncError::RuntimeMissingBasePackages {
-        packages: status.missing_base_packages.join(", "),
-    }
-    .into())
 }
 
 fn r_minor_version(version: &str) -> Option<String> {
@@ -3248,12 +3043,11 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultRepositoryPreference, LockError, LockfileCompatibilityError, ProjectPackage,
-        apply_added_packages_to_description, lock_error_from_resolution,
-        locked_dependencies_from_description, locked_install_order, locked_package_install_order,
-        locked_package_repositories, lockfile_supports_project, package_not_found_help,
+        DefaultRepositoryPreference, LockError, apply_added_packages_to_description,
+        lock_error_from_resolution, locked_dependencies_from_description, locked_install_order,
+        locked_package_install_order, locked_package_repositories, package_not_found_help,
         parse_add_package, pinned_package_relations, remove_packages_from_description_dependencies,
-        roots_from_description, validate_lockfile_compatibility,
+        roots_from_description,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
@@ -3264,7 +3058,7 @@ mod tests {
     use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
     use r_description::{
         VersionConstraint,
-        lossless::{RDescription, Relation, Version},
+        lossless::{RDescription, Relation},
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -3385,42 +3179,6 @@ mod tests {
         assert!(position("hard") < position("project"));
         assert!(position("project") < position("reverse"));
         assert!(order.contains(&"unrelated".to_string()));
-    }
-
-    #[test]
-    fn validates_locked_reverse_dependencies_against_project_version() {
-        let project = ProjectPackage {
-            name: "project".to_string(),
-            version: "1.0.1".parse::<Version>().unwrap(),
-        };
-        let mut lockfile = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            repositories: vec![],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::from([(
-                "testthat".to_string(),
-                LockedPackage {
-                    package: "testthat".to_string(),
-                    version: "3.0.0".to_string(),
-                    source: None,
-                    source_url: None,
-                    dependencies: vec![LockedDependency {
-                        package: "project".to_string(),
-                        kind: "Imports".to_string(),
-                        min_version: Some("1.0.0".to_string()),
-                        max_version_exclusive: Some("1.1.0".to_string()),
-                    }],
-                },
-            )]),
-        };
-
-        assert!(lockfile_supports_project(&lockfile, &project));
-        lockfile.packages.get_mut("testthat").unwrap().dependencies[0].min_version =
-            Some("1.1.0".to_string());
-        assert!(!lockfile_supports_project(&lockfile, &project));
     }
 
     #[test]
@@ -3587,28 +3345,6 @@ Enhances: removeMe, keepEnhances
         assert_eq!(
             package_not_found_help(&["dyplr".to_string(), "ggplot".to_string()], &known),
             "For dyplr, did you mean dplyr? For ggplot, did you mean ggplot2?"
-        );
-    }
-
-    #[test]
-    fn accepts_newer_revision_but_rejects_newer_lockfile_version() {
-        let mut lockfile = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION + 1,
-            repositories: vec![],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::new(),
-        };
-
-        assert_eq!(validate_lockfile_compatibility(&lockfile), Ok(()));
-
-        lockfile.version = LOCKFILE_VERSION + 1;
-
-        assert_eq!(
-            validate_lockfile_compatibility(&lockfile),
-            Err(LockfileCompatibilityError::Newer)
         );
     }
 
