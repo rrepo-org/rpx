@@ -1,11 +1,15 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::lossless::{RDescription, Relation, Version};
+use r_description::{
+    lossless::{RDescription, Relation, Version},
+    lossy::{RemoteSource, Remotes},
+};
 use std::{
     cell::OnceCell,
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
+    io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -58,6 +62,31 @@ pub enum ManifestReadError {
         #[source]
         source: r_description::lossless::Error,
     },
+
+    #[error("failed to parse Remotes in DESCRIPTION at {}: {details}", path.display())]
+    #[diagnostic(code(rpx::project::manifest_remotes_parse_failed))]
+    RemotesParse { path: PathBuf, details: String },
+
+    #[error(
+        "unsupported Remotes source {kind} in DESCRIPTION at {}: {remote}",
+        path.display()
+    )]
+    #[diagnostic(
+        code(rpx::project::manifest_remotes_unsupported),
+        help("Use a GitHub, GitLab, Bitbucket, or generic git remote.")
+    )]
+    UnsupportedRemote {
+        path: PathBuf,
+        remote: String,
+        kind: String,
+    },
+
+    #[error(
+        "package {package} has multiple Remotes declarations in DESCRIPTION at {}",
+        path.display()
+    )]
+    #[diagnostic(code(rpx::project::manifest_remotes_duplicate_package))]
+    DuplicateRemotePackage { path: PathBuf, package: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -296,7 +325,11 @@ impl Project {
         })?;
         let description = contents
             .parse()
-            .map_err(|source| ManifestReadError::Parse { path, source })?;
+            .map_err(|source| ManifestReadError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+        parse_git_remotes(&contents, &path)?;
 
         Ok(self.description.get_or_init(|| description))
     }
@@ -479,6 +512,63 @@ impl Project {
 
         Ok(lockfile)
     }
+}
+
+fn parse_git_remotes(contents: &str, path: &Path) -> Result<Remotes, ManifestReadError> {
+    // Parse the field explicitly because the 0.6.0 lossless accessor panics on invalid Remotes.
+    let paragraph = deb822_fast::ParagraphReader::new(Cursor::new(contents))
+        .next()
+        .transpose()
+        .map_err(|error| ManifestReadError::RemotesParse {
+            path: path.to_path_buf(),
+            details: error.to_string(),
+        })?;
+    let Some(value) = paragraph
+        .as_ref()
+        .and_then(|paragraph| paragraph.get("Remotes"))
+    else {
+        return Ok(Remotes::new());
+    };
+    let remotes = value
+        .parse::<Remotes>()
+        .map_err(|details| ManifestReadError::RemotesParse {
+            path: path.to_path_buf(),
+            details,
+        })?;
+    let mut packages = BTreeSet::new();
+
+    for remote in remotes.iter() {
+        let kind = match &remote.source {
+            RemoteSource::GitHub(_)
+            | RemoteSource::GitLab(_)
+            | RemoteSource::Bitbucket(_)
+            | RemoteSource::Git(_) => None,
+            RemoteSource::Unspecified(_) => Some("unspecified".to_string()),
+            RemoteSource::Cran(_) => Some("cran".to_string()),
+            RemoteSource::Url(_) => Some("url".to_string()),
+            RemoteSource::Local(_) => Some("local".to_string()),
+            RemoteSource::Svn(_) => Some("svn".to_string()),
+            RemoteSource::Bioconductor(_) => Some("bioconductor".to_string()),
+            RemoteSource::Unknown(remote) => Some(remote.kind.clone()),
+        };
+        if let Some(kind) = kind {
+            return Err(ManifestReadError::UnsupportedRemote {
+                path: path.to_path_buf(),
+                remote: remote.to_string(),
+                kind,
+            });
+        }
+        if let Some(package) = &remote.package
+            && !packages.insert(package.clone())
+        {
+            return Err(ManifestReadError::DuplicateRemotePackage {
+                path: path.to_path_buf(),
+                package: package.clone(),
+            });
+        }
+    }
+
+    Ok(remotes)
 }
 
 fn locked_package_description(
@@ -723,6 +813,60 @@ mod tests {
         ));
         fs::create_dir(&path).expect("project directory should be created");
         path
+    }
+
+    #[test]
+    fn parses_supported_git_remotes_from_description() {
+        let contents = "Package: project\nVersion: 1.0.0\nRemotes: github::owner/github-package@main,\n gitlab@code.example::group/gitlab-package,\n bitbucket::owner/bitbucket-package/subdir@v1,\n generic=git::ssh://git@example.com/team/generic-package.git@develop\n";
+        let remotes = parse_git_remotes(contents, Path::new(DESCRIPTION_NAME))
+            .expect("Git remotes should parse");
+
+        assert_eq!(remotes.len(), 4);
+        assert!(matches!(remotes[0].source, RemoteSource::GitHub(_)));
+        assert!(matches!(remotes[1].source, RemoteSource::GitLab(_)));
+        assert!(matches!(remotes[2].source, RemoteSource::Bitbucket(_)));
+        assert!(matches!(remotes[3].source, RemoteSource::Git(_)));
+        assert_eq!(remotes[1].host.as_deref(), Some("code.example"));
+        assert_eq!(remotes[3].package.as_deref(), Some("generic"));
+    }
+
+    #[test]
+    fn rejects_malformed_remotes_when_description_is_loaded() {
+        let path = project_directory("malformed-remotes");
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner\n",
+        )
+        .expect("DESCRIPTION should be written");
+        let project = Project::new(path.clone());
+
+        assert!(matches!(
+            project.description(),
+            Err(ManifestReadError::RemotesParse { .. })
+        ));
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn rejects_unsupported_remote_sources() {
+        let contents = "Package: project\nVersion: 1.0.0\nRemotes: archive=url::https://example.com/pkg.tar.gz\n";
+
+        assert!(matches!(
+            parse_git_remotes(contents, Path::new(DESCRIPTION_NAME)),
+            Err(ManifestReadError::UnsupportedRemote { kind, .. }) if kind == "url"
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_remote_package_aliases() {
+        let contents = "Package: project\nVersion: 1.0.0\nRemotes: dependency=owner/first, dependency=owner/second\n";
+
+        assert!(matches!(
+            parse_git_remotes(contents, Path::new(DESCRIPTION_NAME)),
+            Err(ManifestReadError::DuplicateRemotePackage { package, .. })
+                if package == "dependency"
+        ));
     }
 
     #[test]
