@@ -36,6 +36,8 @@ use tracing_subscriber::{
 mod cache;
 mod cli;
 mod description;
+#[allow(dead_code)]
+mod git;
 mod http;
 mod lockfile;
 mod output;
