@@ -54,8 +54,9 @@ use lockfile::{
 };
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
-    Project, artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
-    project_library_root_path, project_root,
+    Project, artifact_cache_path, build_temp_library_path, cache_dir_path,
+    locked_default_repository_enabled, project_library_path, project_library_root_path,
+    project_root,
 };
 use r::{base_packages, install_local_package, install_project_package, installed_packages};
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
@@ -75,8 +76,8 @@ use crate::{
     lockfile::LockedPackage,
     r::{RVirtualEnv, r_version_async, remove_packages_from_venv},
     repository::{
-        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
-        RrepoRepository, built_in_repository, parse_repository_url,
+        CranRepository, LocalRepository, PackageRepository, RepositoryError, RrepoRepository,
+        built_in_repository, parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -554,14 +555,14 @@ async fn cmd_add(
         .description()
         .map_err(project::ProjectError::Manifest)?
         .clone();
-    let current_lockfile = project
+    let old_lockfile = project
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let current_lockfile = if current_lockfile.is_some() {
+    let current_lockfile = if old_lockfile.is_some() {
         match project.validate_locked_resolution(&r_version) {
-            Ok(()) => current_lockfile,
+            Ok(()) => old_lockfile.clone(),
             Err(
                 project::LockedResolutionError::RepositoriesChanged
                 | project::LockedResolutionError::PackageRequirementsChanged
@@ -579,8 +580,9 @@ async fn cmd_add(
     } else {
         None
     };
-    let repositories = repository_preference
-        .package_repositories(&description, current_lockfile.as_ref())
+    let default_repository_enabled =
+        repository_preference.enabled(&description, old_lockfile.as_ref());
+    let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
         .map_err(|source| LockError::Repository { source })?;
 
@@ -659,14 +661,14 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
         .description()
         .map_err(project::ProjectError::Manifest)?
         .clone();
-    let current_lockfile = project
+    let old_lockfile = project
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let current_lockfile = if current_lockfile.is_some() {
+    let current_lockfile = if old_lockfile.is_some() {
         match project.validate_locked_resolution(&r_version) {
-            Ok(()) => current_lockfile,
+            Ok(()) => old_lockfile.clone(),
             Err(
                 project::LockedResolutionError::RepositoriesChanged
                 | project::LockedResolutionError::PackageRequirementsChanged
@@ -684,19 +686,12 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
     } else {
         None
     };
-    let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
-        .package_repositories(&description, current_lockfile.as_ref())
-        .await
-        .map_err(|source| LockError::Repository { source })?;
-    let new_repo = <dyn PackageRepository>::from_url(url)
-        .await
-        .map_err(|source| RepoError::Add {
-            url: url.trim().to_string(),
-            source,
-        })?;
-    let new_repo_url = remote_repository_url(new_repo.as_ref())
-        .expect("URL-classified repositories should be remote")
-        .clone();
+    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
+        .enabled(&description, old_lockfile.as_ref());
+    let new_repo_url = parse_repository_url(url).map_err(|source| RepoError::Add {
+        url: url.trim().to_string(),
+        source,
+    })?;
 
     let mut additional_repositories = description.additional_repositories().unwrap_or_default();
     if additional_repositories.iter().any(|existing| {
@@ -715,13 +710,9 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
         .map(String::as_str)
         .collect::<Vec<_>>();
     description.set_additional_repositories(&additional_repositories);
-
-    if !repositories
-        .iter()
-        .any(|repository| repository.as_ref() == new_repo.as_ref())
-    {
-        repositories.push(Arc::clone(&new_repo));
-    }
+    let repositories = effective_package_repositories(&description, default_repository_enabled)
+        .await
+        .map_err(|source| LockError::Repository { source })?;
 
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
     let preferred_versions = preferred_versions_from_lockfile(
@@ -755,14 +746,14 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         .description()
         .map_err(project::ProjectError::Manifest)?
         .clone();
-    let current_lockfile = project
+    let old_lockfile = project
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let current_lockfile = if current_lockfile.is_some() {
+    let current_lockfile = if old_lockfile.is_some() {
         match project.validate_locked_resolution(&r_version) {
-            Ok(()) => current_lockfile,
+            Ok(()) => old_lockfile.clone(),
             Err(
                 project::LockedResolutionError::RepositoriesChanged
                 | project::LockedResolutionError::PackageRequirementsChanged
@@ -780,10 +771,8 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
     } else {
         None
     };
-    let mut repositories = DefaultRepositoryPreference::FromLockfileOrDefault
-        .package_repositories(&description, current_lockfile.as_ref())
-        .await
-        .map_err(|source| LockError::Repository { source })?;
+    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
+        .enabled(&description, old_lockfile.as_ref());
     let base_url = parse_repository_url(url).map_err(|source| RepoError::Add {
         url: url.trim().to_string(),
         source,
@@ -806,10 +795,9 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
         .map(String::as_str)
         .collect::<Vec<_>>();
     description.set_additional_repositories(&additional_repositories);
-
-    repositories.retain(|repository| {
-        remote_repository_url(repository.as_ref()).is_none_or(|url| url != &base_url)
-    });
+    let repositories = effective_package_repositories(&description, default_repository_enabled)
+        .await
+        .map_err(|source| LockError::Repository { source })?;
 
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
     let preferred_versions = preferred_versions_from_lockfile(
@@ -923,14 +911,14 @@ async fn cmd_remove(
         .description()
         .map_err(project::ProjectError::Manifest)?
         .clone();
-    let current_lockfile = project
+    let old_lockfile = project
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let current_lockfile = if current_lockfile.is_some() {
+    let current_lockfile = if old_lockfile.is_some() {
         match project.validate_locked_resolution(&r_version) {
-            Ok(()) => current_lockfile,
+            Ok(()) => old_lockfile.clone(),
             Err(
                 project::LockedResolutionError::RepositoriesChanged
                 | project::LockedResolutionError::PackageRequirementsChanged
@@ -948,8 +936,9 @@ async fn cmd_remove(
     } else {
         None
     };
-    let repositories = repository_preference
-        .package_repositories(&description, current_lockfile.as_ref())
+    let default_repository_enabled =
+        repository_preference.enabled(&description, old_lockfile.as_ref());
+    let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
         .map_err(|source| LockError::Repository { source })?;
 
@@ -1037,14 +1026,14 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     let description = project
         .description()
         .map_err(project::ProjectError::Manifest)?;
-    let current_lockfile = project
+    let old_lockfile = project
         .lockfile_optional()
         .map_err(project::ProjectError::Lockfile)?
         .cloned();
     let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let current_lockfile = if current_lockfile.is_some() {
+    let current_lockfile = if old_lockfile.is_some() {
         match project.validate_locked_resolution(&r_version) {
-            Ok(()) => current_lockfile,
+            Ok(()) => old_lockfile.clone(),
             Err(
                 project::LockedResolutionError::RepositoriesChanged
                 | project::LockedResolutionError::PackageRequirementsChanged
@@ -1062,8 +1051,9 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     } else {
         None
     };
-    let repositories = repository_preference
-        .package_repositories(&description, current_lockfile.as_ref())
+    let default_repository_enabled =
+        repository_preference.enabled(description, old_lockfile.as_ref());
+    let repositories = effective_package_repositories(description, default_repository_enabled)
         .await
         .map_err(|source| LockError::Repository { source })?;
     let roots = roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
@@ -1229,67 +1219,36 @@ impl DefaultRepositoryPreference {
         }
     }
 
-    async fn package_repositories(
-        self,
-        description: &RDescription,
-        lockfile: Option<&Lockfile>,
-    ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
-        let mut repos = match lockfile {
-            Some(lockfile) => package_repositories_from_lockfile(lockfile)?,
-            None => package_repositories_from_description(description).await?,
-        };
-
-        if self == Self::Enabled || (self == Self::FromLockfileOrDefault && lockfile.is_none()) {
-            let default = default_repository().await?;
-            if !repos
-                .iter()
-                .any(|repository| repository.as_ref() == default.as_ref())
-            {
-                repos.insert(0, default);
-            }
+    fn enabled(self, description: &RDescription, lockfile: Option<&Lockfile>) -> bool {
+        match self {
+            Self::Enabled => true,
+            Self::Disabled => false,
+            Self::FromLockfileOrDefault => lockfile
+                .and_then(|lockfile| locked_default_repository_enabled(description, lockfile))
+                .unwrap_or(true),
         }
-
-        Ok(repos)
     }
 }
 
-fn package_repositories_from_lockfile(
-    lockfile: &Lockfile,
-) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
-    lockfile
-        .repositories
-        .iter()
-        .map(|locked_repository| {
-            let url = parse_repository_url(&locked_repository.url)?;
-
-            Ok(match locked_repository.kind {
-                LockedRepositoryKind::Rrepo => {
-                    Arc::new(RrepoRepository::new(url)) as Arc<dyn PackageRepository>
-                }
-                LockedRepositoryKind::CranLike => Arc::new(CranRepository::new(
-                    url,
-                    locked_repository
-                        .cran_archive_support
-                        .unwrap_or(ArchiveSupport::Unavailable),
-                )),
-            })
-        })
-        .collect()
-}
-
-async fn package_repositories_from_description(
+async fn effective_package_repositories(
     description: &RDescription,
+    default_repository_enabled: bool,
 ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
     let additional_repositories = description.additional_repositories().unwrap_or_default();
-
-    futures_util::future::join_all(
+    let mut repositories = futures_util::future::join_all(
         additional_repositories
             .iter()
             .map(|url| async move { <dyn PackageRepository>::from_url(url).await }),
     )
     .await
     .into_iter()
-    .collect()
+    .collect::<Result<Vec<_>, _>>()?;
+
+    if default_repository_enabled {
+        repositories.insert(0, default_repository().await?);
+    }
+
+    Ok(repositories)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3289,16 +3248,16 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockError, LockfileCompatibilityError, ProjectPackage, apply_added_packages_to_description,
-        lock_error_from_resolution, locked_dependencies_from_description, locked_install_order,
-        locked_package_install_order, locked_package_repositories, lockfile_supports_project,
-        package_not_found_help, parse_add_package, pinned_package_relations,
-        remove_packages_from_description_dependencies, roots_from_description,
-        validate_lockfile_compatibility,
+        DefaultRepositoryPreference, LockError, LockfileCompatibilityError, ProjectPackage,
+        apply_added_packages_to_description, lock_error_from_resolution,
+        locked_dependencies_from_description, locked_install_order, locked_package_install_order,
+        locked_package_repositories, lockfile_supports_project, package_not_found_help,
+        parse_add_package, pinned_package_relations, remove_packages_from_description_dependencies,
+        roots_from_description, validate_lockfile_compatibility,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
-        LockedSystemRequirements, Lockfile,
+        LockedRepository, LockedRepositoryKind, LockedSystemRequirements, Lockfile,
     };
     use crate::repository::{LocalRepository, PackageRepository};
     use crate::resolver::{RDependencyProvider, ResolutionError};
@@ -3323,6 +3282,47 @@ mod tests {
             .expect_err("local repositories should not be lockable");
 
         assert!(matches!(error, LockError::UnsupportedRepository { .. }));
+    }
+
+    #[test]
+    fn resolves_default_repository_preference_from_flags_and_lock() {
+        let description =
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\n"
+                .parse::<RDescription>()
+                .expect("DESCRIPTION should parse");
+        let lockfile = |repositories: &[&str]| Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            repositories: repositories
+                .iter()
+                .map(|url| LockedRepository {
+                    url: (*url).to_string(),
+                    kind: LockedRepositoryKind::Rrepo,
+                    cran_archive_support: None,
+                })
+                .collect(),
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+        let enabled = lockfile(&[
+            "https://custom-default.test/cran",
+            "https://extra.test/cran",
+        ]);
+        let disabled = lockfile(&["https://extra.test/cran"]);
+
+        assert!(DefaultRepositoryPreference::Enabled.enabled(&description, Some(&disabled)));
+        assert!(!DefaultRepositoryPreference::Disabled.enabled(&description, Some(&enabled)));
+        assert!(
+            DefaultRepositoryPreference::FromLockfileOrDefault
+                .enabled(&description, Some(&enabled))
+        );
+        assert!(
+            !DefaultRepositoryPreference::FromLockfileOrDefault
+                .enabled(&description, Some(&disabled))
+        );
+        assert!(DefaultRepositoryPreference::FromLockfileOrDefault.enabled(&description, None));
     }
 
     #[test]

@@ -17,8 +17,8 @@ use crate::{
         locked_repository_for_source,
     },
     repository::{
-        ArchiveSupport, BUILT_IN_REPOSITORY_BASE_URL, CranRepository, LocalRepository,
-        PackageRepository, RrepoRepository, parse_repository_url,
+        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RrepoRepository,
+        parse_repository_url,
     },
     resolver::{PackageVersion, is_base_package},
 };
@@ -447,32 +447,32 @@ fn package_repository(
 }
 
 fn repositories_match(description: &RDescription, lockfile: &Lockfile) -> bool {
-    let Some(mut expected) = description
+    locked_default_repository_enabled(description, lockfile).is_some()
+}
+
+pub(crate) fn locked_default_repository_enabled(
+    description: &RDescription,
+    lockfile: &Lockfile,
+) -> Option<bool> {
+    let expected = description
         .additional_repositories()
         .unwrap_or_default()
         .iter()
         .map(|repository| canonical_repository_url(repository))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let Some(locked) = lockfile
+        .collect::<Option<Vec<_>>>()?;
+    let locked = lockfile
         .repositories
         .iter()
         .map(|repository| canonical_repository_url(&repository.url))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let Some(default_repository) = canonical_repository_url(BUILT_IN_REPOSITORY_BASE_URL) else {
-        return false;
-    };
+        .collect::<Option<Vec<_>>>()?;
 
-    if locked.contains(&default_repository) && !expected.contains(&default_repository) {
-        expected.insert(0, default_repository);
+    if locked == expected {
+        Some(false)
+    } else if locked.len() == expected.len() + 1 && locked[1..] == expected {
+        Some(true)
+    } else {
+        None
     }
-
-    locked == expected
 }
 
 fn canonical_repository_url(value: &str) -> Option<String> {
@@ -801,6 +801,83 @@ mod tests {
         ));
 
         fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn infers_default_repository_policy_from_locked_order() {
+        let description =
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\n"
+                .parse::<RDescription>()
+                .expect("DESCRIPTION should parse");
+        let lockfile = |repositories: &[&str]| Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: 0,
+            repositories: repositories
+                .iter()
+                .map(|url| LockedRepository {
+                    url: (*url).to_string(),
+                    kind: LockedRepositoryKind::Rrepo,
+                    cran_archive_support: None,
+                })
+                .collect(),
+            r: Default::default(),
+            sysreqs: Default::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            locked_default_repository_enabled(
+                &description,
+                &lockfile(&["https://extra.test/cran"])
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            locked_default_repository_enabled(
+                &description,
+                &lockfile(&[
+                    "https://custom-default.test/cran",
+                    "https://extra.test/cran",
+                ])
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            locked_default_repository_enabled(
+                &description,
+                &lockfile(&[
+                    "https://stale.test/cran",
+                    "https://extra.test/cran",
+                    "https://unexpected.test/cran",
+                ])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preserves_a_duplicate_default_as_a_leading_repository_slot() {
+        let description = "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://default.test/cran\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+        let lockfile = serde_json::from_str::<Lockfile>(
+            r#"{
+                "version": 4,
+                "repositories": [
+                    {"url": "https://default.test/cran", "kind": "rrepo"},
+                    {"url": "https://default.test/cran", "kind": "rrepo"}
+                ],
+                "roots": [],
+                "packages": {}
+            }"#,
+        )
+        .expect("lockfile should parse");
+
+        assert_eq!(
+            locked_default_repository_enabled(&description, &lockfile),
+            Some(true)
+        );
     }
 
     #[test]

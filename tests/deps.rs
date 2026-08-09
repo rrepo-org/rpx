@@ -319,6 +319,40 @@ Imports: digest",
 }
 
 #[test]
+fn inherits_and_overrides_default_repository_policy() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-default-repository-policy";
+    create_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx lock --no-default-repo");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        !lockfile.contains("https://upstream.rrepo.dev/cran"),
+        "lockfile was: {lockfile}"
+    );
+
+    let command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        !lockfile.contains("https://upstream.rrepo.dev/cran"),
+        "lockfile was: {lockfile}"
+    );
+
+    let command = format!("cd {project_path} && rpx lock --default-repo");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        lockfile.contains("https://upstream.rrepo.dev/cran"),
+        "lockfile was: {lockfile}"
+    );
+}
+
+#[test]
 fn does_not_add_import_when_package_is_already_in_depends() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-depends";

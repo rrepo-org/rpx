@@ -346,11 +346,18 @@ runtime snapshot structure:
   type (`win.binary`, `mac.binary.*`, or `source`).
 - Base-package inspection remains a separate cached R query.
 
-### Phase 3: Effective Repositories
+### Phase 3: Effective Repositories (Completed)
 
 Derive the repository runtime set from the mutated manifest and the effective
 default-repository decision. Do not reconstruct the runtime repository set
 from the old lock.
+
+Implemented with structural policy inheritance from the ordered lock
+repository list. New resolutions rebuild repository adapters from the current
+manifest and current effective default URL, while sync continues to use its
+locked repository metadata unchanged. Enabled defaults retain a distinct
+leading slot even when the same URL is also declared as an additional
+repository.
 
 The old lock supplies default-policy inheritance and resolution preferences.
 The effective base repository is the built-in repository unless overridden by
