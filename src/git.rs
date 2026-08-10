@@ -1,7 +1,8 @@
 use crate::project::cache_dir_path;
 use git2::{
-    AutotagOption, Config, Cred, CredentialType, Direction, FetchOptions, Odb, Oid, ProxyOptions,
-    Reference, RemoteCallbacks, RemoteRedirect, Repository, build::CheckoutBuilder,
+    AutotagOption, Config, Cred, CredentialType, Direction, ErrorClass, ErrorCode, FetchOptions,
+    Odb, Oid, ProxyOptions, Reference, RemoteCallbacks, RemoteRedirect, Repository,
+    build::CheckoutBuilder,
 };
 use r_description::lossy::{HostedGitRemote, Remote, RemoteSource};
 use sha2::{Digest, Sha256};
@@ -196,6 +197,13 @@ pub enum GitError {
 
     #[error("Git commit {commit} is not available from {remote}")]
     CommitUnavailable { remote: String, commit: Oid },
+
+    #[error("could not access Git repository {remote}")]
+    Access {
+        remote: String,
+        #[source]
+        source: git2::Error,
+    },
 
     #[error("failed to {operation}: {source}")]
     Operation {
@@ -435,7 +443,7 @@ fn fetch(
         .update_fetchhead(false);
     git_remote
         .fetch(refspecs, Some(&mut options), Some("rpx source fetch"))
-        .map_err(|source| operation("fetch Git source", source))
+        .map_err(|source| remote_operation("fetch Git source", remote, source))
 }
 
 fn populate_checkout(
@@ -611,7 +619,7 @@ fn advertised_references(
     proxy.auto();
     let connection = remote
         .connect_auth(Direction::Fetch, Some(callbacks), Some(proxy))
-        .map_err(|source| operation("connect to Git remote", source))?;
+        .map_err(|source| remote_operation("connect to Git remote", remote_url, source))?;
     let refs = connection
         .list()
         .map_err(|source| operation("list Git references", source))?
@@ -738,7 +746,13 @@ fn remote_callbacks<'a>(
             && !helper_attempted
         {
             helper_attempted = true;
-            return Cred::credential_helper(config, callback_url, username);
+            return Cred::credential_helper(config, callback_url, username).map_err(
+                |mut source| {
+                    source.set_code(ErrorCode::Auth);
+                    source.set_class(ErrorClass::Callback);
+                    source
+                },
+            );
         }
         if remote.is_ssh()
             && allowed.contains(CredentialType::USERNAME)
@@ -757,8 +771,10 @@ fn remote_callbacks<'a>(
             return Cred::ssh_key_from_agent(username);
         }
 
-        Err(git2::Error::from_str(
-            "no supported Git credentials are available",
+        Err(git2::Error::new(
+            ErrorCode::Auth,
+            ErrorClass::Callback,
+            "Git credentials are unavailable",
         ))
     });
     if let Some(span) = progress_span {
@@ -844,6 +860,17 @@ fn invalid_text(value: &str) -> bool {
 
 fn operation(operation: &'static str, source: git2::Error) -> GitError {
     GitError::Operation { operation, source }
+}
+
+fn remote_operation(operation: &'static str, remote: &GitUrl, source: git2::Error) -> GitError {
+    if source.code() == ErrorCode::Auth {
+        GitError::Access {
+            remote: remote.to_string(),
+            source,
+        }
+    } else {
+        GitError::Operation { operation, source }
+    }
 }
 
 #[cfg(test)]

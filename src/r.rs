@@ -231,19 +231,20 @@ pub async fn install_local_package(
     install_command_result(output, format!("{package}@{version}"))
 }
 
-pub async fn install_project_package(
-    project_root: &Path,
+pub async fn install_package_directory(
+    package_root: &Path,
     target_library: &Path,
+    target: &str,
 ) -> Result<(), PackageInstallError> {
     let mut command = Command::with_venv("R");
     command
         .arg("CMD")
         .arg("INSTALL")
         .arg(format!("--library={}", target_library.display()))
-        .arg(project_root);
+        .arg(package_root);
     let output = run_subprocess(command, "R").await;
 
-    install_command_result(output, "project package".to_string())
+    install_command_result(output, target.to_string())
 }
 
 fn install_command_result(

@@ -684,6 +684,46 @@ mod tests {
         assert_eq!(selected.repository().to_string(), "second source");
     }
 
+    #[tokio::test]
+    async fn equal_versions_use_the_earlier_repository() {
+        let first_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("first source"));
+        let second_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("second source"));
+        let first_candidate = version("2.0.0", first_source);
+        let second_candidate = version("2.0.0", second_source);
+        let first_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "first",
+            packages: BTreeMap::from([("example".to_string(), first_candidate.clone())]),
+            versions: BTreeMap::from([("example".to_string(), BTreeSet::from([first_candidate]))]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+        let second_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "second",
+            packages: BTreeMap::from([("example".to_string(), second_candidate.clone())]),
+            versions: BTreeMap::from([("example".to_string(), BTreeSet::from([second_candidate]))]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+
+        let selected = choose_package_version(
+            &[first_repository, second_repository],
+            &BTreeMap::new(),
+            "example",
+            &Ranges::full(),
+        )
+        .await
+        .expect("version selection should succeed")
+        .expect("candidate should be available");
+
+        assert_eq!(selected.repository().to_string(), "first source");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn root_name_is_reserved_for_the_supplied_version() {
         let local_repository = local_repository("project", "1.0.0");

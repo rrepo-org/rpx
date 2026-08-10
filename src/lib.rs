@@ -55,7 +55,7 @@ use project::{
     artifact_cache_path, build_temp_library_path, cache_dir_path,
     locked_default_repository_enabled, project_library_path, project_library_root_path,
 };
-use r::{install_local_package, install_project_package, installed_packages};
+use r::{install_local_package, install_package_directory, installed_packages};
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
@@ -73,8 +73,8 @@ use crate::{
     lockfile::Lockfile,
     r::{RVirtualEnv, r_version_async, remove_packages_from_venv},
     repository::{
-        CranRepository, LocalRepository, PackageRepository, RepositoryError, RrepoRepository,
-        default_repository, parse_repository_url,
+        CranRepository, GitRepository, LocalRepository, PackageRepository, RepositoryError,
+        RrepoRepository, default_repository, parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -261,7 +261,7 @@ enum RunError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum LockError {
-    #[error("failed to resolve package set from registry: {details}")]
+    #[error("failed to prepare package requirements: {details}")]
     #[diagnostic(
         code(rpx::lock::resolve_failed),
         help("Check package names and version constraints in DESCRIPTION.")
@@ -282,7 +282,20 @@ enum LockError {
         source: RepositoryError,
     },
 
-    #[error("failed to resolve package set from registry")]
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable { repository: String },
+
+    #[error("failed to load packages from {repository}: {details}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    RepositoryIndexFailed { repository: String, details: String },
+
+    #[error("failed to resolve package set")]
     #[diagnostic(
         code(rpx::lock::resolve_failed),
         help("Check package names and version constraints in DESCRIPTION.")
@@ -306,6 +319,18 @@ enum LockError {
 }
 
 fn lock_error_from_resolution(error: ResolutionError) -> LockError {
+    if let ResolutionError::Provider(provider) = &error {
+        let source = match provider {
+            resolver::ProviderError::Repository(source)
+            | resolver::ProviderError::DependencyMetadata { source, .. } => source,
+        };
+        if let Some(repository) = inaccessible_git_repository(source) {
+            return LockError::GitRepositoryUnavailable {
+                repository: repository.to_string(),
+            };
+        }
+    }
+
     match error {
         ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
             derivation_tree.collapse_no_versions();
@@ -315,6 +340,26 @@ fn lock_error_from_resolution(error: ResolutionError) -> LockError {
         }
         source => LockError::Resolution { source },
     }
+}
+
+fn lock_error_from_repository(source: RepositoryError) -> LockError {
+    if let Some(repository) = inaccessible_git_repository(&source) {
+        LockError::GitRepositoryUnavailable {
+            repository: repository.to_string(),
+        }
+    } else {
+        LockError::Repository { source }
+    }
+}
+
+fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
+    let RepositoryError::Git { source, .. } = error else {
+        return None;
+    };
+    let git::GitError::Access { remote, .. } = source.as_ref() else {
+        return None;
+    };
+    Some(remote)
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -340,6 +385,14 @@ enum SyncError {
     #[error("failed to install project package: {source}")]
     #[diagnostic(code(rpx::sync::project_install_failed))]
     ProjectPackageInstall {
+        #[source]
+        source: r::PackageInstallError,
+    },
+
+    #[error("failed to install package {package}: {source}")]
+    #[diagnostic(code(rpx::sync::package_install_failed))]
+    PackageInstall {
+        package: String,
         #[source]
         source: r::PackageInstallError,
     },
@@ -532,7 +585,7 @@ async fn cmd_add(
         .await;
     let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     let mut desired_roots = roots_from_description(&description);
     let new_packages = packages
         .iter()
@@ -692,7 +745,7 @@ async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
     description.set_additional_repositories(&additional_repositories);
     let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     match project.validate_locked_resolution(&description, &repositories, &r_version) {
         Ok(_) => {}
         Err(error)
@@ -801,7 +854,7 @@ async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxEr
     description.set_additional_repositories(&additional_repositories);
     let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     match project.validate_locked_resolution(&description, &repositories, &r_version) {
         Ok(_) => {}
         Err(error)
@@ -891,7 +944,7 @@ async fn cmd_repo_list() -> Result<(), RpxError> {
         .await;
     let repositories = effective_package_repositories(description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     project
         .validate_locked_resolution(description, &repositories, &r_version)
         .map_err(project::ProjectError::LockedResolution)?;
@@ -945,7 +998,7 @@ async fn cmd_remove(
         .await;
     let repositories = effective_package_repositories(&description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     let removed_packages = packages.iter().cloned().collect::<BTreeSet<_>>();
     remove_packages_from_description_dependencies(&mut description, &removed_packages);
     let desired_roots = roots_from_description(&description);
@@ -1093,7 +1146,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
         .await;
     let repositories = effective_package_repositories(description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     match project.validate_locked_resolution(description, &repositories, &r_version) {
         Ok(_) => {}
         Err(error)
@@ -1180,7 +1233,7 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
         .await;
     let repositories = effective_package_repositories(description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     let lockfile = project
         .validate_locked_resolution(description, &repositories, &r_version)
         .map_err(project::ProjectError::LockedResolution)?;
@@ -1216,7 +1269,7 @@ async fn cmd_status() -> Result<(), RpxError> {
         .await;
     let repositories = effective_package_repositories(description, default_repository_enabled)
         .await
-        .map_err(|source| LockError::Repository { source })?;
+        .map_err(lock_error_from_repository)?;
     let lockfile = project
         .validate_locked_resolution(description, &repositories, &r_version)
         .map_err(project::ProjectError::LockedResolution)?;
@@ -1351,6 +1404,18 @@ async fn effective_package_repositories(
     if default_repository_enabled {
         repositories.insert(0, default_repository().await?);
     }
+
+    repositories.extend(
+        description
+            .remotes()
+            .unwrap_or_default()
+            .iter()
+            .map(|remote| {
+                GitRepository::new(&remote.parsed())
+                    .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
 
     Ok(repositories)
 }
@@ -1509,8 +1574,17 @@ async fn latest_package_versions_for_add(
         .await;
 
     for result in package_indexes {
-        let available = result.map_err(|(url, details)| LockError::ResolveFailed {
-            details: format!("failed to load package index from {url}: {details}"),
+        let available = result.map_err(|(repository, source)| {
+            if let Some(repository) = inaccessible_git_repository(&source) {
+                return LockError::GitRepositoryUnavailable {
+                    repository: repository.to_string(),
+                };
+            }
+
+            LockError::RepositoryIndexFailed {
+                repository,
+                details: source.to_string(),
+            }
         })?;
         known_packages.extend(available.keys().cloned());
 
@@ -1754,27 +1828,25 @@ async fn sync_packages(
     let packages_to_remove = installed
         .iter()
         .filter(|(name, installed_version)| {
-            required
-                .get(*name)
-                .is_none_or(|(required_version, _)| required_version != *installed_version)
+            required.get(*name).is_none_or(|(required_version, _)| {
+                package_requires_install(required_version, Some(installed_version))
+            })
         })
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
     let retained = installed
         .iter()
         .filter(|(name, installed_version)| {
-            required
-                .get(*name)
-                .is_some_and(|(required_version, _)| required_version == *installed_version)
+            required.get(*name).is_some_and(|(required_version, _)| {
+                !package_requires_install(required_version, Some(installed_version))
+            })
         })
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
     let packages_to_install = required
         .into_iter()
         .filter(|(name, (required_version, _))| {
-            installed
-                .get(name)
-                .is_none_or(|installed_version| installed_version != required_version)
+            package_requires_install(required_version, installed.get(name))
         })
         .collect();
 
@@ -1782,6 +1854,15 @@ async fn sync_packages(
     install_required_packages(packages_to_install, retained, r_version).await?;
 
     Ok(())
+}
+
+fn package_requires_install(required: &PackageVersion, installed: Option<&PackageVersion>) -> bool {
+    required
+        .repository()
+        .as_ref()
+        .downcast_ref::<GitRepository>()
+        .is_some()
+        || installed != Some(required)
 }
 
 pub(crate) fn exit_with_status(code: Option<i32>) {
@@ -1799,7 +1880,7 @@ async fn hydrate_resolved_packages(
             .repository()
             .description(&name, version.version())
             .await
-            .map_err(|source| LockError::Repository { source })?;
+            .map_err(lock_error_from_repository)?;
 
         Ok::<_, LockError>((name, (version, description)))
     }))
@@ -1824,7 +1905,7 @@ async fn lockfile_from_resolution(
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()
-    .map_err(|source| LockError::Repository { source })?;
+    .map_err(lock_error_from_repository)?;
 
     let packages = resolved_packages
         .iter()
@@ -2238,9 +2319,82 @@ async fn install_required_packages(
                             }
                         })?;
 
-                    install_project_package(&project_path, &project_library_path())
-                        .await
-                        .map_err(|source| SyncError::ProjectPackageInstall { source })?;
+                    install_package_directory(
+                        &project_path,
+                        &project_library_path(),
+                        "project package",
+                    )
+                    .await
+                    .map_err(|source| SyncError::ProjectPackageInstall { source })?;
+                    {
+                        let mut installed_packages = install_installed_packages.lock().await;
+                        installed_packages.insert(package_name.clone());
+                    }
+                    let _ = install_installed_tx.send(());
+
+                    Ok::<_, SyncError>(package_name)
+                }
+                .instrument(sync_span.clone()),
+            );
+            continue;
+        }
+
+        if let Some(repository) = package_version
+            .repository()
+            .as_ref()
+            .downcast_ref::<GitRepository>()
+        {
+            let repository = repository.clone();
+            let install_required_names = Arc::clone(&required_names);
+            let install_installed_packages = Arc::clone(&installed_packages);
+            let install_installed_rx = installed_rx.clone();
+            let install_installed_tx = installed_tx.clone();
+            let install_shared_pool = Arc::clone(&shared_pool);
+            let install_pool = Arc::clone(&install_pool);
+            install_tasks.spawn(
+                async move {
+                    wait_for_package_dependencies(
+                        &package_name,
+                        &dependencies,
+                        install_required_names,
+                        Arc::clone(&install_installed_packages),
+                        install_installed_rx,
+                    )
+                    .await
+                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+
+                    let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
+                        SyncError::DownloadArtifactsFailed {
+                            details: "install pool closed before Git package installation"
+                                .to_string(),
+                        }
+                    })?;
+                    let _shared_permit =
+                        install_shared_pool.acquire_owned().await.map_err(|_| {
+                            SyncError::DownloadArtifactsFailed {
+                                details: "sync work pool closed before Git package installation"
+                                    .to_string(),
+                            }
+                        })?;
+
+                    let checkout = repository.checkout().await.map_err(|error| {
+                        SyncError::DownloadArtifactsFailed {
+                            details: format!("failed to checkout {package_name}: {error}"),
+                        }
+                    })?;
+                    let package_root = repository
+                        .subdirectory()
+                        .map_or(checkout.clone(), |subdirectory| checkout.join(subdirectory));
+                    install_package_directory(
+                        &package_root,
+                        &project_library_path(),
+                        &format!("{package_name} from Git"),
+                    )
+                    .await
+                    .map_err(|source| SyncError::PackageInstall {
+                        package: package_name.clone(),
+                        source,
+                    })?;
                     {
                         let mut installed_packages = install_installed_packages.lock().await;
                         installed_packages.insert(package_name.clone());
@@ -2830,16 +2984,18 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 mod tests {
     use super::{
         DefaultRepositoryPreference, LockError, RequiredPackages,
-        apply_added_packages_to_description, lock_error_from_resolution, lockfile_from_resolution,
-        package_not_found_help, package_rules_from_lockfile, parse_add_package,
-        pinned_package_relations, remove_packages_from_description_dependencies,
-        required_package_install_order, roots_from_description,
+        apply_added_packages_to_description, effective_package_repositories,
+        lock_error_from_resolution, lockfile_from_resolution, package_not_found_help,
+        package_rules_from_lockfile, parse_add_package, pinned_package_relations,
+        remove_packages_from_description_dependencies, required_package_install_order,
+        roots_from_description,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, Lockfile, Repository, SystemRequirements,
     };
     use crate::repository::{
-        LocalRepository, PackageRepository, RepositoryError, built_in_repository,
+        GitRepository, LocalRepository, PackageRepository, RepositoryError, RrepoRepository,
+        built_in_repository,
     };
     use crate::resolver::{PackageVersion, RDependencyProvider, ResolutionError};
     use crate::sysreqs::{SysreqDbSnapshot, SysreqRule};
@@ -2963,6 +3119,30 @@ mod tests {
                 .enabled(&description, None)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn appends_git_remotes_after_registry_repositories() {
+        let description =
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@main\n"
+                .parse::<RDescription>()
+                .expect("DESCRIPTION should parse");
+
+        let repositories = effective_package_repositories(&description, true)
+            .await
+            .expect("repositories should load");
+
+        assert_eq!(repositories.len(), 2);
+        assert!(repositories[0].downcast_ref::<RrepoRepository>().is_some());
+        let git = repositories[1]
+            .downcast_ref::<GitRepository>()
+            .expect("remote should become a Git repository");
+        assert_eq!(
+            git.remote().to_string(),
+            "https://github.com/owner/repository.git"
+        );
+        assert_eq!(git.reference(), Some("main"));
+        assert_eq!(git.subdirectory(), None);
     }
 
     #[test]
@@ -3103,6 +3283,60 @@ mod tests {
                 "libcurl".to_string(),
                 BTreeSet::from(["selectedpkg".to_string()]),
             )])
+        );
+    }
+
+    #[tokio::test]
+    async fn locks_selected_git_package_with_pinned_repository() {
+        let commit = "1111111111111111111111111111111111111111"
+            .parse::<git2::Oid>()
+            .expect("commit should parse");
+        let remote = "github::owner/repository@main"
+            .parse::<r_description::lossy::Remote>()
+            .expect("remote should parse");
+        let repository: Arc<dyn PackageRepository> = Arc::new(
+            GitRepository::new(&remote)
+                .expect("Git repository should construct")
+                .with_commit(commit),
+        );
+        let description = "Package: gitfixture\nVersion: 1.0.0\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+        let resolved = BTreeMap::from([(
+            "gitfixture".to_string(),
+            (
+                PackageVersion::new(
+                    "1.0.0".parse().expect("version should parse"),
+                    Arc::clone(&repository),
+                ),
+                Arc::new(description),
+            ),
+        )]);
+
+        let lockfile = lockfile_from_resolution(
+            BTreeSet::from([Relation::simple("gitfixture")]),
+            &resolved,
+            &crate::sysreqs::empty_snapshot(),
+            &[repository],
+            &semver::Version::new(4, 5, 0),
+        )
+        .await
+        .expect("Git resolution should become a lockfile");
+
+        assert!(matches!(
+            &lockfile.repos[0],
+            Repository::Git {
+                url,
+                reference: crate::lockfile::GitReference::Named { value },
+                commit: locked_commit,
+                subdirectory: None,
+            } if url.as_str() == "https://github.com/owner/repository.git"
+                && value == "main"
+                && locked_commit == &commit
+        ));
+        assert_eq!(
+            lockfile.packages["gitfixture"].repository.as_str(),
+            "https://github.com/owner/repository.git"
         );
     }
 

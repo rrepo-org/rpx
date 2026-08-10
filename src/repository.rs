@@ -1,5 +1,4 @@
 mod cran;
-#[allow(dead_code)]
 mod git;
 mod local;
 mod rrepo;
@@ -21,7 +20,6 @@ use std::{
 use thiserror::Error;
 
 pub use cran::CranRepository;
-#[allow(unused_imports)]
 pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;

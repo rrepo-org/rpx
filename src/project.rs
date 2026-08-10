@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::{
     lockfile::{self, LOCKFILE_VERSION, Lockfile, LockfileHeader},
     repository::{
-        LocalRepository, PackageRepository, RepositoryError, default_repository,
+        GitRepository, LocalRepository, PackageRepository, RepositoryError, default_repository,
         parse_repository_url,
     },
     resolver::{PackageVersion, is_base_package},
@@ -623,12 +623,7 @@ pub(crate) async fn locked_default_repository_enabled(
     description: &RDescription,
     lockfile: &Lockfile,
 ) -> Option<bool> {
-    let expected = description
-        .additional_repositories()
-        .unwrap_or_default()
-        .iter()
-        .map(|repository| parse_repository_url(repository).ok())
-        .collect::<Option<Vec<_>>>()?;
+    let expected = description_repository_urls(description)?;
 
     if lockfile
         .repos
@@ -641,6 +636,27 @@ pub(crate) async fn locked_default_repository_enabled(
 
     let default = default_repository().await.ok()?;
     infer_locked_default_repository_enabled(&expected, lockfile, default.as_ref())
+}
+
+fn description_repository_urls(description: &RDescription) -> Option<Vec<url::Url>> {
+    let additional = description
+        .additional_repositories()
+        .unwrap_or_default()
+        .iter()
+        .map(|repository| parse_repository_url(repository).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let remotes = description
+        .remotes()
+        .unwrap_or_default()
+        .iter()
+        .map(|remote| {
+            let remote = remote.parsed();
+            let repository = GitRepository::new(&remote).ok()?;
+            url::Url::try_from(repository.remote()).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(additional.into_iter().chain(remotes).collect())
 }
 
 fn infer_locked_default_repository_enabled(
@@ -867,6 +883,17 @@ mod tests {
         Repository::Rrepo { url: url(value) }
     }
 
+    fn git_repository(value: &str, reference: &str, commit: &str) -> Repository {
+        Repository::Git {
+            url: url(value),
+            reference: GitReference::Named {
+                value: reference.to_string(),
+            },
+            commit: oid(commit),
+            subdirectory: None,
+        }
+    }
+
     fn package(version: &str, repository: &str, dependencies: &[&str]) -> Package {
         Package {
             version: package_version(version),
@@ -896,6 +923,21 @@ mod tests {
         assert!(matches!(remotes[3].source, RemoteSource::Git(_)));
         assert_eq!(remotes[1].host.as_deref(), Some("code.example"));
         assert_eq!(remotes[3].package.as_deref(), Some("generic"));
+    }
+
+    #[test]
+    fn derives_repository_urls_from_additional_repositories_and_remotes() {
+        let description = "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+
+        assert_eq!(
+            description_repository_urls(&description),
+            Some(vec![
+                url("https://extra.test/cran"),
+                url("https://github.com/owner/repository.git"),
+            ])
+        );
     }
 
     #[test]
@@ -1139,6 +1181,64 @@ mod tests {
     }
 
     #[test]
+    fn detects_git_remote_reference_drift() {
+        let path = project_directory("git-remote-drift");
+        let description =
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@main\n"
+                .parse::<RDescription>()
+                .expect("DESCRIPTION should parse");
+        let changed_description =
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@develop\n"
+                .parse::<RDescription>()
+                .expect("DESCRIPTION should parse");
+        let mut lockfile = minimal_lockfile();
+        lockfile.repos = vec![git_repository(
+            "https://github.com/owner/repository.git",
+            "main",
+            GIT_COMMIT,
+        )];
+        write_lockfile(&path, &lockfile);
+        let project = Project::new(path.clone());
+        let repository = description
+            .remotes()
+            .and_then(|remotes| remotes.get_remote(0))
+            .map(|remote| remote.parsed())
+            .and_then(|remote| GitRepository::new(&remote).ok())
+            .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+            .expect("Git repository should construct");
+
+        project
+            .validate_locked_resolution(&description, &[repository], &semver::Version::new(4, 5, 0))
+            .expect("matching remote should validate");
+
+        let changed_repository = changed_description
+            .remotes()
+            .and_then(|remotes| remotes.get_remote(0))
+            .map(|remote| remote.parsed())
+            .and_then(|remote| GitRepository::new(&remote).ok())
+            .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+            .expect("Git repository should construct");
+        let error = project
+            .validate_locked_resolution(
+                &changed_description,
+                &[changed_repository],
+                &semver::Version::new(4, 5, 0),
+            )
+            .expect_err("changed remote should invalidate the lockfile");
+        let LockedResolutionError::Validation { failures } = error else {
+            panic!("changed remote should produce validation failures");
+        };
+
+        assert_eq!(failures.len(), 1);
+        assert!(matches!(
+            failures[0],
+            LockedResolutionFailure::RepositoriesChanged
+        ));
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
     fn collects_all_locked_resolution_failures() {
         let path = project_directory("invalid-resolution");
         let description = "Package: project\nVersion: 1.0.0\nImports: digest\n"
@@ -1241,6 +1341,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn infers_disabled_default_repository_with_git_remote_tail() {
+        let description = "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+        let mut lockfile = minimal_lockfile();
+        lockfile.repos = vec![
+            rrepo("https://extra.test/cran"),
+            git_repository(
+                "https://github.com/owner/repository.git",
+                "main",
+                GIT_COMMIT,
+            ),
+        ];
+
+        assert_eq!(
+            locked_default_repository_enabled(&description, &lockfile).await,
+            Some(false)
+        );
+    }
+
     #[test]
     fn hydrates_locked_packages_and_local_root() {
         let path = project_directory("locked-packages");
@@ -1285,6 +1406,42 @@ mod tests {
                 .path(),
             path
         );
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn hydrates_package_from_first_repository_with_matching_url() {
+        let path = project_directory("first-matching-repository");
+        let description = "Package: project\nVersion: 2.0.0\n"
+            .parse::<RDescription>()
+            .expect("DESCRIPTION should parse");
+        let repository = "https://github.com/owner/repository.git";
+        let mut lockfile = minimal_lockfile();
+        lockfile.repos = vec![
+            git_repository(repository, "first", GIT_COMMIT),
+            git_repository(
+                repository,
+                "second",
+                "3333333333333333333333333333333333333333",
+            ),
+        ];
+        lockfile
+            .packages
+            .insert("fixture".to_string(), package("1.0.0", repository, &[]));
+        write_lockfile(&path, &lockfile);
+        let project = Project::new(path.clone());
+
+        let packages = project
+            .required_packages_from_lockfile(&description)
+            .expect("required packages should load");
+        let repository = packages["fixture"]
+            .0
+            .repository()
+            .downcast_ref::<GitRepository>()
+            .expect("locked package should use a Git repository");
+
+        assert_eq!(repository.reference(), Some("first"));
 
         fs::remove_dir_all(path).expect("project directory should be removed");
     }

@@ -16,7 +16,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::{OnceCell, SetError};
+use tokio::sync::OnceCell;
+#[cfg(test)]
+use tokio::sync::SetError;
 
 #[derive(Debug, Clone)]
 pub struct GitRepository {
@@ -53,7 +55,8 @@ impl GitRepository {
         self
     }
 
-    pub fn set_commit(&self, commit: Oid) -> Result<(), SetError<Oid>> {
+    #[cfg(test)]
+    fn set_commit(&self, commit: Oid) -> Result<(), SetError<Oid>> {
         self.commit.set(commit)
     }
 
