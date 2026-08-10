@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use serde_json::{Value, json};
 
 fn write_description(
     container: &testcontainers::core::Container<testcontainers::GenericImage>,
@@ -32,8 +33,9 @@ fn assert_package_state(
     package: &str,
     expected: &str,
 ) {
-    let check =
-        format!("cat('{package}' %in% rownames(installed.packages(lib.loc = .libPaths()[1])))");
+    let check = format!(
+        "cat(tryCatch({{ library('{package}', character.only = TRUE, lib.loc = .libPaths()[1]); TRUE }}, error = function(error) {{ message(conditionMessage(error)); FALSE }}))"
+    );
     let command =
         format!("mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"{check}\"");
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
@@ -80,19 +82,12 @@ fn runs_rpx_lock_from_current_library() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let lockfile = read_project_file(&container, project_path, "rpx.lock");
-    assert!(
-        lockfile.contains("\"version\": 4"),
-        "lockfile was: {lockfile}"
-    );
-    assert!(
-        lockfile.contains("\"revision\": 0"),
-        "lockfile was: {lockfile}"
-    );
-    assert!(
-        lockfile.contains("\"packages\": {}"),
-        "lockfile was: {lockfile}"
-    );
+    let lockfile =
+        serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
+            .expect("lockfile should parse");
+    assert_eq!(lockfile["version"], 5);
+    assert_eq!(lockfile["revision"], 0);
+    assert_eq!(lockfile["packages"], json!({}));
 }
 
 #[test]
@@ -163,15 +158,14 @@ fn runs_rpx_sync_restores_locked_versions() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-version";
     create_package_project(&container, project_path);
-    let add_dependency =
-        format!("cd {project_path} && cat >> DESCRIPTION <<'EOF'\nImports: digest\nEOF");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_dependency);
+    let add_command = format!("cd {project_path} && rpx add 'digest@==0.6.37'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && r_version=$(Rscript -e 'cat(as.character(getRversion()))') && cat > rpx.lock <<EOF\n{{\n  \"version\": 4,\n  \"revision\": 0,\n  \"repositories\": [\n    {{\n      \"url\": \"https://upstream.rrepo.dev/cran\",\n      \"kind\": \"rrepo\"\n    }}\n  ],\n  \"r\": {{\n    \"version\": \"$r_version\"\n  }},\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"source_url\": \"https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
+    let remove_package_dir = format!(
+        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\""
     );
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_package_dir);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let before = read_project_file(&container, project_path, "rpx.lock");
@@ -204,11 +198,7 @@ fn refuses_to_sync_old_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("unsupported rpx.lock schema version 3"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("rpx::project::lockfile_unsupported_version"),
+        stderr.contains("rpx::project::lockfile_outdated"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -228,17 +218,13 @@ fn refuses_to_sync_newer_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("unsupported rpx.lock schema version 999"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("rpx::project::lockfile_unsupported_version"),
+        stderr.contains("rpx::project::lockfile_from_newer_rpx"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn runs_rpx_sync_with_reordered_lockfile_roots() {
+fn runs_rpx_sync_with_reordered_lockfile_requirements() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-ordered-roots";
     write_description(
@@ -259,15 +245,9 @@ Imports: digest, jsonlite",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let reorder_command = format!(
-        r#"cd {project_path} && perl -0pi -e 's/"roots": \[\s+\{{\s+"package": "digest",\s+"constraint": "\*"\s+\}},\s+\{{\s+"package": "jsonlite",\s+"constraint": "\*"\s+\}}\s+\]/"roots": [
-    {{
-      "package": "jsonlite",
-      "constraint": "*"
-    }},
-    {{
-      "package": "digest",
-      "constraint": "*"
-    }}
+        r#"cd {project_path} && perl -0pi -e 's/"requirements": \[\s+"digest",\s+"jsonlite"\s+\]/"requirements": [
+    "jsonlite",
+    "digest"
   ]/' rpx.lock"#
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &reorder_command);

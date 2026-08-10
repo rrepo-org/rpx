@@ -1,4 +1,5 @@
 mod cran;
+mod git;
 mod local;
 mod rrepo;
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
+    env,
     fmt::{Debug, Display},
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -18,6 +20,7 @@ use std::{
 use thiserror::Error;
 
 pub use cran::CranRepository;
+pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
@@ -32,6 +35,13 @@ static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
 
 pub fn built_in_repository() -> Arc<dyn PackageRepository> {
     BUILT_IN_REPOSITORY.clone()
+}
+
+pub(crate) async fn default_repository() -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+    match env::var("RPX_REGISTRY_BASE_URL") {
+        Ok(url) => <dyn PackageRepository>::from_url(&url).await,
+        Err(_) => Ok(built_in_repository()),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -87,6 +97,29 @@ pub enum RepositoryError {
     #[error("local repository at {path} does not contain {package} {version}")]
     PackageVersionNotFound {
         path: PathBuf,
+        package: String,
+        version: Version,
+    },
+
+    #[allow(dead_code)]
+    #[error("Git repository {repository} failed: {source}")]
+    Git {
+        repository: String,
+        #[source]
+        source: Arc<crate::git::GitError>,
+    },
+
+    #[allow(dead_code)]
+    #[error("DESCRIPTION from {repository} is missing {field}")]
+    MissingRepositoryField {
+        repository: String,
+        field: &'static str,
+    },
+
+    #[allow(dead_code)]
+    #[error("repository {repository} does not contain {package} {version}")]
+    RepositoryPackageVersionNotFound {
+        repository: String,
         package: String,
         version: Version,
     },
@@ -228,6 +261,111 @@ impl dyn PackageRepository {
             }
         }
     }
+
+    pub fn from_lockfile(
+        repository: &crate::lockfile::Repository,
+    ) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+        match repository {
+            crate::lockfile::Repository::Rrepo { url } => {
+                Ok(Arc::new(RrepoRepository::new(url.clone())))
+            }
+            crate::lockfile::Repository::CranLike {
+                url,
+                archive_support,
+            } => {
+                let archive_support = match archive_support {
+                    crate::lockfile::ArchiveSupport::Available => ArchiveSupport::Available,
+                    crate::lockfile::ArchiveSupport::Unavailable => ArchiveSupport::Unavailable,
+                };
+                Ok(Arc::new(CranRepository::new(url.clone(), archive_support)))
+            }
+            crate::lockfile::Repository::Git {
+                url,
+                reference,
+                commit,
+                subdirectory,
+            } => {
+                let remote =
+                    crate::git::GitUrl::try_from(url).map_err(|source| RepositoryError::Git {
+                        repository: url.to_string(),
+                        source: Arc::new(source),
+                    })?;
+                let reference = match reference {
+                    crate::lockfile::GitReference::DefaultBranch => None,
+                    crate::lockfile::GitReference::Named { value } => Some(value.clone()),
+                    crate::lockfile::GitReference::Commit => Some(commit.to_string()),
+                };
+                let subdirectory = subdirectory.as_ref().map(|path| path.to_path(""));
+                Ok(Arc::new(
+                    GitRepository::from_parts(remote, reference, subdirectory).with_commit(*commit),
+                ))
+            }
+        }
+    }
+
+    pub async fn to_lockfile(&self) -> Result<crate::lockfile::Repository, RepositoryError> {
+        if let Some(repository) = self.downcast_ref::<RrepoRepository>() {
+            return Ok(crate::lockfile::Repository::Rrepo {
+                url: repository.url().clone(),
+            });
+        }
+
+        if let Some(repository) = self.downcast_ref::<CranRepository>() {
+            let archive_support = match repository.archive_support() {
+                ArchiveSupport::Available => crate::lockfile::ArchiveSupport::Available,
+                ArchiveSupport::Unavailable => crate::lockfile::ArchiveSupport::Unavailable,
+            };
+            return Ok(crate::lockfile::Repository::CranLike {
+                url: repository.url().clone(),
+                archive_support,
+            });
+        }
+
+        if let Some(repository) = self.downcast_ref::<GitRepository>() {
+            let commit = repository.commit().await?;
+            let url = reqwest::Url::try_from(repository.remote()).map_err(|source| {
+                RepositoryError::Git {
+                    repository: repository.to_string(),
+                    source: Arc::new(source),
+                }
+            })?;
+            let reference = match repository.reference() {
+                None => crate::lockfile::GitReference::DefaultBranch,
+                Some(reference) if is_commit_reference(reference, commit) => {
+                    crate::lockfile::GitReference::Commit
+                }
+                Some(value) => crate::lockfile::GitReference::Named {
+                    value: value.to_string(),
+                },
+            };
+            let subdirectory = repository
+                .subdirectory()
+                .map(relative_path::RelativePathBuf::from_path)
+                .transpose()
+                .map_err(|error| RepositoryError::InvalidData {
+                    resource: format!("subdirectory in {repository}"),
+                    details: error.to_string(),
+                })?;
+
+            return Ok(crate::lockfile::Repository::Git {
+                url,
+                reference,
+                commit,
+                subdirectory,
+            });
+        }
+
+        Err(RepositoryError::InvalidData {
+            resource: "lockfile repository".to_string(),
+            details: format!("unsupported repository {self}"),
+        })
+    }
+}
+
+fn is_commit_reference(reference: &str, commit: git2::Oid) -> bool {
+    (4..=40).contains(&reference.len())
+        && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && commit.to_string().starts_with(reference)
 }
 
 pub fn parse_repository_url(value: &str) -> Result<Url, RepositoryError> {

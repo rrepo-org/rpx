@@ -134,9 +134,12 @@ pub enum RVersionError {
         source: std::string::FromUtf8Error,
     },
 
-    #[error("Rscript returned an empty R version")]
-    #[diagnostic(code(rpx::runtime::version_empty))]
-    Empty,
+    #[error("R reported invalid version {version}: {source}")]
+    InvalidVersion {
+        version: String,
+        #[source]
+        source: semver::Error,
+    },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -187,7 +190,7 @@ impl RVirtualEnv for tokio::process::Command {
 }
 
 static BASE_PACKAGES: OnceCell<Vec<String>> = OnceCell::const_new();
-static R_VERSION: OnceCell<String> = OnceCell::const_new();
+static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
 pub async fn install_local_package(
     artifact_path: &Path,
@@ -228,19 +231,20 @@ pub async fn install_local_package(
     install_command_result(output, format!("{package}@{version}"))
 }
 
-pub async fn install_project_package(
-    project_root: &Path,
+pub async fn install_package_directory(
+    package_root: &Path,
     target_library: &Path,
+    target: &str,
 ) -> Result<(), PackageInstallError> {
     let mut command = Command::with_venv("R");
     command
         .arg("CMD")
         .arg("INSTALL")
         .arg(format!("--library={}", target_library.display()))
-        .arg(project_root);
+        .arg(package_root);
     let output = run_subprocess(command, "R").await;
 
-    install_command_result(output, "project package".to_string())
+    install_command_result(output, target.to_string())
 }
 
 fn install_command_result(
@@ -367,27 +371,27 @@ fn escape_r_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-pub async fn r_version_async() -> Result<String, RVersionError> {
+pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
     R_VERSION.get_or_try_init(fetch_r_version).await.cloned()
 }
 
-async fn fetch_r_version() -> Result<String, RVersionError> {
+async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
     let mut command = tokio::process::Command::new("Rscript");
     command.arg("-e").arg("cat(as.character(getRversion()))");
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| RVersionError::Command { source })?;
 
-    let version = String::from_utf8(output.stdout)
-        .map_err(|source| RVersionError::InvalidUtf8 { source })?
-        .trim()
-        .to_string();
+    let version =
+        String::from_utf8(output.stdout).map_err(|source| RVersionError::InvalidUtf8 { source })?;
+    let version = version.trim();
 
-    if version.is_empty() {
-        return Err(RVersionError::Empty);
-    }
-
-    Ok(version)
+    version
+        .parse()
+        .map_err(|source| RVersionError::InvalidVersion {
+            version: version.to_string(),
+            source,
+        })
 }
 
 async fn run_subprocess(

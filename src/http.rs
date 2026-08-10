@@ -577,14 +577,20 @@ pub async fn rrepo_windows_binary(
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
-    r_minor: &str,
+    r_version: &semver::Version,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
         .pop_if_empty()
         .extend([
-            "packages", package, "versions", version, "binaries", "windows", r_minor,
+            "packages",
+            package,
+            "versions",
+            version,
+            "binaries",
+            "windows",
+            format!("{}.{}", r_version.major, r_version.minor).as_str(),
         ]);
 
     client().get(url).send().await
@@ -595,14 +601,21 @@ pub async fn rrepo_macos_binary(
     package: &str,
     version: &str,
     target: &str,
-    r_minor: &str,
+    r_version: &semver::Version,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
     let mut url = base_url.clone();
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
         .pop_if_empty()
         .extend([
-            "packages", package, "versions", version, "binaries", "macos", target, r_minor,
+            "packages",
+            package,
+            "versions",
+            version,
+            "binaries",
+            "macos",
+            target,
+            format!("{}.{}", r_version.major, r_version.minor).as_str(),
         ]);
 
     client().get(url).send().await
@@ -691,7 +704,7 @@ pub async fn cran_latest_package_description(
 
 pub async fn cran_windows_binary(
     base_url: &reqwest::Url,
-    r_minor: &str,
+    r_version: &semver::Version,
     package: &str,
     version: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -700,7 +713,13 @@ pub async fn cran_windows_binary(
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
         .pop_if_empty()
-        .extend(["bin", "windows", "contrib", r_minor, &file_name]);
+        .extend([
+            "bin",
+            "windows",
+            "contrib",
+            format!("{}.{}", r_version.major, r_version.minor).as_str(),
+            &file_name,
+        ]);
 
     client().get(url).send().await
 }
@@ -708,7 +727,7 @@ pub async fn cran_windows_binary(
 pub async fn cran_macos_binary(
     base_url: &reqwest::Url,
     target: &str,
-    r_minor: &str,
+    r_version: &semver::Version,
     package: &str,
     version: &str,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -717,7 +736,14 @@ pub async fn cran_macos_binary(
     url.path_segments_mut()
         .expect("repository base URL should support path segments")
         .pop_if_empty()
-        .extend(["bin", "macosx", target, "contrib", r_minor, &file_name]);
+        .extend([
+            "bin",
+            "macosx",
+            target,
+            "contrib",
+            format!("{}.{}", r_version.major, r_version.minor).as_str(),
+            &file_name,
+        ]);
 
     client().get(url).send().await
 }
