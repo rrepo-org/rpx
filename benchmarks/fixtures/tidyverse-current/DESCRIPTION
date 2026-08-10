@@ -1,0 +1,6 @@
+Package: benchmarktidyverse
+Version: 0.0.0
+Title: Current Broad Resolution Benchmark
+Description: Exercises a broad current dependency graph against the live registry.
+License: MIT
+Imports: tidyverse
