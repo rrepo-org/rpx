@@ -1977,6 +1977,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2327,6 +2333,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relative-path"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bca40a312222d8ba74837cb474edef44b37f561da5f773981007a10bbaa992b0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2436,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "rpx"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2453,13 +2468,16 @@ dependencies = [
  "miette",
  "mockito",
  "moka",
+ "pathdiff",
  "pubgrub",
  "r-description-scalerail",
  "regex",
+ "relative-path",
  "reqwest",
  "reqwest-middleware",
  "reqwest-tracing",
  "rpassword",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -2471,6 +2489,7 @@ dependencies = [
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2714,6 +2733,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"

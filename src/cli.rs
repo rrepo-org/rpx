@@ -165,6 +165,6 @@ pub enum RepoCommands {
         remove_credential: bool,
     },
 
-    #[command(about = "List configured additional repositories")]
+    #[command(about = "List configured repositories")]
     List,
 }

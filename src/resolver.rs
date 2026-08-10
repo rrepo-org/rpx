@@ -118,7 +118,7 @@ pub(crate) struct RDependencyProvider {
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
     root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
-    preferred_versions: BTreeMap<String, PackageVersion>,
+    preferred_versions: BTreeMap<String, Version>,
     description_prefetch_permits: Arc<Semaphore>,
 }
 
@@ -127,7 +127,7 @@ impl RDependencyProvider {
         repositories: Vec<Arc<dyn PackageRepository>>,
         root: Arc<LocalRepository>,
         root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
-        preferred_versions: BTreeMap<String, PackageVersion>,
+        preferred_versions: BTreeMap<String, Version>,
     ) -> Self {
         Self {
             repositories,
@@ -299,19 +299,21 @@ impl DependencyProvider for RDependencyProvider {
 
 async fn choose_package_version(
     repositories: &[Arc<dyn PackageRepository>],
-    preferred_versions: &BTreeMap<String, PackageVersion>,
+    preferred_versions: &BTreeMap<String, Version>,
     package: &str,
     range: &Ranges<PackageVersion>,
 ) -> Result<Option<PackageVersion>, ProviderError> {
-    if let Some(preferred) = preferred_versions.get(package) {
-        if range.contains(preferred) {
-            return Ok(Some(preferred.clone()));
-        }
-    }
+    let preferred = preferred_versions.get(package).filter(|preferred| {
+        range.contains(&PackageVersion::new(
+            (*preferred).clone(),
+            built_in_repository(),
+        ))
+    });
 
     let candidates = futures_util::future::join_all(repositories.iter().enumerate().map(
         |(repository_index, repository)| async move {
-            let version = choose_repository_version(repository.as_ref(), package, range).await?;
+            let version =
+                choose_repository_version(repository.as_ref(), package, range, preferred).await?;
 
             Ok::<_, ProviderError>(version.map(|version| (version, repository_index)))
         },
@@ -324,8 +326,14 @@ async fn choose_package_version(
         .into_iter()
         .flatten()
         .max_by(|(left_version, left_repo), (right_version, right_repo)| {
-            left_version
-                .cmp(right_version)
+            let left_preferred =
+                preferred.is_some_and(|preferred| left_version.version() == preferred);
+            let right_preferred =
+                preferred.is_some_and(|preferred| right_version.version() == preferred);
+
+            left_preferred
+                .cmp(&right_preferred)
+                .then_with(|| left_version.cmp(right_version))
                 // For equal versions, prefer lower repository index.
                 // `max_by` wants the preferred item to compare greater,
                 // so reverse the repo-index comparison.
@@ -338,21 +346,33 @@ async fn choose_repository_version(
     repository: &dyn PackageRepository,
     package: &str,
     range: &Ranges<PackageVersion>,
+    preferred: Option<&Version>,
 ) -> Result<Option<PackageVersion>, ProviderError> {
     let packages = repository.packages().await?;
 
-    let Some(latest) = packages.get(package) else {
+    let Some(latest) = packages.get(package).cloned() else {
         return Ok(None);
     };
 
-    if range.contains(latest) {
-        return Ok(Some(latest.clone()));
+    if preferred.is_some_and(|preferred| latest.version() == preferred) && range.contains(&latest) {
+        return Ok(Some(latest));
     }
 
-    Ok(repository
-        .versions(package)
-        .await?
-        .into_iter()
+    if preferred.is_none() && range.contains(&latest) {
+        return Ok(Some(latest));
+    }
+
+    let versions = repository.versions(package).await?;
+    if let Some(preferred) = preferred
+        && let Some(version) = versions
+            .iter()
+            .find(|version| version.version() == preferred && range.contains(version))
+    {
+        return Ok(Some(version.clone()));
+    }
+
+    Ok(std::iter::once(latest)
+        .chain(versions)
         .filter(|version| range.contains(version))
         .max())
 }
@@ -404,12 +424,8 @@ pub(crate) async fn resolve_from_registry(
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
     root_relations: BTreeSet<Relation>,
-    preferred_versions: BTreeMap<String, PackageVersion>,
+    preferred_versions: BTreeMap<String, Version>,
 ) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
-    if root_relations.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
     let root_count = root_relations.len();
     let span = tracing::info_span!(
         "resolve_dependencies",
@@ -435,11 +451,8 @@ pub(crate) async fn resolve_from_registry(
         let provider =
             RDependencyProvider::new(repositories, root, root_dependencies, preferred_versions);
 
-        let selected = resolve(&provider, root_package.clone(), root_version)?;
-
-        let selected = selected
+        let selected = resolve(&provider, root_package, root_version)?
             .into_iter()
-            .filter(|(package, _)| package != &root_package)
             .collect::<BTreeMap<_, _>>();
         resolve_span.record("selected", selected.len());
 
@@ -578,6 +591,99 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn preferred_version_uses_the_repository_that_contains_it() {
+        let first_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("first source"));
+        let second_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("second source"));
+        let first_latest = version("3.0.0", Arc::clone(&first_source));
+        let second_latest = version("2.0.0", Arc::clone(&second_source));
+        let preferred = Version::from_str("1.5.0").expect("valid preferred version");
+        let preferred_candidate = PackageVersion::new(preferred.clone(), second_source);
+        let first_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "first",
+            packages: BTreeMap::from([("example".to_string(), first_latest.clone())]),
+            versions: BTreeMap::from([("example".to_string(), BTreeSet::from([first_latest]))]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+        let second_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "second",
+            packages: BTreeMap::from([("example".to_string(), second_latest.clone())]),
+            versions: BTreeMap::from([(
+                "example".to_string(),
+                BTreeSet::from([preferred_candidate.clone(), second_latest]),
+            )]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+
+        let selected = choose_package_version(
+            &[first_repository, second_repository],
+            &BTreeMap::from([("example".to_string(), preferred)]),
+            "example",
+            &Ranges::full(),
+        )
+        .await
+        .expect("version selection should succeed")
+        .expect("preferred version should be available");
+
+        assert_eq!(selected.version(), preferred_candidate.version());
+        assert_eq!(selected.repository().to_string(), "second source");
+    }
+
+    #[tokio::test]
+    async fn missing_preferred_version_uses_the_normal_best_candidate() {
+        let first_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("first source"));
+        let second_source: Arc<dyn PackageRepository> =
+            Arc::new(TestRepository::empty("second source"));
+        let first_latest = version("2.0.0", first_source);
+        let second_latest = version("3.0.0", second_source);
+        let first_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "first",
+            packages: BTreeMap::from([("example".to_string(), first_latest.clone())]),
+            versions: BTreeMap::from([("example".to_string(), BTreeSet::from([first_latest]))]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+        let second_repository: Arc<dyn PackageRepository> = Arc::new(TestRepository {
+            name: "second",
+            packages: BTreeMap::from([("example".to_string(), second_latest.clone())]),
+            versions: BTreeMap::from([(
+                "example".to_string(),
+                BTreeSet::from([second_latest.clone()]),
+            )]),
+            descriptions: BTreeMap::new(),
+            package_queries: AtomicUsize::new(0),
+            version_queries: Mutex::new(Vec::new()),
+            description_queries: Mutex::new(Vec::new()),
+        });
+
+        let selected = choose_package_version(
+            &[first_repository, second_repository],
+            &BTreeMap::from([(
+                "example".to_string(),
+                Version::from_str("1.5.0").expect("valid preferred version"),
+            )]),
+            "example",
+            &Ranges::full(),
+        )
+        .await
+        .expect("version selection should succeed")
+        .expect("fallback version should be available");
+
+        assert_eq!(selected.version(), second_latest.version());
+        assert_eq!(selected.repository().to_string(), "second source");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn root_name_is_reserved_for_the_supplied_version() {
         let local_repository = local_repository("project", "1.0.0");
@@ -687,8 +793,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolution_filters_the_actual_root_without_remote_queries() {
+    async fn resolution_includes_the_actual_root_without_remote_queries() {
         let local_repository = local_repository("project", "1.0.0");
+        let (_, root_version) = local_repository.package().await.expect("root should load");
         let remote_repository = Arc::new(TestRepository::empty("remote"));
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
@@ -699,13 +806,39 @@ mod tests {
         .await
         .expect("root-only resolution should succeed");
 
-        assert!(selected.is_empty());
+        assert_eq!(
+            selected,
+            BTreeMap::from([("project".to_string(), root_version)])
+        );
+        assert_eq!(remote_repository.package_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolution_with_no_dependencies_still_includes_the_root() {
+        let local_repository = local_repository("project", "1.0.0");
+        let (_, root_version) = local_repository.package().await.expect("root should load");
+        let remote_repository = Arc::new(TestRepository::empty("remote"));
+
+        let selected = resolve_from_registry(
+            vec![remote_repository.clone()],
+            local_repository,
+            BTreeSet::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("dependency-free resolution should succeed");
+
+        assert_eq!(
+            selected,
+            BTreeMap::from([("project".to_string(), root_version)])
+        );
         assert_eq!(remote_repository.package_queries.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn backtracks_instead_of_replacing_the_fixed_root() {
         let local_repository = local_repository("project", "1.0.1");
+        let (_, root_version) = local_repository.package().await.expect("root should load");
         let mut metadata_repository = TestRepository::empty("remote metadata");
         metadata_repository.descriptions.insert(
             (
@@ -767,7 +900,10 @@ mod tests {
 
         assert_eq!(
             selected,
-            BTreeMap::from([("testthat".to_string(), testthat_3_0)])
+            BTreeMap::from([
+                ("project".to_string(), root_version),
+                ("testthat".to_string(), testthat_3_0),
+            ])
         );
         assert!(
             !remote_repository

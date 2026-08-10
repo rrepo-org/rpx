@@ -1,6 +1,6 @@
 [package]
 name = "rpx"
-version = "1.7.0"
+version = "2.0.0"
 edition = "2024"
 description = "Rust CLI for managing R package project dependencies"
 license = "MIT"
@@ -24,6 +24,7 @@ indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 moka = { version = "0.12", features = ["future"] }
+pathdiff = "0.2"
 pubgrub = "0.3.0"
 regex = "1.12.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
@@ -41,6 +42,9 @@ tokio = { version = "1.51.1", features = ["rt-multi-thread", "macros", "process"
 tracing = "0.1.41"
 tracing-indicatif = "0.3.13"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+semver = { version = "1.0.28", features = ["serde"] }
+url = { version = "2.5.8", features = ["serde"] }
+relative-path = { version = "2.0.1", features = ["serde"] }
 [dev-dependencies]
 mockito = "1.7.0"
 testcontainers = { version = "0.27.2", features = ["blocking"] }

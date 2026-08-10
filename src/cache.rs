@@ -12,25 +12,25 @@ use std::{
 pub struct CompiledPackageCacheKey {
     package: String,
     version: String,
-    r_version: String,
+    r_version: semver::Version,
     platform: String,
 }
 
 impl CompiledPackageCacheKey {
-    pub fn new(package: &str, version: &str, r_version: &str) -> Self {
+    pub fn new(package: &str, version: &str, r_version: &semver::Version) -> Self {
         Self::with_platform(package, version, r_version, host_platform_key())
     }
 
     pub fn with_platform(
         package: &str,
         version: &str,
-        r_version: &str,
+        r_version: &semver::Version,
         platform: impl Into<String>,
     ) -> Self {
         Self {
             package: package.to_string(),
             version: version.to_string(),
-            r_version: r_version.to_string(),
+            r_version: r_version.clone(),
             platform: platform.into(),
         }
     }

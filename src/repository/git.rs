@@ -156,8 +156,7 @@ impl GitRepository {
         }
     }
 
-    #[cfg(test)]
-    fn from_parts(
+    pub(crate) fn from_parts(
         remote: GitUrl,
         reference: Option<String>,
         subdirectory: Option<PathBuf>,
@@ -285,7 +284,41 @@ fn validate_subdirectory(value: &str) -> Result<PathBuf, RepositoryError> {
 mod tests {
     use super::*;
     use crate::git::tests::{commit_file, source_repository};
+    use crate::lockfile::{GitReference, Repository};
     use std::fs;
+
+    #[tokio::test]
+    async fn converts_to_a_pinned_lockfile_repository() {
+        let commit = "1111111111111111111111111111111111111111"
+            .parse::<Oid>()
+            .expect("commit should parse");
+        let remote = "github::owner/repository/subdir@main"
+            .parse::<Remote>()
+            .expect("remote should parse");
+        let repository: Arc<dyn PackageRepository> = Arc::new(
+            GitRepository::new(&remote)
+                .expect("repository should build")
+                .with_commit(commit),
+        );
+
+        let locked = repository
+            .to_lockfile()
+            .await
+            .expect("repository should convert");
+
+        assert!(matches!(
+            locked,
+            Repository::Git {
+                url,
+                reference: GitReference::Named { value },
+                commit: locked_commit,
+                subdirectory: Some(subdirectory),
+            } if url.as_str() == "https://github.com/owner/repository.git"
+                && value == "main"
+                && locked_commit == commit
+                && subdirectory.as_str() == "subdir"
+        ));
+    }
 
     #[tokio::test]
     async fn exposes_one_package_and_caches_description_by_commit() {

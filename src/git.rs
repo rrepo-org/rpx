@@ -106,7 +106,12 @@ impl GitUrl {
         }
 
         parse_scp_url(value)?;
-        Ok(Self(value.to_string()))
+        let delimiter = scp_delimiter(value).expect("validated SCP URL should contain a delimiter");
+        let authority = &value[..delimiter];
+        let path = &value[delimiter + 1..];
+        let url = reqwest::Url::parse(&format!("ssh://{authority}/{path}"))
+            .map_err(|_| GitError::InvalidUrl)?;
+        Ok(Self(url.to_string()))
     }
 
     #[cfg(test)]
@@ -132,6 +137,22 @@ impl TryFrom<&Remote> for GitUrl {
             RemoteSource::Git(source) => Self::from_generic(&source.url),
             _ => Err(GitError::UnsupportedRemote),
         }
+    }
+}
+
+impl TryFrom<&reqwest::Url> for GitUrl {
+    type Error = GitError;
+
+    fn try_from(url: &reqwest::Url) -> Result<Self, Self::Error> {
+        Self::from_generic(url.as_str())
+    }
+}
+
+impl TryFrom<&GitUrl> for reqwest::Url {
+    type Error = GitError;
+
+    fn try_from(url: &GitUrl) -> Result<Self, Self::Error> {
+        Self::parse(url.as_str()).map_err(|_| GitError::InvalidUrl)
     }
 }
 
@@ -907,6 +928,14 @@ pub(crate) mod tests {
             .expect("SSH URL should parse");
 
         assert_eq!(remote_key(&scp), remote_key(&ssh));
+    }
+
+    #[test]
+    fn canonicalizes_scp_urls_to_ssh() {
+        let remote = GitUrl::from_generic("git@example.com:team/repository.git")
+            .expect("SCP URL should parse");
+
+        assert_eq!(remote.as_str(), "ssh://git@example.com/team/repository.git");
     }
 
     #[test]
