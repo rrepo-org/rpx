@@ -1,0 +1,6 @@
+Package: benchmarkdigest
+Version: 0.0.0
+Title: Shallow Resolution Benchmark
+Description: Exercises a minimal dependency resolution against the live registry.
+License: MIT
+Imports: digest
