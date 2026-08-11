@@ -25,6 +25,9 @@ pub enum Commands {
         long_about = "Install one or more packages for this project. Each package is recorded in DESCRIPTION, then rpx regenerates rpx.lock and syncs the project library."
     )]
     Add {
+        #[arg(long, help = "Record packages as development dependencies in Suggests")]
+        dev: bool,
+
         #[arg(
             long,
             conflicts_with = "no_default_repo",
@@ -167,4 +170,23 @@ pub enum RepoCommands {
 
     #[command(about = "List configured repositories")]
     List,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn parses_dev_add_flag() {
+        let cli =
+            Cli::try_parse_from(["rpx", "add", "--dev", "testthat"]).expect("dev add should parse");
+
+        let Commands::Add { dev, packages, .. } = cli.command else {
+            panic!("expected add command");
+        };
+        assert!(dev);
+        assert_eq!(packages, ["testthat"]);
+    }
 }

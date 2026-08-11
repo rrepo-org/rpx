@@ -126,6 +126,51 @@ fn runs_rpx_add_inside_custom_r_image() {
 }
 
 #[test]
+fn adds_existing_dependency_as_development_dependency() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-add-dev";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest (>= 0.6.37), digest (< 1.0.0)",
+    );
+
+    let command = format!("cd {project_path} && rpx add --dev digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Added digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert_package_state(&container, project_path, "digest", "TRUE");
+
+    let description =
+        parsed_description(&read_project_file(&container, project_path, "DESCRIPTION"));
+    assert!(
+        !relation_names(description.imports()).contains(&"digest".to_string()),
+        "DESCRIPTION was: {description}"
+    );
+    assert_eq!(
+        description
+            .suggests()
+            .unwrap()
+            .iter()
+            .filter(|relation| relation.name() == "digest")
+            .map(|relation| relation.to_string())
+            .collect::<Vec<_>>(),
+        vec!["digest (< 1.0.0)", "digest (>= 0.6.37)"]
+    );
+}
+
+#[test]
 fn constrained_add_replaces_default_dependency_bounds() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-constraint";

@@ -139,8 +139,12 @@ Add or remove direct dependencies with `rpx` so the manifest, lockfile, and proj
 
 ```bash
 rpx add jsonlite
+rpx add --dev testthat
 rpx remove digest
 ```
+
+`rpx add --dev` records packages in the `Suggests` field instead of `Imports`, while still
+resolving, locking, and installing them in the project library.
 
 Check the project before committing or in CI:
 

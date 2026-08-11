@@ -512,12 +512,18 @@ async fn run_inner() -> Result<(), RpxError> {
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Add {
+            dev,
             default_repo,
             no_default_repo,
             packages,
         } => {
             cmd_add(
                 &packages,
+                if dev {
+                    AddDependencyKind::Development
+                } else {
+                    AddDependencyKind::Runtime
+                },
                 DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
             )
             .await
@@ -563,6 +569,7 @@ fn cmd_init() -> Result<(), RpxError> {
 
 async fn cmd_add(
     packages: &[String],
+    dependency_kind: AddDependencyKind,
     repository_preference: DefaultRepositoryPreference,
 ) -> Result<(), RpxError> {
     let packages = packages
@@ -597,6 +604,14 @@ async fn cmd_add(
     desired_roots.extend(added_relations.iter().cloned());
     for package in &packages {
         let Some(relation) = &package.relation else {
+            if dependency_kind == AddDependencyKind::Development {
+                added_relations.extend(
+                    desired_roots
+                        .iter()
+                        .filter(|existing| existing.name() == package.name)
+                        .cloned(),
+                );
+            }
             continue;
         };
 
@@ -604,7 +619,7 @@ async fn cmd_add(
         desired_roots.insert(relation.clone());
         added_relations.insert(relation.clone());
     }
-    apply_added_packages_to_description(&mut description, &added_relations)?;
+    apply_added_packages_to_description(&mut description, &added_relations, dependency_kind)?;
     let (lockfile, resolved) =
         match project.validate_locked_resolution(&description, &repositories, &r_version) {
             Ok(lockfile) => (
@@ -1694,9 +1709,16 @@ fn next_major_version(version: &Version) -> Result<Version, String> {
         .map_err(|error| format!("failed to build next major version for {version}: {error}"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddDependencyKind {
+    Runtime,
+    Development,
+}
+
 fn apply_added_packages_to_description(
     description: &mut RDescription,
     added_relations: &BTreeSet<Relation>,
+    dependency_kind: AddDependencyKind,
 ) -> Result<(), RpxError> {
     let added_packages = added_relations
         .iter()
@@ -1704,22 +1726,31 @@ fn apply_added_packages_to_description(
         .collect::<BTreeSet<_>>();
     remove_packages_from_description_dependencies(description, &added_packages);
 
-    let added_imports = added_relations
+    let added_dependencies = added_relations
         .iter()
-        .filter(|relation| !is_base_package(&relation.name()))
+        .filter(|relation| {
+            dependency_kind == AddDependencyKind::Development || !is_base_package(&relation.name())
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    if !added_imports.is_empty() {
-        let imports = description
-            .imports()
-            .into_iter()
-            .flat_map(|relations| relations.iter())
-            .chain(added_imports)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        description.set_imports(Relations::from(imports));
+    if !added_dependencies.is_empty() {
+        let dependencies = match dependency_kind {
+            AddDependencyKind::Runtime => description.imports(),
+            AddDependencyKind::Development => description.suggests(),
+        }
+        .into_iter()
+        .flat_map(|relations| relations.iter())
+        .chain(added_dependencies)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+        match dependency_kind {
+            AddDependencyKind::Runtime => description.set_imports(Relations::from(dependencies)),
+            AddDependencyKind::Development => {
+                description.set_suggests(Relations::from(dependencies));
+            }
+        }
     }
 
     Ok(())
@@ -2983,7 +3014,7 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultRepositoryPreference, LockError, RequiredPackages,
+        AddDependencyKind, DefaultRepositoryPreference, LockError, RequiredPackages,
         apply_added_packages_to_description, effective_package_repositories,
         lock_error_from_resolution, lockfile_from_resolution, package_not_found_help,
         package_rules_from_lockfile, parse_add_package, pinned_package_relations,
@@ -3455,8 +3486,12 @@ Enhances: dplyr, keepEnhances
             Some((VersionConstraint::Equal, "1.0.0".parse().unwrap())),
         );
 
-        apply_added_packages_to_description(&mut description, &BTreeSet::from([relation]))
-            .expect("description should update");
+        apply_added_packages_to_description(
+            &mut description,
+            &BTreeSet::from([relation]),
+            AddDependencyKind::Runtime,
+        )
+        .expect("description should update");
 
         assert_eq!(description.depends().unwrap().to_string(), "keepDepends");
         assert_eq!(
@@ -3481,14 +3516,46 @@ Imports: zoo, cli, cli
             "askpass"
                 .parse::<Relation>()
                 .expect("relation should parse"),
+            "grid".parse::<Relation>().expect("relation should parse"),
         ]);
 
-        apply_added_packages_to_description(&mut description, &added)
+        apply_added_packages_to_description(&mut description, &added, AddDependencyKind::Runtime)
             .expect("description should update");
 
         assert_eq!(
             description.imports().unwrap().to_string(),
             "askpass,\ncli,\ndplyr,\nzoo"
+        );
+    }
+
+    #[test]
+    fn added_development_dependencies_are_sorted_in_suggests() {
+        let mut description: RDescription = "Package: testpkg
+Version: 0.1.0
+Imports: keepImport
+Suggests: zoo, testthat, testthat
+"
+        .parse()
+        .expect("description should parse");
+        let added = BTreeSet::from([
+            "dplyr".parse::<Relation>().expect("relation should parse"),
+            "askpass"
+                .parse::<Relation>()
+                .expect("relation should parse"),
+            "grid".parse::<Relation>().expect("relation should parse"),
+        ]);
+
+        apply_added_packages_to_description(
+            &mut description,
+            &added,
+            AddDependencyKind::Development,
+        )
+        .expect("description should update");
+
+        assert_eq!(description.imports().unwrap().to_string(), "keepImport");
+        assert_eq!(
+            description.suggests().unwrap().to_string(),
+            "askpass,\ndplyr,\ngrid,\ntestthat,\nzoo"
         );
     }
 
