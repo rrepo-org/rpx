@@ -64,7 +64,7 @@ jobs:
       - name: Install dist from fork
         # This intentionally overrides generated dist installation while testing
         # native Azure signing from scalerail-solutions/cargo-dist.
-        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist.git --rev 4f4f0f24bf0a49f84a5dcc1bf78e865825bc6960 --locked cargo-dist
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -113,9 +113,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      AZURE_CODESIGNING_ENDPOINT: ${{ secrets.AZURE_CODESIGNING_ENDPOINT }}
-      AZURE_CODESIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODESIGNING_ACCOUNT_NAME }}
-      AZURE_CODESIGNING_CERT_PROFILE_NAME: ${{ secrets.AZURE_CODESIGNING_CERT_PROFILE_NAME }}
     steps:
       - name: enable windows longpaths
         run: |
@@ -134,7 +131,7 @@ jobs:
       - name: Install dist from fork
         # This intentionally overrides generated dist installation while testing
         # native Azure signing from scalerail-solutions/cargo-dist.
-        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist.git --rev 4f4f0f24bf0a49f84a5dcc1bf78e865825bc6960 --locked cargo-dist
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -192,9 +189,6 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
-      AZURE_CODESIGNING_ENDPOINT: ${{ secrets.AZURE_CODESIGNING_ENDPOINT }}
-      AZURE_CODESIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODESIGNING_ACCOUNT_NAME }}
-      AZURE_CODESIGNING_CERT_PROFILE_NAME: ${{ secrets.AZURE_CODESIGNING_CERT_PROFILE_NAME }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -203,7 +197,7 @@ jobs:
       - name: Install dist from fork
         # This intentionally overrides generated dist installation while testing
         # native Azure signing from scalerail-solutions/cargo-dist.
-        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist.git --rev 4f4f0f24bf0a49f84a5dcc1bf78e865825bc6960 --locked cargo-dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8

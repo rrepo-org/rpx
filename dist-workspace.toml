@@ -4,11 +4,9 @@ members = ["cargo:."]
 # Config for 'dist'
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.31.0"
+cargo-dist-version = "0.32.0-github-placeholder"
 # Skip checking whether the specified configuration files are up to date
 allow-dirty = ["ci"]
-# Whether to sign Windows executables with Azure Artifact Signing
-azure-windows-sign = true
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -25,3 +23,9 @@ simple-download-url = "https://rrepo.org/rpx/{tag}"
 host-jobs = ["./upload-r2"]
 # Whether to install an updater program
 install-updater = false
+
+# Sign Windows executables with Azure Artifact Signing
+[dist.azure-windows-sign]
+endpoint = "https://weu.codesigning.azure.net/"
+account-name = "rpx-signing-account"
+certificate-profile-name = "rpx-public-trust"
