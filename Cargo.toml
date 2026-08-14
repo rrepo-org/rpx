@@ -1,6 +1,6 @@
 [package]
 name = "rpx"
-version = "2.0.0-azure.1"
+version = "2.0.0-azure.2"
 edition = "2024"
 description = "Rust CLI for managing R package project dependencies"
 authors = ["Adam Smielewski <adam@scalerail.de>"]
