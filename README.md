@@ -1,35 +1,93 @@
 # rpx
 
-`rpx` is a package manager for R projects. It resolves dependencies from package metadata, writes a committed `rpx.lock`, and runs R inside an isolated project library.
+**Modern package management for R.**
 
-Use it when you want everyone on a project, including CI, to install the same R package versions without depending on a global user library.
+`rpx` brings modern package-management semantics to R projects. Packages declare compatible dependency ranges in [`DESCRIPTION`](https://cran.r-project.org/doc/manuals/r-release/R-exts.html#The-DESCRIPTION-file), `rpx` resolves those constraints before installation, and `rpx.lock` records the exact result.
 
-`rpx` uses [`DESCRIPTION`](https://cran.r-project.org/doc/manuals/r-release/R-exts.html#The-DESCRIPTION-file) as the manifest. It resolves packages through the public rrepo registry at `https://upstream.rrepo.dev/cran` by default.
+`rpx` works with `rrepo`, the registry infrastructure that provides the package metadata needed for reliable resolution across public, private, and historical R packages.
 
-## Documentation
+The short version:
 
-The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overview):
+- `rpx` is the developer workflow.
+- `rrepo` provides registry APIs for CRAN mirrors and private repositories.
+- `DESCRIPTION` declares compatibility.
+- `rpx.lock` records the exact solution.
 
-- [Install rpx](https://rrepo.org/documentation/install-rpx)
-- [Start a project](https://rrepo.org/documentation/start-a-project)
-- [Use an existing project](https://rrepo.org/documentation/use-an-existing-project)
-- [Run R](https://rrepo.org/documentation/run-r)
-- [Private packages](https://rrepo.org/documentation/private-packages)
+## Why rpx Exists
+
+R projects should not depend on whatever happens to be installed in a user's global library. `rpx` gives each project its own locked package set and runs R with that project library active.
+
+Use `rpx` when you want:
+
+1. A committed `rpx.lock` for the exact package versions used by the project.
+2. A local project library that can be recreated from that lockfile.
+3. Dependency declarations in `DESCRIPTION` that give the resolver useful version bounds.
+4. CI and developer machines using the same package set without sharing a global library.
+
+The important difference from a snapshot-only workflow is that `DESCRIPTION` is not only a list of package names. It is the input to the resolver.
+
+## Dependency Bounds
+
+Most R packages either leave dependency versions unbounded or only set a lower bound. Compatibility is often handled outside the dependency declaration, especially through [CRAN reverse dependency checks](https://r-pkgs.org/release.html#sec-release-revdep-checks).
+
+`rpx` moves more of that compatibility information into `DESCRIPTION`, where the resolver can use it directly. When you add a package, `rpx` records the version it selected as the lower bound and the next major version as the upper bound.
+
+For example, adding a package resolved at `1.4.2` writes:
+
+```text
+Imports:
+    examplepkg (>= 1.4.2),
+    examplepkg (< 2.0.0)
+```
+
+The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint.
+
+This uses semver because the major version is the common place to signal breaking changes. R packages do not universally follow semver, so this is not a guarantee that every `1.x` release is compatible or every `2.x` release is incompatible. It is a default constraint that is safer than leaving the dependency open-ended.
+
+For `0.x` packages, `rpx` records the selected version as the lower bound and `< 1.0.0` as the upper bound.
+
+To set a constraint yourself, use `PACKAGE@OPERATORVERSION`. For example, this writes
+`digest (>= 0.6.37)` to `Imports`:
+
+```bash
+rpx add 'digest@>=0.6.37'
+```
+
+Supported operators are `<`, `<=`, `==`, `!=`, `>=`, and `>`. A constrained add replaces every
+existing relation for that package in `DESCRIPTION` before adding the requested relation to
+`Imports`.
 
 ## Install
 
-`rpx` requires R to be installed and available on `PATH`.
+`rpx` requires R to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` works in your shell.
 
-### Prerequisites
+Install R:
 
-`Rscript` should be available in your shell before using `rpx`.
+- Windows: https://cran.r-project.org/bin/windows/base/
+- macOS: https://cran.r-project.org/bin/macosx/
+- CRAN mirrors: https://cran.r-project.org/mirrors.html
 
-- Install R:
-  - Windows: https://cran.r-project.org/bin/windows/base/
-  - macOS: https://cran.r-project.org/bin/macosx/
-  - CRAN mirrors: https://cran.r-project.org/mirrors.html
+Install the latest release on macOS or Linux:
 
-Windows currently uses `cargo install --git ...` as the recommended install path, so you also need the Rust toolchain installed:
+```bash
+curl -LsSf https://rrepo.org/rpx/latest/rpx-installer.sh | sh
+```
+
+Install the latest release on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://rrepo.org/rpx/latest/rpx-installer.ps1 | iex"
+```
+
+Windows binary signing is still being worked on. The PowerShell installer is available, but Windows Defender or SmartScreen may warn until the signing flow is finalized.
+
+You can also install `rpx` from Git with Cargo:
+
+```bash
+cargo install --git https://github.com/scalerail-solutions/rpx.git
+```
+
+If you do not already have Rust and Cargo installed, install them with `rustup`:
 
 - Rust: https://rustup.rs/
 - Windows Rust/MSVC prerequisites: https://rust-lang.github.io/rustup/installation/windows-msvc.html
@@ -37,22 +95,6 @@ Windows currently uses `cargo install --git ...` as the recommended install path
 `rpx` prefers binary R package artifacts on Windows and macOS when available, but some packages may still need to be built from source. On Windows, install Rtools if you hit source-build requirements:
 
 - Rtools: https://cran.r-project.org/bin/windows/Rtools/
-
-Install the latest release on macOS or Linux:
-
-```bash
-curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
-```
-
-Install on Windows via Cargo for now:
-
-```powershell
-cargo install --git https://github.com/scalerail-solutions/rpx.git
-```
-
-Windows is supported, but the native signed Windows installer flow is still in progress. The current PowerShell installer can trigger Windows Defender or SmartScreen warnings while that work is being finalized, so installing from Git is the most reliable Windows path for now. We will update the Windows install guidance as the signing and installer flow improve.
-
-Rust users on other platforms can also install from source with `cargo install --git https://github.com/scalerail-solutions/rpx.git`.
 
 You can also run the Docker image directly:
 
@@ -121,18 +163,21 @@ rpx clean
 
 ## Repository Management
 
-The public rrepo registry is enabled by default. It is the preferred primary source because it exposes package metadata through a low-latency API, which keeps dependency resolution fast.
+The package universe is the set of package versions and metadata available to the resolver.
 
-Projects can add additional repositories. `rpx repo add` detects whether a repository exposes the rrepo API or a CRAN-like `src/contrib/PACKAGES` index:
+By default, `rpx` uses the public rrepo-backed CRAN universe at `https://upstream.rrepo.dev/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
+
+Projects can add additional repositories. `rpx` supports rrepo API repositories, CRAN repositories, and CRAN-like repositories:
 
 ```bash
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo add https://cloud.r-project.org
 rpx repo add https://packagemanager.posit.co/cran/latest
+rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
 rpx repo list
 rpx repo remove https://packagemanager.posit.co/cran/latest
 ```
 
-A useful setup is to keep the default rrepo registry enabled and add Posit Package Manager's latest CRAN repository as a fallback for binary artifacts:
+The default rrepo-backed CRAN universe remains enabled unless you explicitly disable it. A useful setup is to keep the default universe enabled and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
 
 ```bash
 rpx repo add https://packagemanager.posit.co/cran/latest
@@ -150,9 +195,35 @@ RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
 
 To lock without the default public registry, use `rpx lock --no-default-repo`. The default-repo choice is recorded in `rpx.lock`; use `--default-repo` to enable it again when regenerating the lockfile.
 
+For private package universes, add an rrepo repository for your organization:
+
+```bash
+rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+```
+
+## rrepo
+
+`rpx` can use CRAN and CRAN-like repositories, but its default package universe is the rrepo-backed CRAN mirror at `https://upstream.rrepo.dev/cran`.
+
+A plain CRAN-style mirror is mostly a package distribution endpoint. It is enough for installing available packages, but it is not a registry API built around dependency solving, package history, artifact selection, authentication, and private packages.
+
+`rrepo.org` mirrors CRAN and exposes that package universe through rrepo APIs. That gives `rpx` a default source for CRAN package versions, dependency metadata, historical package metadata, and platform artifacts.
+
+For teams, rrepo provides the same registry model for private R packages: publishing, access control, and private package metadata that can be resolved together with CRAN packages.
+
+## Documentation
+
+The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overview):
+
+- [Install rpx](https://rrepo.org/documentation/install-rpx)
+- [Start a project](https://rrepo.org/documentation/start-a-project)
+- [Use an existing project](https://rrepo.org/documentation/use-an-existing-project)
+- [Run R](https://rrepo.org/documentation/run-r)
+- [Private packages](https://rrepo.org/documentation/private-packages)
+
 ## How It Works
 
-- `DESCRIPTION` is the dependency manifest.
+- `DESCRIPTION` is the dependency manifest and compatibility contract.
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
 - `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
 - `rpx` prefers existing locked versions when they are still available from enabled repositories.

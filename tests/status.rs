@@ -21,49 +21,34 @@ fn runs_rpx_status_for_clean_project() {
 }
 
 #[test]
-fn runs_rpx_status_for_lockfile_drift() {
+fn reports_declared_package_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-drift";
     create_package_project(&container, project_path);
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let add_dependency =
         format!("cd {project_path} && cat >> DESCRIPTION <<'EOF'\nImports: digest\nEOF");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_dependency);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 3,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
-    );
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Lockfile is out of date"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Run: rpx lock"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Packages in DESCRIPTION but not locked:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("- digest"),
+        stderr.contains("rpx::project::requirements_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn reports_old_lockfile_needs_update() {
+fn reports_unsupported_old_lockfile_schema() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-old-lockfile";
     create_package_project(&container, project_path);
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 3,\n  \"revision\": 1,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -72,21 +57,13 @@ fn reports_old_lockfile_needs_update() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is out of date"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("rpx::lockfile::older"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("Run `rpx lock`"),
+        stderr.contains("rpx::project::lockfile_outdated"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn reports_newer_lockfile_is_incompatible() {
+fn reports_unsupported_newer_lockfile_schema() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-newer-lockfile";
     create_package_project(&container, project_path);
@@ -100,21 +77,13 @@ fn reports_newer_lockfile_is_incompatible() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("lockfile is incompatible"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("rpx::lockfile::newer"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("Upgrade rpx or regenerate the lockfile with this version."),
+        stderr.contains("rpx::project::lockfile_from_newer_rpx"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn runs_rpx_status_ignores_additional_repositories() {
+fn reports_repository_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-repo-drift";
     create_package_project(&container, project_path);
@@ -131,9 +100,9 @@ fn runs_rpx_status_ignores_additional_repositories() {
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project is in sync"),
+        stderr.contains("rpx::project::repositories_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -149,7 +118,7 @@ fn runs_rpx_status_for_missing_library_package() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let remove_package_dir = format!(
-        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\""
+        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\" \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'testpkg'))\")\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_package_dir);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -158,19 +127,7 @@ fn runs_rpx_status_for_missing_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Run: rpx sync"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Packages locked but not installed:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("- digest"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -194,15 +151,7 @@ fn runs_rpx_status_for_extra_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Packages installed but not locked:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("- jsonlite"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -218,34 +167,26 @@ fn runs_rpx_status_for_version_mismatch() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let mutate_lockfile = format!(
-        "cd {project_path} && perl -0pi -e 's/(\"digest\": \\{{\\s+\"package\": \"digest\",\\s+\"version\": )\"[0-9.]+\"/${{1}}\"0.0.1\"/' rpx.lock"
+        "cd {project_path} && perl -0pi -e 's/(\"digest\": \\{{\\s+\"version\": )\"[0-9.]+\"/${{1}}\"0.0.1\"/' rpx.lock"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let mutate_description =
+        format!("cd {project_path} && perl -0pi -e 's/Version: 0.1.0/Version: 0.2.0/' DESCRIPTION");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_description);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Project library is out of sync"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Installed versions that differ from rpx.lock:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("- digest ("),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("0.0.1 locked"),
+        stderr.contains("rpx::status::out_of_sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
 #[test]
-fn reports_r_runtime_version_mismatch_without_failing_status() {
+fn reports_r_runtime_version_lockfile_drift() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-r-version-mismatch";
     create_package_project(&container, project_path);
@@ -255,24 +196,16 @@ fn reports_r_runtime_version_mismatch_without_failing_status() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let mutate_lockfile = format!(
-        "cd {project_path} && perl -0pi -e 's/(\"r\": \\{{\\s+\"version\": )\"[0-9.]+\"/${{1}}\"0.0.1\"/' rpx.lock"
+        "cd {project_path} && perl -0pi -e 's/(\"r\": )\"[0-9.]+\"/${{1}}\"0.0.1\"/' rpx.lock"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("R runtime differs from lockfile:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("R 0.0.1 locked"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stdout.contains("Project is in sync"),
+        stderr.contains("rpx::project::r_version_changed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

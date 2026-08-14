@@ -1,3 +1,4 @@
-fn main() -> miette::Result<()> {
-    rpx::run()
+#[tokio::main]
+async fn main() -> miette::Result<()> {
+    rpx::run().await
 }

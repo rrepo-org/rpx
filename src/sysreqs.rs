@@ -1,4 +1,5 @@
 use flate2::read::GzDecoder;
+use r_description::lossless::RDescription;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -155,16 +156,24 @@ pub(crate) fn empty_snapshot() -> SysreqDbSnapshot {
     }
 }
 
-pub(crate) fn match_rules(spec: Option<&str>, db: &SysreqDbSnapshot) -> Vec<String> {
-    let Some(spec) = spec.map(str::trim).filter(|value| !value.is_empty()) else {
+pub(crate) fn match_rules(description: &RDescription, db: &SysreqDbSnapshot) -> Vec<String> {
+    let system_requirements = description.system_requirements();
+
+    let Some(spec) = system_requirements
+        .as_ref()
+        .map(|values| values.join(" "))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
         return vec![];
     };
 
     let mut matches = BTreeSet::new();
+
     for rule in &db.rules {
         if rule.patterns.iter().any(|pattern| {
             Regex::new(&format!("(?i){pattern}"))
-                .map(|regex| regex.is_match(spec))
+                .map(|regex| regex.is_match(&spec))
                 .unwrap_or(false)
         }) {
             matches.insert(rule.id.clone());
@@ -419,7 +428,11 @@ fn download_snapshot(commit: &str) -> Result<SysreqDbSnapshot, String> {
 
         let top = components[1].as_os_str().to_string_lossy();
         let name = components[2].as_os_str().to_string_lossy().to_string();
-        if top == "rules" && name.ends_with(".json") {
+        if top == "rules"
+            && std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
             let mut contents = String::new();
             entry
                 .read_to_string(&mut contents)
@@ -633,8 +646,7 @@ fn apt_simulation_missing_packages(packages: &[String], output: &str) -> Vec<Str
         .filter(|package| {
             let candidate = selected_aliases
                 .get(package.as_str())
-                .map(String::as_str)
-                .unwrap_or(package.as_str());
+                .map_or(package.as_str(), String::as_str);
             packages_to_install.contains(candidate)
         })
         .cloned()

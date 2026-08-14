@@ -1,0 +1,6 @@
+disallowed-types = [
+  { path = "r_description::Version", reason = "Use the lossless Version type instead", replacement = "r_description::lossless::Version" },
+  { path = "r_description::RDescription", reason = "Use the lossless RDescription type instead", replacement = "r_description::lossless::RDescription" },
+  { path = "r_description::lossy::RDescription", reason = "Use the lossless RDescription type instead", replacement = "r_description::lossless::RDescription" },
+  { path = "r_description::Relation", reason = "Use the lossless Relation type instead", replacement = "r_description::lossless::Relation" },
+]

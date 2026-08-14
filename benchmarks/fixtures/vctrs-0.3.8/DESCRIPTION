@@ -1,0 +1,10 @@
+Package: vctrs
+Version: 0.3.8
+Title: Vector Helpers
+Description: Defines tools for consistent type coercion and size recycling.
+License: MIT + file LICENSE
+Depends: R (>= 3.3)
+Imports: ellipsis (>= 0.2.0), glue, rlang (>= 0.4.10)
+Suggests: bit64, covr, crayon, dplyr (>= 0.8.5), generics, knitr,
+        pillar (>= 1.4.4), pkgdown, rmarkdown, testthat (>= 2.3.0),
+        tibble, withr, xml2, waldo (>= 0.2.0), zeallot

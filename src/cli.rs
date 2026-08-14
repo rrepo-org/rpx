@@ -40,8 +40,8 @@ pub enum Commands {
         no_default_repo: bool,
 
         #[arg(
-            help = "Package names to add to the project's dependencies",
-            value_name = "PACKAGE",
+            help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
+            value_name = "PACKAGE[@CONSTRAINTVERSION]",
             required = true
         )]
         packages: Vec<String>,
@@ -165,6 +165,6 @@ pub enum RepoCommands {
         remove_credential: bool,
     },
 
-    #[command(about = "List configured additional repositories")]
+    #[command(about = "List configured repositories")]
     List,
 }
