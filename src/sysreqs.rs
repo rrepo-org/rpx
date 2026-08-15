@@ -1,5 +1,5 @@
 use flate2::read::GzDecoder;
-use r_description::lossless::RDescription;
+use r_description::{RDescription, SystemRequirementsError};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -156,16 +156,16 @@ pub(crate) fn empty_snapshot() -> SysreqDbSnapshot {
     }
 }
 
-pub(crate) fn match_rules(description: &RDescription, db: &SysreqDbSnapshot) -> Vec<String> {
-    let system_requirements = description.system_requirements();
-
-    let Some(spec) = system_requirements
-        .as_ref()
-        .map(|values| values.join(" "))
+pub(crate) fn match_rules(
+    description: &RDescription,
+    db: &SysreqDbSnapshot,
+) -> Result<Vec<String>, SystemRequirementsError> {
+    let Some(spec) = description
+        .system_requirements()?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     let mut matches = BTreeSet::new();
@@ -180,7 +180,7 @@ pub(crate) fn match_rules(description: &RDescription, db: &SysreqDbSnapshot) -> 
         }
     }
 
-    matches.into_iter().collect()
+    Ok(matches.into_iter().collect())
 }
 
 pub(crate) fn current_host_platform() -> HostPlatform {

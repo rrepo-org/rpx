@@ -1,15 +1,11 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::{
-    lossless::{RDescription, Relation, Version},
-    lossy::{RemoteSource, Remotes},
-};
+use r_description::{PackageError, RDescription, Relation, Remote, RemoteSource, VersionError};
 use std::{
     cell::OnceCell,
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
-    io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -52,17 +48,13 @@ pub enum ManifestReadError {
         source: std::io::Error,
     },
 
-    #[error("failed to parse DESCRIPTION at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_parse_failed))]
-    Parse {
+    #[error("failed to read {field} in DESCRIPTION at {}: {details}", path.display())]
+    #[diagnostic(code(rpx::project::manifest_field_invalid))]
+    InvalidField {
         path: PathBuf,
-        #[source]
-        source: r_description::lossless::Error,
+        field: &'static str,
+        details: String,
     },
-
-    #[error("failed to parse Remotes in DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_remotes_parse_failed))]
-    RemotesParse { path: PathBuf, details: String },
 
     #[error(
         "unsupported Remotes source {kind} in DESCRIPTION at {}: {remote}",
@@ -157,6 +149,10 @@ pub enum LockedResolutionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Lockfile(#[from] LockfileReadError),
+
+    #[error("failed to read package requirements from DESCRIPTION: {details}")]
+    #[diagnostic(code(rpx::project::manifest_requirements_invalid))]
+    ManifestRequirements { details: String },
 
     #[error("rpx.lock does not match the current project configuration")]
     #[diagnostic(
@@ -329,13 +325,7 @@ impl Project {
             path: path.clone(),
             source,
         })?;
-        let description = contents
-            .parse()
-            .map_err(|source| ManifestReadError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-        parse_git_remotes(&contents, &path)?;
+        let description = RDescription::parse(&contents);
 
         Ok(self.description.get_or_init(|| description))
     }
@@ -451,7 +441,7 @@ impl Project {
                         }
                     })?;
 
-                let description = locked_package_description(name, package);
+                let description = locked_package_description(name, package)?;
 
                 Ok((
                     name.clone(),
@@ -474,20 +464,26 @@ impl Project {
         description: &RDescription,
     ) -> Result<(String, PackageVersion), LockedPackagesError> {
         let path = self.path.join(DESCRIPTION_NAME);
-        let package = description
-            .package()
-            .ok_or_else(|| LockedPackagesError::MissingField {
+        let package = description.package().map_err(|source| match source {
+            PackageError::Missing => LockedPackagesError::MissingField {
                 path: path.clone(),
                 field: "Package",
-            })?;
-        let version = description
-            .version()
-            .ok_or_else(|| LockedPackagesError::MissingField {
+            },
+            source @ PackageError::Duplicate(_) => LockedPackagesError::InvalidLockedDescription {
+                package: "project".to_string(),
+                details: source.to_string(),
+            },
+        })?;
+        let version = description.version().map_err(|source| match source {
+            VersionError::Missing => LockedPackagesError::MissingField {
                 path: path.clone(),
                 field: "Version",
-            })?
-            .parse::<Version>()
-            .map_err(|details| LockedPackagesError::InvalidVersion { path, details })?;
+            },
+            source => LockedPackagesError::InvalidVersion {
+                path,
+                details: source.to_string(),
+            },
+        })?;
         let repository: Arc<dyn PackageRepository> =
             Arc::new(LocalRepository::new(self.path.clone()).with_description(description.clone()));
 
@@ -523,12 +519,14 @@ impl Project {
             || repository_validation
                 .iter()
                 .any(|result| matches!(result, Ok(false)));
+        let roots = description_roots(description)
+            .map_err(|details| LockedResolutionError::ManifestRequirements { details })?;
         let failures = repository_validation
             .into_iter()
             .filter_map(Result::err)
             .chain(repositories_changed.then_some(LockedResolutionFailure::RepositoriesChanged))
             .chain(
-                (lockfile.requirements != description_roots(description))
+                (lockfile.requirements != roots)
                     .then_some(LockedResolutionFailure::PackageRequirementsChanged),
             )
             .chain(
@@ -547,30 +545,21 @@ impl Project {
     }
 }
 
-fn parse_git_remotes(contents: &str, path: &Path) -> Result<Remotes, ManifestReadError> {
-    // Parse the field explicitly because the 0.6.0 lossless accessor panics on invalid Remotes.
-    let paragraph = deb822_fast::ParagraphReader::new(Cursor::new(contents))
-        .next()
-        .transpose()
-        .map_err(|error| ManifestReadError::RemotesParse {
+pub(crate) fn git_remotes(
+    description: &RDescription,
+    path: &Path,
+) -> Result<Vec<Remote>, ManifestReadError> {
+    let remotes = description
+        .remotes()
+        .map_err(|source| ManifestReadError::InvalidField {
             path: path.to_path_buf(),
-            details: error.to_string(),
-        })?;
-    let Some(value) = paragraph
-        .as_ref()
-        .and_then(|paragraph| paragraph.get("Remotes"))
-    else {
-        return Ok(Remotes::new());
-    };
-    let remotes = value
-        .parse::<Remotes>()
-        .map_err(|details| ManifestReadError::RemotesParse {
-            path: path.to_path_buf(),
-            details,
+            field: "Remotes",
+            details: source.to_string(),
         })?;
     let mut packages = BTreeSet::new();
+    let mut validated = Vec::new();
 
-    for remote in remotes.iter() {
+    for remote in remotes {
         let kind = match &remote.source {
             RemoteSource::GitHub(_)
             | RemoteSource::GitLab(_)
@@ -599,24 +588,26 @@ fn parse_git_remotes(contents: &str, path: &Path) -> Result<Remotes, ManifestRea
                 package: package.clone(),
             });
         }
+        validated.push(remote);
     }
 
-    Ok(remotes)
+    Ok(validated)
 }
 
-fn locked_package_description(name: &str, package: &lockfile::Package) -> RDescription {
-    let mut description = RDescription::new();
-    description.set_package(name);
-    description.set_version(package.version.as_str());
-    description.set_depends(
-        package
-            .dependencies
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into(),
-    );
-    description
+fn locked_package_description(
+    name: &str,
+    package: &lockfile::Package,
+) -> Result<RDescription, LockedPackagesError> {
+    let mut description = RDescription::parse("");
+    description.set_package(name).map_err(|source| {
+        LockedPackagesError::InvalidLockedDescription {
+            package: name.to_string(),
+            details: source.to_string(),
+        }
+    })?;
+    description.set_version(&package.version);
+    description.set_depends(package.dependencies.iter().cloned());
+    Ok(description)
 }
 
 pub(crate) async fn locked_default_repository_enabled(
@@ -641,17 +632,14 @@ pub(crate) async fn locked_default_repository_enabled(
 fn description_repository_urls(description: &RDescription) -> Option<Vec<url::Url>> {
     let additional = description
         .additional_repositories()
-        .unwrap_or_default()
-        .iter()
-        .map(|repository| parse_repository_url(repository).ok())
+        .ok()?
+        .map(|repository| parse_repository_url(repository.as_str()).ok())
         .collect::<Option<Vec<_>>>()?;
-    let remotes = description
-        .remotes()
-        .unwrap_or_default()
-        .iter()
+    let remotes = git_remotes(description, Path::new(DESCRIPTION_NAME))
+        .ok()?
+        .into_iter()
         .map(|remote| {
-            let remote = remote.parsed();
-            let repository = GitRepository::new(&remote).ok()?;
+            let repository = GitRepository::new(remote).ok()?;
             url::Url::try_from(repository.remote()).ok()
         })
         .collect::<Option<Vec<_>>>()?;
@@ -686,31 +674,20 @@ fn infer_locked_default_repository_enabled(
     locked_default.equals(default).then_some(true)
 }
 
-fn description_roots(description: &RDescription) -> BTreeSet<Relation> {
-    description
-        .imports()
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .chain(
-            description
-                .depends()
-                .into_iter()
-                .flat_map(|relations| relations.iter()),
-        )
-        .chain(
-            description
-                .linking_to()
-                .into_iter()
-                .flat_map(|relations| relations.iter()),
-        )
-        .chain(
-            description
-                .suggests()
-                .into_iter()
-                .flat_map(|relations| relations.iter()),
-        )
-        .filter(|relation| relation.name() != "R")
-        .collect()
+fn description_roots(description: &RDescription) -> Result<BTreeSet<Relation>, String> {
+    let imports = description.imports().map_err(|error| error.to_string())?;
+    let depends = description.depends().map_err(|error| error.to_string())?;
+    let linking_to = description
+        .linking_to()
+        .map_err(|error| error.to_string())?;
+    let suggests = description.suggests().map_err(|error| error.to_string())?;
+
+    Ok(imports
+        .chain(depends)
+        .chain(linking_to)
+        .chain(suggests)
+        .filter(|relation| relation.package() != "R")
+        .collect())
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -830,6 +807,7 @@ mod tests {
         },
         repository::RrepoRepository,
     };
+    use r_description::Version;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SYSREQ_COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -913,7 +891,8 @@ mod tests {
     #[test]
     fn parses_supported_git_remotes_from_description() {
         let contents = "Package: project\nVersion: 1.0.0\nRemotes: github::owner/github-package@main,\n gitlab@code.example::group/gitlab-package,\n bitbucket::owner/bitbucket-package/subdir@v1,\n generic=git::ssh://git@example.com/team/generic-package.git@develop\n";
-        let remotes = parse_git_remotes(contents, Path::new(DESCRIPTION_NAME))
+        let description = RDescription::parse(contents);
+        let remotes = git_remotes(&description, Path::new(DESCRIPTION_NAME))
             .expect("Git remotes should parse");
 
         assert_eq!(remotes.len(), 4);
@@ -927,9 +906,9 @@ mod tests {
 
     #[test]
     fn derives_repository_urls_from_additional_repositories_and_remotes() {
-        let description = "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n",
+        );
 
         assert_eq!(
             description_repository_urls(&description),
@@ -949,11 +928,43 @@ mod tests {
         )
         .expect("DESCRIPTION should be written");
         let project = Project::new(path.clone());
+        let description = project.description().expect("DESCRIPTION should load");
 
         assert!(matches!(
-            project.description(),
-            Err(ManifestReadError::RemotesParse { .. })
+            git_remotes(description, &path.join(DESCRIPTION_NAME)),
+            Err(ManifestReadError::InvalidField {
+                field: "Remotes",
+                ..
+            })
         ));
+
+        fs::remove_dir_all(path).expect("project directory should be removed");
+    }
+
+    #[test]
+    fn loads_recovered_description_with_unrelated_syntax_issues() {
+        let path = project_directory("recovered-description");
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: project\nVersion: 1.0.0\nthis line is malformed\nImports: cli\n",
+        )
+        .expect("DESCRIPTION should be written");
+        let project = Project::new(path.clone());
+
+        let description = project.description().expect("DESCRIPTION should load");
+        assert!(!description.syntax_issues().is_empty());
+        assert_eq!(
+            description.package().expect("Package should be valid"),
+            "project"
+        );
+        assert_eq!(
+            description
+                .imports()
+                .expect("Imports should be valid")
+                .map(|relation| relation.package().to_string())
+                .collect::<Vec<_>>(),
+            vec!["cli"]
+        );
 
         fs::remove_dir_all(path).expect("project directory should be removed");
     }
@@ -961,9 +972,10 @@ mod tests {
     #[test]
     fn rejects_unsupported_remote_sources() {
         let contents = "Package: project\nVersion: 1.0.0\nRemotes: archive=url::https://example.com/pkg.tar.gz\n";
+        let description = RDescription::parse(contents);
 
         assert!(matches!(
-            parse_git_remotes(contents, Path::new(DESCRIPTION_NAME)),
+            git_remotes(&description, Path::new(DESCRIPTION_NAME)),
             Err(ManifestReadError::UnsupportedRemote { kind, .. }) if kind == "url"
         ));
     }
@@ -971,9 +983,10 @@ mod tests {
     #[test]
     fn rejects_duplicate_remote_package_aliases() {
         let contents = "Package: project\nVersion: 1.0.0\nRemotes: dependency=owner/first, dependency=owner/second\n";
+        let description = RDescription::parse(contents);
 
         assert!(matches!(
-            parse_git_remotes(contents, Path::new(DESCRIPTION_NAME)),
+            git_remotes(&description, Path::new(DESCRIPTION_NAME)),
             Err(ManifestReadError::DuplicateRemotePackage { package, .. })
                 if package == "dependency"
         ));
@@ -997,8 +1010,8 @@ mod tests {
                 .description()
                 .expect("DESCRIPTION should load")
                 .package()
-                .as_deref(),
-            Some("initial")
+                .expect("Package should be valid"),
+            "initial"
         );
         assert_eq!(
             project.lockfile().expect("lockfile should load").revision,
@@ -1019,8 +1032,8 @@ mod tests {
                 .description()
                 .expect("cached DESCRIPTION should be returned")
                 .package()
-                .as_deref(),
-            Some("initial")
+                .expect("Package should be valid"),
+            "initial"
         );
         assert_eq!(
             project
@@ -1053,9 +1066,7 @@ mod tests {
         let path = project_directory("project-files");
         let project = Project::new(path.clone());
 
-        let description = "Package: project\nVersion: 1.0.0\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 1.0.0\n");
         let mut lockfile = minimal_lockfile();
         lockfile.revision = 1;
 
@@ -1161,9 +1172,7 @@ mod tests {
     #[test]
     fn accepts_a_matching_locked_resolution() {
         let path = project_directory("matching-resolution");
-        let description = "Package: project\nVersion: 1.0.0\nImports: cli\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 1.0.0\nImports: cli\n");
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![rrepo("https://repo.test/cran")];
         lockfile.requirements = BTreeSet::from([relation("cli")]);
@@ -1183,14 +1192,12 @@ mod tests {
     #[test]
     fn detects_git_remote_reference_drift() {
         let path = project_directory("git-remote-drift");
-        let description =
-            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@main\n"
-                .parse::<RDescription>()
-                .expect("DESCRIPTION should parse");
-        let changed_description =
-            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@develop\n"
-                .parse::<RDescription>()
-                .expect("DESCRIPTION should parse");
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@main\n",
+        );
+        let changed_description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@develop\n",
+        );
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![git_repository(
             "https://github.com/owner/repository.git",
@@ -1199,11 +1206,11 @@ mod tests {
         )];
         write_lockfile(&path, &lockfile);
         let project = Project::new(path.clone());
-        let repository = description
-            .remotes()
-            .and_then(|remotes| remotes.get_remote(0))
-            .map(|remote| remote.parsed())
-            .and_then(|remote| GitRepository::new(&remote).ok())
+        let repository = git_remotes(&description, Path::new(DESCRIPTION_NAME))
+            .expect("Git remotes should parse")
+            .into_iter()
+            .next()
+            .and_then(|remote| GitRepository::new(remote).ok())
             .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
             .expect("Git repository should construct");
 
@@ -1211,11 +1218,11 @@ mod tests {
             .validate_locked_resolution(&description, &[repository], &semver::Version::new(4, 5, 0))
             .expect("matching remote should validate");
 
-        let changed_repository = changed_description
-            .remotes()
-            .and_then(|remotes| remotes.get_remote(0))
-            .map(|remote| remote.parsed())
-            .and_then(|remote| GitRepository::new(&remote).ok())
+        let changed_repository = git_remotes(&changed_description, Path::new(DESCRIPTION_NAME))
+            .expect("Git remotes should parse")
+            .into_iter()
+            .next()
+            .and_then(|remote| GitRepository::new(remote).ok())
             .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
             .expect("Git repository should construct");
         let error = project
@@ -1241,9 +1248,8 @@ mod tests {
     #[test]
     fn collects_all_locked_resolution_failures() {
         let path = project_directory("invalid-resolution");
-        let description = "Package: project\nVersion: 1.0.0\nImports: digest\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description =
+            RDescription::parse("Package: project\nVersion: 1.0.0\nImports: digest\n");
         let mut lockfile = minimal_lockfile();
         lockfile.r = semver::Version::new(4, 5, 0);
         lockfile.requirements = BTreeSet::from([relation("cli")]);
@@ -1343,9 +1349,9 @@ mod tests {
 
     #[tokio::test]
     async fn infers_disabled_default_repository_with_git_remote_tail() {
-        let description = "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\nRemotes: github::owner/repository@main\n",
+        );
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![
             rrepo("https://extra.test/cran"),
@@ -1365,9 +1371,7 @@ mod tests {
     #[test]
     fn hydrates_locked_packages_and_local_root() {
         let path = project_directory("locked-packages");
-        let description = "Package: project\nVersion: 2.0.0\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 2.0.0\n");
         let repository = "https://repo.test/example";
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![rrepo(repository)];
@@ -1385,7 +1389,13 @@ mod tests {
         assert_eq!(packages.len(), 2);
         let (digest, description) = packages.get("digest").expect("digest should be locked");
         assert_eq!(digest.version().to_string(), "0.6.39");
-        assert_eq!(description.depends().unwrap().to_string(), "cli");
+        assert_eq!(
+            description
+                .depends()
+                .expect("Depends should be valid")
+                .collect::<Vec<_>>(),
+            vec![relation("cli")]
+        );
         assert_eq!(
             digest
                 .repository()
@@ -1413,9 +1423,7 @@ mod tests {
     #[test]
     fn hydrates_package_from_first_repository_with_matching_url() {
         let path = project_directory("first-matching-repository");
-        let description = "Package: project\nVersion: 2.0.0\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 2.0.0\n");
         let repository = "https://github.com/owner/repository.git";
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![
@@ -1449,9 +1457,7 @@ mod tests {
     #[test]
     fn excludes_base_packages_from_locked_packages() {
         let path = project_directory("base-packages");
-        let description = "Package: project\nVersion: 1.0.0\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 1.0.0\n");
         let repository = "https://repo.test/cran";
         let mut lockfile = minimal_lockfile();
         lockfile.repos = vec![rrepo(repository)];
@@ -1475,9 +1481,7 @@ mod tests {
     #[test]
     fn rejects_locked_package_with_missing_repository() {
         let path = project_directory("missing-package-repository");
-        let description = "Package: project\nVersion: 1.0.0\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: 1.0.0\n");
         let mut lockfile = minimal_lockfile();
         lockfile.packages.insert(
             "digest".to_string(),
@@ -1504,18 +1508,14 @@ mod tests {
             ("Version: 1.0.0\n", "Package"),
             ("Package: project\n", "Version"),
         ] {
-            let description = contents
-                .parse::<RDescription>()
-                .expect("DESCRIPTION should parse");
+            let description = RDescription::parse(contents);
             assert!(matches!(
                 project.root_package_for(&description),
                 Err(LockedPackagesError::MissingField { field, .. }) if field == expected
             ));
         }
 
-        let description = "Package: project\nVersion: invalid\n"
-            .parse::<RDescription>()
-            .expect("DESCRIPTION should parse");
+        let description = RDescription::parse("Package: project\nVersion: invalid\n");
         assert!(matches!(
             project.root_package_for(&description),
             Err(LockedPackagesError::InvalidVersion { .. })

@@ -6,7 +6,7 @@ mod rrepo;
 use crate::http;
 use crate::resolver::PackageVersion;
 use async_trait::async_trait;
-use r_description::lossless::{RDescription, Version};
+use r_description::{PackageError, RDescription, Version, VersionError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -78,18 +78,22 @@ pub enum RepositoryError {
         source: Arc<std::io::Error>,
     },
 
-    #[error("failed to parse DESCRIPTION {location}: {source}")]
-    Description {
+    #[error("failed to read Package from DESCRIPTION {location}: {source}")]
+    PackageField {
         location: String,
         #[source]
-        source: Arc<r_description::lossless::Error>,
+        source: Arc<PackageError>,
+    },
+
+    #[error("failed to read Version from DESCRIPTION {location}: {source}")]
+    VersionField {
+        location: String,
+        #[source]
+        source: Arc<VersionError>,
     },
 
     #[error("invalid {resource}: {details}")]
     InvalidData { resource: String, details: String },
-
-    #[error("DESCRIPTION at {path} is missing {field}")]
-    MissingField { path: PathBuf, field: &'static str },
 
     #[error("source package does not contain {package}/DESCRIPTION")]
     DescriptionNotFound { package: String },
@@ -107,13 +111,6 @@ pub enum RepositoryError {
         repository: String,
         #[source]
         source: Arc<crate::git::GitError>,
-    },
-
-    #[allow(dead_code)]
-    #[error("DESCRIPTION from {repository} is missing {field}")]
-    MissingRepositoryField {
-        repository: String,
-        field: &'static str,
     },
 
     #[allow(dead_code)]
@@ -374,7 +371,7 @@ pub fn parse_repository_url(value: &str) -> Result<Url, RepositoryError> {
         value: value.to_string(),
     })?;
     url.path_segments_mut()
-        .map_err(|_| RepositoryError::InvalidUrl {
+        .map_err(|()| RepositoryError::InvalidUrl {
             value: value.to_string(),
         })?
         .pop_if_empty();

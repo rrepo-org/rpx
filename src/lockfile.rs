@@ -16,7 +16,8 @@ pub struct Lockfile {
     pub r: semver::Version,
     pub sysreqs: SystemRequirements,
     pub repos: Vec<Repository>,
-    pub requirements: BTreeSet<r_description::lossless::Relation>,
+    #[serde(with = "relation_set")]
+    pub requirements: BTreeSet<r_description::Relation>,
     pub packages: BTreeMap<String, Package>,
 }
 
@@ -80,10 +81,34 @@ pub enum GitReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Package {
     #[serde(with = "package_version")]
-    pub version: r_description::lossless::Version,
+    pub version: r_description::Version,
     #[serde(with = "repository_url")]
     pub repository: url::Url,
-    pub dependencies: BTreeSet<r_description::lossless::Relation>,
+    #[serde(with = "relation_set")]
+    pub dependencies: BTreeSet<r_description::Relation>,
+}
+
+mod relation_set {
+    use r_description::Relation;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    use std::collections::BTreeSet;
+
+    pub fn serialize<S>(relations: &BTreeSet<Relation>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_seq(relations.iter().map(ToString::to_string))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeSet<Relation>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.parse().map_err(D::Error::custom))
+            .collect()
+    }
 }
 
 mod repository_url {
@@ -156,7 +181,7 @@ mod optional_git_oid {
 }
 
 mod package_version {
-    use r_description::lossless::Version;
+    use r_description::Version;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S>(version: &Version, serializer: S) -> Result<S::Ok, S::Error>
@@ -192,11 +217,11 @@ mod tests {
         value.parse().expect("URL should parse")
     }
 
-    fn relation(value: &str) -> r_description::lossless::Relation {
+    fn relation(value: &str) -> r_description::Relation {
         value.parse().expect("relation should parse")
     }
 
-    fn package_version(value: &str) -> r_description::lossless::Version {
+    fn package_version(value: &str) -> r_description::Version {
         value.parse().expect("package version should parse")
     }
 

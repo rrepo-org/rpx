@@ -7,7 +7,7 @@ use std::{
 };
 
 use miette::Diagnostic;
-use r_description::lossless::Version;
+use r_description::Version;
 use thiserror::Error;
 use tokio::{process::Command, sync::OnceCell};
 
@@ -350,12 +350,12 @@ fn parse_installed_packages(
                 });
             }
 
-            let parsed_version = version.parse::<Version>().map_err(|details| {
+            let parsed_version = version.parse::<Version>().map_err(|source| {
                 InstalledPackagesError::InvalidVersion {
                     line: index + 1,
                     package: package.to_string(),
                     version: version.to_string(),
-                    details,
+                    details: source.to_string(),
                 }
             })?;
 

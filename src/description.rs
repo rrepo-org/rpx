@@ -1,5 +1,5 @@
 use miette::Diagnostic;
-use r_description::lossless::RDescription;
+use r_description::{FieldMutationError, RDescription, VersionParseError};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -27,6 +27,20 @@ pub enum DescriptionError {
     #[diagnostic(code(rpx::description::package_name_failed))]
     PackageNameFailed { details: String },
 
+    #[error("failed to build DESCRIPTION: {source}")]
+    #[diagnostic(code(rpx::description::invalid_field))]
+    FieldMutation {
+        #[source]
+        source: FieldMutationError,
+    },
+
+    #[error("failed to build DESCRIPTION: invalid version: {source}")]
+    #[diagnostic(code(rpx::description::invalid_version))]
+    Version {
+        #[source]
+        source: VersionParseError,
+    },
+
     #[error("failed to write DESCRIPTION at {}: {source}", path.display())]
     #[diagnostic(code(rpx::description::write_failed))]
     WriteFailed {
@@ -43,7 +57,7 @@ pub fn init_description() -> Result<String, DescriptionError> {
     }
 
     let package_name = package_name_from_description_path(&path)?;
-    let description = initial_description(&package_name);
+    let description = initial_description(&package_name)?;
 
     fs::write(&path, description.to_string()).map_err(|source| DescriptionError::WriteFailed {
         path: path.clone(),
@@ -60,20 +74,33 @@ pub fn init_description() -> Result<String, DescriptionError> {
     Ok(path.display().to_string())
 }
 
-fn initial_description(package_name: &str) -> RDescription {
-    let mut description = RDescription::new();
-    description.set_package(package_name);
-    description.set_version("0.1.0");
-    description.set_title(&title_from_package_name(package_name));
-    description.set_description("Add a package description.");
-    description.set_license("MIT");
-    description.set_authors(
-        &r#"person("First", "Last", email = "you@example.com", role = c("aut", "cre"))"#
-            .parse()
-            .unwrap(),
-    );
-    description.set_maintainer("Your Name <you@example.com>");
+fn initial_description(package_name: &str) -> Result<RDescription, DescriptionError> {
+    let mut description = RDescription::parse("");
     description
+        .set_package(package_name)
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    let version = "0.1.0"
+        .parse()
+        .map_err(|source| DescriptionError::Version { source })?;
+    description.set_version(&version);
+    description
+        .set_title(&title_from_package_name(package_name))
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    description
+        .set_description("Add a package description.")
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    description
+        .set_license("MIT")
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    description
+        .set_authors_at_r(
+            r#"person("First", "Last", email = "you@example.com", role = c("aut", "cre"))"#,
+        )
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    description
+        .set_maintainer("Your Name <you@example.com>")
+        .map_err(|source| DescriptionError::FieldMutation { source })?;
+    Ok(description)
 }
 
 fn package_name_from_description_path(path: &Path) -> Result<String, DescriptionError> {
@@ -138,7 +165,7 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{sanitize_package_name, title_from_package_name};
-    use r_description::lossless::{RDescription, Relations};
+    use r_description::RDescription;
 
     #[test]
     fn sanitizes_directory_name_to_package_name() {
@@ -166,14 +193,14 @@ mod tests {
 
     #[test]
     fn serializes_empty_dependency_fields_as_parseable_description() {
-        let mut description: RDescription = "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\n"
-            .parse()
-            .expect("description should parse");
-        description.set_imports(Relations::default());
+        let mut description = RDescription::parse(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\n",
+        );
+        description.set_imports([]);
 
         let contents = description.to_string();
         assert!(
-            contents.parse::<RDescription>().is_ok(),
+            RDescription::parse(&contents).syntax_issues().is_empty(),
             "serialized DESCRIPTION should parse:\n{contents}"
         );
     }

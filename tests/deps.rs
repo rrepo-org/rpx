@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use r_description::lossless::RDescription;
+use r_description::{RDescription, Relation};
 use serde_json::{Value, json};
 
 fn write_description(
@@ -49,14 +49,12 @@ fn assert_package_state(
 }
 
 fn parsed_description(contents: &str) -> RDescription {
-    contents.parse().expect("DESCRIPTION should parse")
+    RDescription::parse(contents)
 }
 
-fn relation_names(relations: Option<r_description::lossless::Relations>) -> Vec<String> {
+fn relation_names(relations: impl Iterator<Item = Relation>) -> Vec<String> {
     relations
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .map(|relation| relation.name())
+        .map(|relation| relation.package().to_string())
         .collect()
 }
 
@@ -147,17 +145,20 @@ fn constrained_add_replaces_default_dependency_bounds() {
         parsed_description(&read_project_file(&container, project_path, "DESCRIPTION"));
     let digest_relations = description
         .imports()
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .filter(|relation| relation.name() == "digest")
+        .expect("Imports should parse")
+        .filter(|relation| relation.package() == "digest")
         .map(|relation| relation.to_string())
         .collect::<Vec<_>>();
     assert_eq!(digest_relations, vec!["digest (>= 0.6.37)"]);
     assert!(
-        !relation_names(description.depends()).contains(&"digest".to_string())
-            && !relation_names(description.linking_to()).contains(&"digest".to_string())
-            && !relation_names(description.suggests()).contains(&"digest".to_string())
-            && !relation_names(description.enhances()).contains(&"digest".to_string()),
+        !relation_names(description.depends().expect("Depends should parse"))
+            .contains(&"digest".to_string())
+            && !relation_names(description.linking_to().expect("LinkingTo should parse"))
+                .contains(&"digest".to_string())
+            && !relation_names(description.suggests().expect("Suggests should parse"))
+                .contains(&"digest".to_string())
+            && !relation_names(description.enhances().expect("Enhances should parse"))
+                .contains(&"digest".to_string()),
         "DESCRIPTION was: {}",
         read_project_file(&container, project_path, "DESCRIPTION")
     );
@@ -450,8 +451,8 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     let parsed = parsed_description(&description);
-    let depends = relation_names(parsed.depends());
-    let imports = relation_names(parsed.imports());
+    let depends = relation_names(parsed.depends().expect("Depends should parse"));
+    let imports = relation_names(parsed.imports().expect("Imports should parse"));
     assert!(
         depends.contains(&"digest".to_string()) && depends.contains(&"R".to_string()),
         "DESCRIPTION was: {description}"
@@ -490,7 +491,7 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     let parsed = parsed_description(&description);
-    let depends = relation_names(parsed.depends());
+    let depends = relation_names(parsed.depends().expect("Depends should parse"));
     assert!(
         depends == vec!["R".to_string()],
         "DESCRIPTION was: {description}"

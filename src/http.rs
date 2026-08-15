@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use http::Extensions;
 use keyring::Entry;
 use moka::future::Cache;
-use r_description::lossless::{Relations, Version};
+use r_description::{Relation, Version};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
@@ -335,19 +335,19 @@ fn remove_credentials(url: &reqwest::Url) -> reqwest::Url {
     url
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CranPackagesIndex {
     pub packages: Vec<CranPackageIndexEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CranPackageIndexEntry {
     pub package: String,
     pub version: String,
-    pub depends: Relations,
-    pub imports: Relations,
-    pub suggests: Relations,
-    pub linking_to: Relations,
+    pub depends: Vec<Relation>,
+    pub imports: Vec<Relation>,
+    pub suggests: Vec<Relation>,
+    pub linking_to: Vec<Relation>,
     pub system_requirements: Option<String>,
 }
 
@@ -370,7 +370,7 @@ impl FromStr for CranPackagesIndex {
             .map(|paragraph| {
                 paragraph
                     .map_err(|error| error.to_string())
-                    .and_then(cran_package_index_entry_from_paragraph)
+                    .and_then(|paragraph| cran_package_index_entry_from_paragraph(&paragraph))
             })
             .collect::<Result<Vec<_>, String>>()?;
 
@@ -422,7 +422,9 @@ impl FromStr for CranPackageArchiveListing {
                 continue;
             }
 
-            let version = version.parse()?;
+            let version = version
+                .parse::<Version>()
+                .map_err(|error| error.to_string())?;
             if !versions.iter().any(|seen| seen == &version) {
                 versions.push(version);
             }
@@ -476,18 +478,18 @@ fn html_unescape_minimal(value: &str) -> String {
 }
 
 fn cran_package_index_entry_from_paragraph(
-    paragraph: deb822_fast::Paragraph,
+    paragraph: &deb822_fast::Paragraph,
 ) -> Result<CranPackageIndexEntry, String> {
-    let package = required_packages_field(&paragraph, "Package")?;
-    let version = required_packages_field(&paragraph, "Version")?;
+    let package = required_packages_field(paragraph, "Package")?;
+    let version = required_packages_field(paragraph, "Version")?;
 
     Ok(CranPackageIndexEntry {
         package,
         version,
-        depends: parse_packages_relations_field(&paragraph, "Depends")?,
-        imports: parse_packages_relations_field(&paragraph, "Imports")?,
-        suggests: parse_packages_relations_field(&paragraph, "Suggests")?,
-        linking_to: parse_packages_relations_field(&paragraph, "LinkingTo")?,
+        depends: parse_packages_relations_field(paragraph, "Depends")?,
+        imports: parse_packages_relations_field(paragraph, "Imports")?,
+        suggests: parse_packages_relations_field(paragraph, "Suggests")?,
+        linking_to: parse_packages_relations_field(paragraph, "LinkingTo")?,
         system_requirements: paragraph
             .get("SystemRequirements")
             .map(str::trim)
@@ -511,13 +513,22 @@ fn required_packages_field(
 fn parse_packages_relations_field(
     paragraph: &deb822_fast::Paragraph,
     field: &'static str,
-) -> Result<Relations, String> {
-    paragraph
-        .get(field)
-        .map(str::parse)
-        .transpose()
-        .map_err(|details| format!("failed to parse {field}: {details}"))
-        .map(Option::unwrap_or_default)
+) -> Result<Vec<Relation>, String> {
+    let Some(value) = paragraph.get(field).map(str::trim) else {
+        return Ok(Vec::new());
+    };
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .map(|relation| {
+            relation
+                .parse()
+                .map_err(|details| format!("failed to parse {field}: {details}"))
+        })
+        .collect()
 }
 
 pub async fn rrepo_repository_packages(
