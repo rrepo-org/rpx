@@ -2,10 +2,10 @@ use clap::Parser;
 use futures_util::StreamExt;
 use miette::Diagnostic;
 use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
-use r_description::{RDescription, Relation, Version, VersionRequirement};
+use r_description::{RDescription, Relation, UrlMutationError, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
@@ -45,12 +45,10 @@ mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
-use description::init_description;
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
-    DESCRIPTION_NAME, LockedResolutionError, LockedResolutionFailure, LockfileReadError, Project,
-    RequiredPackages, artifact_cache_path, build_temp_library_path, cache_dir_path, git_remotes,
-    locked_default_repository_enabled, project_library_path, project_library_root_path,
+    LockedResolutionError, LockedResolutionFailure, RequiredPackages, artifact_cache_path,
+    build_temp_library_path, cache_dir_path, project_library_path, project_library_root_path,
 };
 use r::{install_local_package, install_package_directory, installed_packages};
 use resolver::{ResolutionError, is_base_package, resolve_from_registry};
@@ -67,11 +65,22 @@ use ui::SystemDepsUi;
 
 use crate::{
     cache::CompiledPackageCacheKey,
-    lockfile::Lockfile,
-    r::{RVirtualEnv, r_version_async, remove_packages_from_venv},
+    description::{
+        DescriptionParseError, DescriptionReadError, DescriptionWriteError, InitialDescriptionError,
+        NamespaceWriteError, PackageNameDerivationError, RepositoriesFromDescriptionError,
+        add_dependencies, additional_repositories, derive_package_name, initial_description,
+        project_dependencies, read_description, remove_dependencies,
+        repositories_from_description, root_package, write_description, write_namespace_if_missing,
+    },
+    lockfile::{Lockfile, LockfileReadError, LockfileWriteError, read_lockfile, write_lockfile},
+    project::{
+        LockedPackagesError, ProjectDiscoveryError, required_packages_from_lockfile,
+        validate_locked_resolution,
+    },
+    r::{RVersionError, RVirtualEnv, r_version_async, remove_packages_from_venv},
     repository::{
         CranRepository, GitRepository, LocalRepository, PackageRepository, RepositoryError,
-        RrepoRepository, default_repository, parse_repository_url,
+        RrepoRepository, parse_repository_url,
     },
     resolver::PackageVersion,
 };
@@ -83,11 +92,11 @@ const SYNC_INSTALL_WORKERS: usize = 8;
 enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Project(#[from] project::ProjectError),
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Description(#[from] description::DescriptionError),
+    Init(#[from] InitError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -96,6 +105,10 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Add(#[from] AddError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Remove(#[from] RemoveError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -124,9 +137,63 @@ enum RpxError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum RepoError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::repo::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionWrite(#[from] DescriptionWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error("failed to update Additional_repositories: {source}")]
+    #[diagnostic(code(rpx::repo::description_update_failed))]
+    DescriptionMutation {
+        #[source]
+        source: UrlMutationError,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
     #[error("failed to add repository {url}: {source}")]
     #[diagnostic(code(rpx::repo::add_failed))]
     Add {
+        url: String,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to remove repository {url}: {source}")]
+    #[diagnostic(code(rpx::repo::remove_failed))]
+    Remove {
         url: String,
         #[source]
         source: RepositoryError,
@@ -139,20 +206,6 @@ enum RepoError {
     #[error("failed to inspect repository credential: {details}")]
     #[diagnostic(code(rpx::repo::credential_inspect_failed))]
     CredentialInspect { details: String },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum AddError {
-    #[error("package not found in configured repositories: {packages}")]
-    #[diagnostic(code(rpx::add::package_not_found), help("{help}"))]
-    PackageNotFound { packages: String, help: String },
-
-    #[error("invalid package constraint {package}: {details}")]
-    #[diagnostic(
-        code(rpx::add::invalid_constraint),
-        help("Use PACKAGE@OPERATORVERSION, for example digest@>=0.6.37.")
-    )]
-    InvalidConstraint { package: String, details: String },
 }
 
 #[derive(Debug)]
@@ -231,6 +284,37 @@ impl std::fmt::Display for StatusMismatches {
 
 #[derive(Debug, Error, Diagnostic)]
 enum StatusError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::status::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
     #[error("project is out of sync\n\n{mismatches}")]
     #[diagnostic(
         code(rpx::status::out_of_sync),
@@ -247,6 +331,13 @@ impl From<SyncError> for RpxError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum RunError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::run::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("failed to run {program}")]
     #[diagnostic(code(rpx::run::command_failed))]
     CommandFailed {
@@ -258,6 +349,44 @@ enum RunError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum LockError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::lock::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::lock::package_metadata_failed))]
+    PackageMetadata {
+        #[from]
+        source: RepositoryError,
+    },
+
     #[error("failed to prepare package requirements: {details}")]
     #[diagnostic(
         code(rpx::lock::resolve_failed),
@@ -287,10 +416,6 @@ enum LockError {
         )
     )]
     GitRepositoryUnavailable { repository: String },
-
-    #[error("failed to load packages from {repository}: {details}")]
-    #[diagnostic(code(rpx::lock::repository_failed))]
-    RepositoryIndexFailed { repository: String, details: String },
 
     #[error("failed to resolve package set")]
     #[diagnostic(
@@ -364,6 +489,45 @@ fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum SyncError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::sync::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RemovePackages(#[from] r::PackageRemovalError),
+
     #[error(
         "system dependency installation is currently supported only on supported Linux distributions/package managers"
     )]
@@ -400,6 +564,13 @@ enum SyncError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum CleanError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::clean::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("failed to remove {label} at {path}")]
     #[diagnostic(code(rpx::clean::remove_failed))]
     RemoveFailed {
@@ -510,586 +681,462 @@ async fn run_inner() -> Result<(), RpxError> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init => cmd_init(),
-        Commands::Add {
-            default_repo,
-            no_default_repo,
-            packages,
-        } => {
-            cmd_add(
-                &packages,
-                DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
-            )
-            .await
-        }
-        Commands::Remove {
-            default_repo,
-            no_default_repo,
-            packages,
-        } => {
-            cmd_remove(
-                &packages,
-                DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
-            )
-            .await
-        }
-        Commands::Run { command } => cmd_run(&command).await,
-        Commands::Lock {
-            default_repo,
-            no_default_repo,
-        } => {
-            cmd_lock(DefaultRepositoryPreference::from_flags(
-                default_repo,
-                no_default_repo,
-            ))
-            .await
-        }
-        Commands::Status => cmd_status().await,
+        Commands::Init => cmd_init()?,
+        Commands::Add { packages } => cmd_add(&packages).await?,
+        Commands::Remove { packages } => cmd_remove(&packages).await?,
+        Commands::Run { command } => cmd_run(&command).await?,
+        Commands::Lock {} => cmd_lock().await?,
+        Commands::Status => cmd_status().await?,
         Commands::Sync {
             install_system,
             install_only_system,
-        } => cmd_sync(install_system, install_only_system).await,
-        Commands::Clean => cmd_clean(),
-        Commands::Repo { command } => cmd_repo(command).await,
+        } => cmd_sync(install_system, install_only_system).await?,
+        Commands::Clean => cmd_clean()?,
+        Commands::Repo { command } => cmd_repo(command).await?,
     }
+
+    Ok(())
 }
 
-fn cmd_init() -> Result<(), RpxError> {
-    let path = init_description()?;
-    status(format_args!("Initialized project at {path}"));
+#[derive(Debug, Error, Diagnostic)]
+pub enum InitError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::init::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    PackageName(#[from] PackageNameDerivationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InitialDescription(#[from] InitialDescriptionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    WriteDescription(#[from] DescriptionWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    WriteNamespace(#[from] NamespaceWriteError),
+}
+
+fn cmd_init() -> Result<(), InitError> {
+    let current_dir =
+        env::current_dir().map_err(|source| InitError::WorkingDirectoryUnavailable { source })?;
+
+    let package_name = derive_package_name(&current_dir)?;
+    let description = initial_description(&package_name)?;
+
+    write_description(&current_dir, &description)?;
+    write_namespace_if_missing(&current_dir)?;
+
+    status(format_args!(
+        "Initialized project at {}",
+        current_dir.display()
+    ));
     status("Next: run `rpx add <package>` or `rpx lock`");
     Ok(())
 }
 
-async fn cmd_add(
-    packages: &[String],
-    repository_preference: DefaultRepositoryPreference,
-) -> Result<(), RpxError> {
-    let packages = packages
+#[derive(Debug, Error, Diagnostic)]
+enum AddError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::add::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionWrite(#[from] DescriptionWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    PackageParse(#[from] AddPackageParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::add::package_metadata_failed))]
+    PackageMetadata {
+        #[from]
+        source: RepositoryError,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Install(#[from] SyncError),
+}
+
+async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
+    let added_relations = packages
         .iter()
         .map(|package| parse_add_package(package))
-        .collect::<Result<Vec<_>, _>>()?;
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let mut description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?
-        .clone();
-    let old_lockfile = match project.lockfile_optional() {
-        Ok(lockfile) => lockfile.cloned(),
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let current_dir =
+        env::current_dir().map_err(|source| AddError::WorkingDirectoryUnavailable { source })?;
+
+    let mut description = read_description(&current_dir)?;
+    let old_lockfile = match read_lockfile(&current_dir) {
+        Ok(lockfile) => Some(lockfile),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
         Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(project::ProjectError::Lockfile(source).into()),
+        Err(source) => return Err(source.into()),
     };
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = repository_preference
-        .enabled(&description, old_lockfile.as_ref())
-        .await;
-    let repositories = effective_package_repositories(&description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    let mut desired_roots = roots_from_description(&description)?;
-    let new_packages = packages
-        .iter()
-        .filter(|package| package.relation.is_none())
-        .filter(|package| !roots_contain_package(&desired_roots, &package.name))
-        .map(|package| package.name.clone())
-        .collect::<Vec<_>>();
-    let mut added_relations = add_relations_for_packages(&repositories, &new_packages).await?;
-    desired_roots.extend(added_relations.iter().cloned());
-    for package in &packages {
-        let Some(relation) = &package.relation else {
-            continue;
-        };
+    let r_version = r_version_async().await?;
 
-        desired_roots.retain(|existing| existing.package() != relation.package());
-        desired_roots.insert(relation.clone());
-        added_relations.insert(relation.clone());
-    }
-    apply_added_packages_to_description(&mut description, &added_relations)?;
-    let (lockfile, resolved) =
-        match project.validate_locked_resolution(&description, &repositories, &r_version) {
-            Ok(lockfile) => (
-                lockfile.clone(),
-                project
-                    .required_packages_from_lockfile(&description)
-                    .map_err(project::ProjectError::LockedPackages)?,
-            ),
-            Err(error)
-                if match &error {
-                    LockedResolutionError::Validation { failures } => {
-                        !failures.is_empty()
-                            && failures.iter().all(|failure| {
-                                matches!(
-                                    failure,
-                                    LockedResolutionFailure::RepositoriesChanged
-                                        | LockedResolutionFailure::PackageRequirementsChanged
-                                        | LockedResolutionFailure::RVersionChanged { .. }
-                                )
-                            })
-                    }
-                    LockedResolutionError::Lockfile(LockfileReadError::NotFound { .. }) => true,
-                    LockedResolutionError::Lockfile(LockfileReadError::OutdatedLockfile {
-                        ..
-                    }) => true,
-                    _ => false,
-                } =>
-            {
-                let preferred_versions = old_lockfile
-                    .as_ref()
-                    .map(|lockfile| {
-                        lockfile
-                            .packages
-                            .iter()
-                            .map(|(name, package)| (name.clone(), package.version.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let root = project_repository(&project, &description);
-                let selected = resolve_from_registry(
-                    repositories.clone(),
-                    Arc::clone(&root),
-                    desired_roots.clone(),
-                    preferred_versions,
-                )
-                .await
-                .map_err(lock_error_from_resolution)?;
-                let resolved = hydrate_resolved_packages(selected).await?;
-                let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-                let lockfile = lockfile_from_resolution(
-                    desired_roots,
-                    &resolved
-                        .iter()
-                        .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-                        .map(|(name, package)| (name.clone(), package.clone()))
-                        .collect::<RequiredPackages>(),
-                    &sysreq_db,
-                    &repositories,
-                    &r_version,
-                )
-                .await?;
-                (lockfile, resolved)
-            }
-            Err(source) => {
-                return Err(project::ProjectError::LockedResolution(source).into());
-            }
-        };
+    add_dependencies(&current_dir, &mut description, &added_relations)?;
 
-    project
-        .write_description(&description)
-        .map_err(project::ProjectError::ManifestWrite)?;
-    project
-        .write_lockfile(&lockfile)
-        .map_err(project::ProjectError::LockfileWrite)?;
+    let desired_roots = project_dependencies(&current_dir, &description)?;
+    let (root_name, root_version) = root_package(&current_dir, &description)?;
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
+
+    let (lockfile, mut resolved) = match old_lockfile.as_ref().map(|lockfile| {
+        (
+            lockfile,
+            validate_locked_resolution(&current_dir, &description, &r_version, lockfile),
+        )
+    }) {
+        Some((lockfile, Ok(()))) => (lockfile.clone(), required_packages_from_lockfile(lockfile)?),
+        Some((lockfile, Err(LockedResolutionError::Validation { failures }))) => {
+            let repositories = if failures.iter().all(|failure| {
+                matches!(
+                    failure,
+                    LockedResolutionFailure::PackageRequirementsChanged
+                        | LockedResolutionFailure::RVersionChanged { .. }
+                )
+            }) {
+                lockfile
+                    .repos
+                    .iter()
+                    .map(<dyn PackageRepository>::from_lockfile)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(lock_error_from_repository)?
+            } else {
+                repositories_from_description(&current_dir, &description).await?
+            };
+            let preferred_versions = lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect();
+            let selected = resolve_from_registry(
+                repositories.clone(),
+                Arc::clone(&root),
+                desired_roots.clone(),
+                preferred_versions,
+            )
+            .await
+            .map_err(lock_error_from_resolution)?;
+            let resolved = hydrate_resolved_packages(selected).await?;
+            let sysreq_db = load_sysreq_snapshot_for_lock(Some(lockfile)).await;
+            let lockfile = lockfile_from_resolution(
+                desired_roots.clone(),
+                &resolved
+                    .iter()
+                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+                    .map(|(name, package)| (name.clone(), package.clone()))
+                    .collect::<RequiredPackages>(),
+                &sysreq_db,
+                &repositories,
+                &r_version,
+            )
+            .await?;
+            (lockfile, resolved)
+        }
+        Some((_, Err(source))) => return Err(source.into()),
+        None => {
+            let repositories = repositories_from_description(&current_dir, &description).await?;
+            let selected = resolve_from_registry(
+                repositories.clone(),
+                Arc::clone(&root),
+                desired_roots.clone(),
+                BTreeMap::new(),
+            )
+            .await
+            .map_err(lock_error_from_resolution)?;
+            let resolved = hydrate_resolved_packages(selected).await?;
+            let sysreq_db = load_sysreq_snapshot_for_lock(None).await;
+            let lockfile = lockfile_from_resolution(
+                desired_roots,
+                &resolved
+                    .iter()
+                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+                    .map(|(name, package)| (name.clone(), package.clone()))
+                    .collect::<RequiredPackages>(),
+                &sysreq_db,
+                &repositories,
+                &r_version,
+            )
+            .await?;
+            (lockfile, resolved)
+        }
+    };
+
+    // The lockfile contains only external packages, but sync also needs the local
+    // root. Reinsert it with the in-memory DESCRIPTION used during resolution.
+    resolved.insert(
+        root_name,
+        (
+            PackageVersion::new(root_version, root),
+            Arc::new(description.clone()),
+        ),
+    );
+
+    write_description(&current_dir, &description)?;
+    write_lockfile(&current_dir, &lockfile)?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let installed = installed_packages()
-        .await
-        .map_err(r::RError::InstalledPackages)?;
-    sync_packages(resolved, installed, &r_version).await?;
+    let project_library = project_library_path(&current_dir);
+    let installed = installed_packages(&project_library).await?;
+    sync_packages(&project_library, resolved, installed, &r_version).await?;
     status(format_args!(
         "Added {}",
-        packages
+        added_relations
             .iter()
-            .map(|package| package.display())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     ));
     Ok(())
 }
 
-async fn cmd_repo(command: RepoCommands) -> Result<(), RpxError> {
-    match command {
-        RepoCommands::Add { url } => cmd_repo_add(&url).await,
-        RepoCommands::Remove {
-            url,
-            remove_credential,
-        } => cmd_repo_remove(&url, remove_credential).await,
-        RepoCommands::List => cmd_repo_list().await,
-    }
+#[derive(Debug, Error, Diagnostic)]
+enum RemoveError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::remove::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionWrite(#[from] DescriptionWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::remove::package_metadata_failed))]
+    PackageMetadata {
+        #[from]
+        source: RepositoryError,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Install(#[from] SyncError),
 }
 
-async fn cmd_repo_add(url: &str) -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let mut description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?
-        .clone();
-    let old_lockfile = match project.lockfile_optional() {
-        Ok(lockfile) => lockfile.cloned(),
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(project::ProjectError::Lockfile(source).into()),
-    };
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
-        .enabled(&description, old_lockfile.as_ref())
-        .await;
-    let new_repo_url = parse_repository_url(url).map_err(|source| RepoError::Add {
-        url: url.trim().to_string(),
-        source,
-    })?;
+async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
+    let current_dir =
+        env::current_dir().map_err(|source| RemoveError::WorkingDirectoryUnavailable { source })?;
 
-    let mut additional_repositories = description
-        .additional_repositories()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?
-        .collect::<Vec<_>>();
-    if additional_repositories.iter().any(|existing| {
-        parse_repository_url(existing.as_str()).is_ok_and(|url| url == new_repo_url)
-    }) {
-        status(format_args!(
-            "Repository already configured: {}",
-            new_repo_url.as_str()
-        ));
-        return Ok(());
-    }
-
-    additional_repositories.push(new_repo_url.clone());
-    description
-        .set_additional_repositories(additional_repositories)
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    let repositories = effective_package_repositories(&description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    match project.validate_locked_resolution(&description, &repositories, &r_version) {
-        Ok(_) => {}
-        Err(error)
-            if match &error {
-                LockedResolutionError::Validation { failures } => {
-                    !failures.is_empty()
-                        && failures.iter().all(|failure| {
-                            matches!(
-                                failure,
-                                LockedResolutionFailure::RepositoriesChanged
-                                    | LockedResolutionFailure::PackageRequirementsChanged
-                                    | LockedResolutionFailure::RVersionChanged { .. }
-                            )
-                        })
-                }
-                LockedResolutionError::Lockfile(LockfileReadError::NotFound { .. }) => true,
-                LockedResolutionError::Lockfile(LockfileReadError::OutdatedLockfile { .. }) => true,
-                _ => false,
-            } => {}
-        Err(source) => {
-            return Err(project::ProjectError::LockedResolution(source).into());
+    let mut description = read_description(&current_dir)?;
+    let old_lockfile = match read_lockfile(&current_dir) {
+        Ok(lockfile) => Some(lockfile),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
         }
-    }
-
-    let roots = roots_from_description(&description)?;
-    let preferred_versions = old_lockfile
-        .as_ref()
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let root = project_repository(&project, &description);
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected).await?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
-
-    project
-        .write_description(&description)
-        .map_err(project::ProjectError::ManifestWrite)?;
-    project
-        .write_lockfile(&lockfile)
-        .map_err(project::ProjectError::LockfileWrite)?;
-    status(format_args!("Added repository {new_repo_url}"));
-    Ok(())
-}
-
-async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let mut description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?
-        .clone();
-    let old_lockfile = match project.lockfile_optional() {
-        Ok(lockfile) => lockfile.cloned(),
         Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(project::ProjectError::Lockfile(source).into()),
+        Err(source) => return Err(source.into()),
     };
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
-        .enabled(&description, old_lockfile.as_ref())
-        .await;
-    let base_url = parse_repository_url(url).map_err(|source| RepoError::Add {
-        url: url.trim().to_string(),
-        source,
-    })?;
-    let normalized_url = base_url.to_string();
+    let r_version = r_version_async().await?;
 
-    let mut additional_repositories = description
-        .additional_repositories()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?
-        .collect::<Vec<_>>();
-    let previous_len = additional_repositories.len();
-    additional_repositories.retain(|existing| {
-        parse_repository_url(existing.as_str()).map_or(true, |existing| existing != base_url)
-    });
-
-    if additional_repositories.len() == previous_len {
-        status(format_args!("Repository not configured: {normalized_url}"));
-        return Ok(());
-    }
-
-    description
-        .set_additional_repositories(additional_repositories)
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    let repositories = effective_package_repositories(&description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    match project.validate_locked_resolution(&description, &repositories, &r_version) {
-        Ok(_) => {}
-        Err(error)
-            if match &error {
-                LockedResolutionError::Validation { failures } => {
-                    !failures.is_empty()
-                        && failures.iter().all(|failure| {
-                            matches!(
-                                failure,
-                                LockedResolutionFailure::RepositoriesChanged
-                                    | LockedResolutionFailure::PackageRequirementsChanged
-                                    | LockedResolutionFailure::RVersionChanged { .. }
-                            )
-                        })
-                }
-                LockedResolutionError::Lockfile(LockfileReadError::NotFound { .. }) => true,
-                LockedResolutionError::Lockfile(LockfileReadError::OutdatedLockfile { .. }) => true,
-                _ => false,
-            } => {}
-        Err(source) => {
-            return Err(project::ProjectError::LockedResolution(source).into());
-        }
-    }
-
-    let roots = roots_from_description(&description)?;
-    let preferred_versions = old_lockfile
-        .as_ref()
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let root = project_repository(&project, &description);
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected).await?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
-
-    if remove_credential {
-        http::remove_stored_credential(&base_url).map_err(|error| RepoError::CredentialRemove {
-            details: error.to_string(),
-        })?;
-    }
-
-    project
-        .write_description(&description)
-        .map_err(project::ProjectError::ManifestWrite)?;
-    project
-        .write_lockfile(&lockfile)
-        .map_err(project::ProjectError::LockfileWrite)?;
-    status(format_args!("Removed repository {normalized_url}"));
-    Ok(())
-}
-
-async fn cmd_repo_list() -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?;
-    let lockfile = project
-        .lockfile()
-        .map_err(project::ProjectError::Lockfile)?;
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
-        .enabled(description, Some(lockfile))
-        .await;
-    let repositories = effective_package_repositories(description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    project
-        .validate_locked_resolution(description, &repositories, &r_version)
-        .map_err(project::ProjectError::LockedResolution)?;
-
-    if lockfile.repos.is_empty() {
-        status("No repositories configured");
-        return Ok(());
-    }
-
-    lockfile.repos.iter().try_for_each(|repository| {
-        let url = repository.url();
-        let kind = match repository {
-            lockfile::Repository::Rrepo { .. } => "rrepo",
-            lockfile::Repository::CranLike { .. } => "CRAN-like",
-            lockfile::Repository::Git { .. } => "Git",
-        };
-        let credential =
-            http::has_stored_credential(url).map_err(|error| RepoError::CredentialInspect {
-                details: error.to_string(),
-            })?;
-        status(format_args!(
-            "{url} [{kind}; {}]",
-            if credential {
-                "credential stored"
-            } else {
-                "no credential"
-            }
-        ));
-
-        Ok(())
-    })
-}
-
-async fn cmd_remove(
-    packages: &[String],
-    repository_preference: DefaultRepositoryPreference,
-) -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let mut description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?
-        .clone();
-    let old_lockfile = match project.lockfile_optional() {
-        Ok(lockfile) => lockfile.cloned(),
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(project::ProjectError::Lockfile(source).into()),
-    };
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = repository_preference
-        .enabled(&description, old_lockfile.as_ref())
-        .await;
-    let repositories = effective_package_repositories(&description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
     let removed_packages = packages.iter().cloned().collect::<BTreeSet<_>>();
-    remove_packages_from_description_dependencies(&mut description, &removed_packages)?;
-    let desired_roots = roots_from_description(&description)?;
-    let (lockfile, resolved) =
-        match project.validate_locked_resolution(&description, &repositories, &r_version) {
-            Ok(lockfile) => (
-                lockfile.clone(),
-                project
-                    .required_packages_from_lockfile(&description)
-                    .map_err(project::ProjectError::LockedPackages)?,
-            ),
-            Err(error)
-                if match &error {
-                    LockedResolutionError::Validation { failures } => {
-                        !failures.is_empty()
-                            && failures.iter().all(|failure| {
-                                matches!(
-                                    failure,
-                                    LockedResolutionFailure::RepositoriesChanged
-                                        | LockedResolutionFailure::PackageRequirementsChanged
-                                        | LockedResolutionFailure::RVersionChanged { .. }
-                                )
-                            })
-                    }
-                    LockedResolutionError::Lockfile(LockfileReadError::NotFound { .. }) => true,
-                    LockedResolutionError::Lockfile(LockfileReadError::OutdatedLockfile {
-                        ..
-                    }) => true,
-                    _ => false,
-                } =>
-            {
-                let preferred_versions = old_lockfile
-                    .as_ref()
-                    .map(|lockfile| {
-                        lockfile
-                            .packages
-                            .iter()
-                            .map(|(name, package)| (name.clone(), package.version.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let root = project_repository(&project, &description);
-                let selected = resolve_from_registry(
-                    repositories.clone(),
-                    Arc::clone(&root),
-                    desired_roots.clone(),
-                    preferred_versions,
-                )
-                .await
-                .map_err(lock_error_from_resolution)?;
-                let resolved = hydrate_resolved_packages(selected).await?;
-                let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-                let lockfile = lockfile_from_resolution(
-                    desired_roots,
-                    &resolved
-                        .iter()
-                        .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-                        .map(|(name, package)| (name.clone(), package.clone()))
-                        .collect::<RequiredPackages>(),
-                    &sysreq_db,
-                    &repositories,
-                    &r_version,
-                )
-                .await?;
-                (lockfile, resolved)
-            }
-            Err(source) => {
-                return Err(project::ProjectError::LockedResolution(source).into());
-            }
-        };
+    remove_dependencies(&current_dir, &mut description, &removed_packages)?;
 
-    project
-        .write_description(&description)
-        .map_err(project::ProjectError::ManifestWrite)?;
-    project
-        .write_lockfile(&lockfile)
-        .map_err(project::ProjectError::LockfileWrite)?;
+    let desired_roots = project_dependencies(&current_dir, &description)?;
+    let (root_name, root_version) = root_package(&current_dir, &description)?;
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
+
+    let (lockfile, mut resolved) = match old_lockfile.as_ref().map(|lockfile| {
+        (
+            lockfile,
+            validate_locked_resolution(&current_dir, &description, &r_version, lockfile),
+        )
+    }) {
+        Some((lockfile, Ok(()))) => (lockfile.clone(), required_packages_from_lockfile(lockfile)?),
+        Some((lockfile, Err(LockedResolutionError::Validation { failures }))) => {
+            let repositories = if failures.iter().all(|failure| {
+                matches!(
+                    failure,
+                    LockedResolutionFailure::PackageRequirementsChanged
+                        | LockedResolutionFailure::RVersionChanged { .. }
+                )
+            }) {
+                lockfile
+                    .repos
+                    .iter()
+                    .map(<dyn PackageRepository>::from_lockfile)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(lock_error_from_repository)?
+            } else {
+                repositories_from_description(&current_dir, &description).await?
+            };
+            let preferred_versions = lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect();
+            let selected = resolve_from_registry(
+                repositories.clone(),
+                Arc::clone(&root),
+                desired_roots.clone(),
+                preferred_versions,
+            )
+            .await
+            .map_err(lock_error_from_resolution)?;
+            let resolved = hydrate_resolved_packages(selected).await?;
+            let sysreq_db = load_sysreq_snapshot_for_lock(Some(lockfile)).await;
+            let lockfile = lockfile_from_resolution(
+                desired_roots.clone(),
+                &resolved
+                    .iter()
+                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+                    .map(|(name, package)| (name.clone(), package.clone()))
+                    .collect::<RequiredPackages>(),
+                &sysreq_db,
+                &repositories,
+                &r_version,
+            )
+            .await?;
+            (lockfile, resolved)
+        }
+        Some((_, Err(source))) => return Err(source.into()),
+        None => {
+            let repositories = repositories_from_description(&current_dir, &description).await?;
+            let selected = resolve_from_registry(
+                repositories.clone(),
+                Arc::clone(&root),
+                desired_roots.clone(),
+                BTreeMap::new(),
+            )
+            .await
+            .map_err(lock_error_from_resolution)?;
+            let resolved = hydrate_resolved_packages(selected).await?;
+            let sysreq_db = load_sysreq_snapshot_for_lock(None).await;
+            let lockfile = lockfile_from_resolution(
+                desired_roots,
+                &resolved
+                    .iter()
+                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+                    .map(|(name, package)| (name.clone(), package.clone()))
+                    .collect::<RequiredPackages>(),
+                &sysreq_db,
+                &repositories,
+                &r_version,
+            )
+            .await?;
+            (lockfile, resolved)
+        }
+    };
+
+    // The lockfile contains only external packages, but sync also needs the local
+    // root. Reinsert it with the in-memory DESCRIPTION used during resolution.
+    resolved.insert(
+        root_name,
+        (
+            PackageVersion::new(root_version, root),
+            Arc::new(description.clone()),
+        ),
+    );
+
+    write_description(&current_dir, &description)?;
+    write_lockfile(&current_dir, &lockfile)?;
     sync_system_dependencies(&lockfile, false, false)?;
-    let installed = installed_packages()
-        .await
-        .map_err(r::RError::InstalledPackages)?;
+
+    let project_library = project_library_path(&current_dir);
+    let installed = installed_packages(&project_library).await?;
     let removed = packages
         .iter()
         .filter(|package| installed.contains_key(package.as_str()))
@@ -1100,7 +1147,9 @@ async fn cmd_remove(
         .filter(|package| !installed.contains_key(package.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    sync_packages(resolved, installed, &r_version).await?;
+
+    sync_packages(&project_library, resolved, installed, &r_version).await?;
+
 
     if let Some(removed) = removed.into_iter().reduce(|mut packages, package| {
         packages.push_str(", ");
@@ -1122,12 +1171,253 @@ async fn cmd_remove(
     Ok(())
 }
 
-async fn cmd_run(command: &[String]) -> Result<(), RpxError> {
+async fn cmd_repo(command: RepoCommands) -> Result<(), RepoError> {
+    match command {
+        RepoCommands::Add { url } => cmd_repo_add(&url).await,
+        RepoCommands::Remove {
+            url,
+            remove_credential,
+        } => cmd_repo_remove(&url, remove_credential).await,
+        RepoCommands::List => cmd_repo_list().await,
+    }
+}
+
+async fn cmd_repo_add(url: &str) -> Result<(), RepoError> {
+    let current_dir =
+        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
+    let mut description = read_description(&current_dir)?;
+    let new_repo_url = parse_repository_url(url).map_err(|source| RepoError::Add {
+        url: url.trim().to_string(),
+        source,
+    })?;
+
+    let mut additional_repositories = additional_repositories(&current_dir, &description)?;
+    if additional_repositories.iter().any(|existing| {
+        parse_repository_url(existing.as_str()).is_ok_and(|url| url == new_repo_url)
+    }) {
+        status(format_args!(
+            "Repository already configured: {}",
+            new_repo_url.as_str()
+        ));
+        return Ok(());
+    }
+
+    additional_repositories.push(new_repo_url.clone());
+    description
+        .set_additional_repositories(additional_repositories)
+        .map_err(|source| RepoError::DescriptionMutation {
+            source,
+        })?;
+
+    let old_lockfile = match read_lockfile(&current_dir) {
+        Ok(lockfile) => Some(lockfile),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
+        Err(source) => return Err(source.into()),
+    };
+    let r_version = r_version_async().await?;
+    let roots = project_dependencies(&current_dir, &description)?;
+    let repositories = repositories_from_description(&current_dir, &description)
+        .await
+        .map_err(LockError::from)?;
+    let preferred_versions = old_lockfile
+        .as_ref()
+        .map(|lockfile| {
+            lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
+    let selected = resolve_from_registry(
+        repositories.clone(),
+        Arc::clone(&root),
+        roots.clone(),
+        preferred_versions,
+    )
+    .await
+    .map_err(lock_error_from_resolution)?;
+    let resolved = hydrate_resolved_packages(selected)
+        .await
+        .map_err(|source| LockError::PackageMetadata { source })?;
+    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
+    let lockfile = lockfile_from_resolution(
+        roots,
+        &resolved
+            .iter()
+            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+            .map(|(name, package)| (name.clone(), package.clone()))
+            .collect::<RequiredPackages>(),
+        &sysreq_db,
+        &repositories,
+        &r_version,
+    )
+    .await?;
+
+    write_description(&current_dir, &description)?;
+    write_lockfile(&current_dir, &lockfile)?;
+    status(format_args!("Added repository {new_repo_url}"));
+    Ok(())
+}
+
+async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RepoError> {
+    let current_dir =
+        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
+    let mut description = read_description(&current_dir)?;
+    let base_url = parse_repository_url(url).map_err(|source| RepoError::Remove {
+        url: url.trim().to_string(),
+        source,
+    })?;
+    let normalized_url = base_url.to_string();
+
+    let mut additional_repositories = additional_repositories(&current_dir, &description)?;
+    let previous_len = additional_repositories.len();
+    additional_repositories.retain(|existing| {
+        parse_repository_url(existing.as_str()).map_or(true, |existing| existing != base_url)
+    });
+
+    if additional_repositories.len() == previous_len {
+        if remove_credential {
+            http::remove_stored_credential(&base_url).map_err(|error| {
+                RepoError::CredentialRemove {
+                    details: error.to_string(),
+                }
+            })?;
+            status(format_args!(
+                "Removed stored credential for {normalized_url}"
+            ));
+        }
+        status(format_args!("Repository not configured: {normalized_url}"));
+        return Ok(());
+    }
+
+    description
+        .set_additional_repositories(additional_repositories)
+        .map_err(|source| RepoError::DescriptionMutation {
+            source,
+        })?;
+
+    let old_lockfile = match read_lockfile(&current_dir) {
+        Ok(lockfile) => Some(lockfile),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
+        Err(source) => return Err(source.into()),
+    };
+    let r_version = r_version_async().await?;
+    let roots = project_dependencies(&current_dir, &description)?;
+    let repositories = repositories_from_description(&current_dir, &description)
+        .await
+        .map_err(LockError::from)?;
+    let preferred_versions = old_lockfile
+        .as_ref()
+        .map(|lockfile| {
+            lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
+    let selected = resolve_from_registry(
+        repositories.clone(),
+        Arc::clone(&root),
+        roots.clone(),
+        preferred_versions,
+    )
+    .await
+    .map_err(lock_error_from_resolution)?;
+    let resolved = hydrate_resolved_packages(selected)
+        .await
+        .map_err(|source| LockError::PackageMetadata { source })?;
+    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
+    let lockfile = lockfile_from_resolution(
+        roots,
+        &resolved
+            .iter()
+            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+            .map(|(name, package)| (name.clone(), package.clone()))
+            .collect::<RequiredPackages>(),
+        &sysreq_db,
+        &repositories,
+        &r_version,
+    )
+    .await?;
+
+    write_description(&current_dir, &description)?;
+    write_lockfile(&current_dir, &lockfile)?;
+
+    if remove_credential {
+        http::remove_stored_credential(&base_url).map_err(|error| RepoError::CredentialRemove {
+            details: error.to_string(),
+        })?;
+    }
+
+    status(format_args!("Removed repository {normalized_url}"));
+    Ok(())
+}
+
+async fn cmd_repo_list() -> Result<(), RepoError> {
+    let current_dir =
+        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
+    let description = read_description(&current_dir)?;
+    let lockfile = read_lockfile(&current_dir)?;
+    let r_version = r_version_async().await?;
+    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
+
+    if lockfile.repos.is_empty() {
+        status("No repositories configured");
+        return Ok(());
+    }
+
+    lockfile.repos.iter().try_for_each(|repository| {
+        let url = repository.url();
+        let kind = match repository {
+            lockfile::Repository::Rrepo { .. } => "rrepo",
+            lockfile::Repository::CranLike { .. } => "CRAN-like",
+            lockfile::Repository::Git { .. } => {
+                status(format_args!("{url} [Git]"));
+                return Ok(());
+            }
+        };
+        let credential =
+            http::has_stored_credential(url).map_err(|error| RepoError::CredentialInspect {
+                details: error.to_string(),
+            })?;
+        status(format_args!(
+            "{url} [{kind}; {}]",
+            if credential {
+                "credential stored"
+            } else {
+                "no credential"
+            }
+        ));
+
+        Ok(())
+    })
+}
+
+async fn cmd_run(command: &[String]) -> Result<(), RunError> {
     let (program, args) = command
         .split_first()
         .expect("run command requires at least one argument");
+    let current_dir =
+        env::current_dir().map_err(|source| RunError::WorkingDirectoryUnavailable { source })?;
+    let project_library = project_library_path(&current_dir);
 
-    let status = Command::with_venv(program)
+    let status = Command::with_venv(program, &project_library)
         .args(args)
         .status()
         .await
@@ -1140,47 +1430,24 @@ async fn cmd_run(command: &[String]) -> Result<(), RpxError> {
     Ok(())
 }
 
-async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?;
-    let old_lockfile = match project.lockfile_optional() {
-        Ok(lockfile) => lockfile.cloned(),
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(project::ProjectError::Lockfile(source).into()),
-    };
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = repository_preference
-        .enabled(description, old_lockfile.as_ref())
-        .await;
-    let repositories = effective_package_repositories(description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    match project.validate_locked_resolution(description, &repositories, &r_version) {
-        Ok(_) => {}
-        Err(error)
-            if match &error {
-                LockedResolutionError::Validation { failures } => {
-                    !failures.is_empty()
-                        && failures.iter().all(|failure| {
-                            matches!(
-                                failure,
-                                LockedResolutionFailure::RepositoriesChanged
-                                    | LockedResolutionFailure::PackageRequirementsChanged
-                                    | LockedResolutionFailure::RVersionChanged { .. }
-                            )
-                        })
-                }
-                LockedResolutionError::Lockfile(LockfileReadError::NotFound { .. }) => true,
-                LockedResolutionError::Lockfile(LockfileReadError::OutdatedLockfile { .. }) => true,
-                _ => false,
-            } => {}
-        Err(source) => {
-            return Err(project::ProjectError::LockedResolution(source).into());
+async fn cmd_lock() -> Result<(), LockError> {
+    let current_dir =
+        env::current_dir().map_err(|source| LockError::WorkingDirectoryUnavailable { source })?;
+
+    let description = read_description(&current_dir)?;
+    let old_lockfile = match read_lockfile(&current_dir) {
+        Ok(lockfile) => Some(lockfile),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
         }
-    }
-    let roots = roots_from_description(description)?;
+        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
+        Err(source) => return Err(source.into()),
+    };
+    let r_version = r_version_async().await?;
+    let roots = project_dependencies(&current_dir, &description)?;
+    let repositories = repositories_from_description(&current_dir, &description).await?;
     let preferred_versions = old_lockfile
         .as_ref()
         .map(|lockfile| {
@@ -1192,7 +1459,8 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
         })
         .unwrap_or_default();
 
-    let root = project_repository(&project, description);
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
     let selected = resolve_from_registry(
         repositories.clone(),
         Arc::clone(&root),
@@ -1216,9 +1484,7 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     )
     .await?;
     let changed = old_lockfile.as_ref() != Some(&lockfile);
-    project
-        .write_lockfile(&lockfile)
-        .map_err(project::ProjectError::LockfileWrite)?;
+    write_lockfile(&current_dir, &lockfile)?;
 
     if changed {
         status("Updated rpx.lock");
@@ -1228,89 +1494,80 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> Result<
     Ok(())
 }
 
-async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?;
-    let old_lockfile = project
-        .lockfile()
-        .map_err(project::ProjectError::Lockfile)?
-        .clone();
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
-        .enabled(description, Some(&old_lockfile))
-        .await;
-    let repositories = effective_package_repositories(description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    let lockfile = project
-        .validate_locked_resolution(description, &repositories, &r_version)
-        .map_err(project::ProjectError::LockedResolution)?;
+async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), SyncError> {
+    let current_dir =
+        env::current_dir().map_err(|source| SyncError::WorkingDirectoryUnavailable { source })?;
+
+    let description = read_description(&current_dir)?;
+    let lockfile = read_lockfile(&current_dir)?;
+    let r_version = r_version_async().await?;
+    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
 
     sync_system_dependencies(&lockfile, install_system, install_only_system)?;
     if install_only_system {
         return Ok(());
     }
 
-    let required = project
-        .required_packages_from_lockfile(description)
-        .map_err(project::ProjectError::LockedPackages)?;
-    let installed = installed_packages()
-        .await
-        .map_err(r::RError::InstalledPackages)?;
-    sync_packages(required, installed, &r_version).await?;
+    let mut required = required_packages_from_lockfile(&lockfile)?;
+    let (root_name, root_version) = root_package(&current_dir, &description)?;
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
+    required.insert(
+        root_name,
+        (
+            PackageVersion::new(root_version, root),
+            Arc::new(description),
+        ),
+    );
+
+    let project_library = project_library_path(&current_dir);
+    let installed = installed_packages(&project_library).await?;
+    sync_packages(&project_library, required, installed, &r_version).await?;
     status("Synchronized project library");
     Ok(())
 }
 
-async fn cmd_status() -> Result<(), RpxError> {
-    let project = Project::discover().map_err(project::ProjectError::Discovery)?;
-    let description = project
-        .description()
-        .map_err(project::ProjectError::Manifest)?;
-    let old_lockfile = project
-        .lockfile()
-        .map_err(project::ProjectError::Lockfile)?
-        .clone();
-    let r_version = r_version_async().await.map_err(r::RError::Version)?;
-    let default_repository_enabled = DefaultRepositoryPreference::FromLockfileOrDefault
-        .enabled(description, Some(&old_lockfile))
-        .await;
-    let repositories = effective_package_repositories(description, default_repository_enabled)
-        .await
-        .map_err(lock_error_from_repository)?;
-    let lockfile = project
-        .validate_locked_resolution(description, &repositories, &r_version)
-        .map_err(project::ProjectError::LockedResolution)?;
-    let locked_packages = project
-        .locked_packages()
-        .map_err(project::ProjectError::LockedPackages)?;
+async fn cmd_status() -> Result<(), StatusError> {
+    let current_dir =
+        env::current_dir().map_err(|source| StatusError::WorkingDirectoryUnavailable { source })?;
 
-    let installed = installed_packages()
-        .await
-        .map_err(r::RError::InstalledPackages)?;
-    let missing_packages = locked_packages
+    let description = read_description(&current_dir)?;
+    let lockfile = read_lockfile(&current_dir)?;
+    let r_version = r_version_async().await?;
+    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
+
+    let mut expected_packages = lockfile
+        .packages
+        .iter()
+        .filter(|(name, _)| !is_base_package(name))
+        .map(|(name, package)| (name.clone(), package.version.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let (root_name, root_version) = root_package(&current_dir, &description)?;
+    expected_packages.insert(root_name, root_version);
+
+    let project_library = project_library_path(&current_dir);
+    let installed = installed_packages(&project_library).await?;
+    let missing_packages = expected_packages
         .keys()
         .filter(|package| !installed.contains_key(*package))
         .cloned()
         .collect();
-    let version_mismatches = locked_packages
+    let version_mismatches = expected_packages
         .iter()
         .filter_map(|(package, expected)| {
             installed
                 .get(package)
-                .filter(|installed| *installed != expected)
+                .filter(|installed| installed.version() != expected)
                 .map(|installed| PackageVersionMismatch {
                     package: package.clone(),
                     installed: installed.version().clone(),
-                    expected: expected.version().clone(),
+                    expected: expected.clone(),
                 })
         })
         .collect();
     let extra_packages = installed
         .keys()
-        .filter(|package| !locked_packages.contains_key(*package))
+        .filter(|package| !expected_packages.contains_key(*package))
         .cloned()
         .collect();
     let mut mismatches = StatusMismatches {
@@ -1321,7 +1578,7 @@ async fn cmd_status() -> Result<(), RpxError> {
     };
 
     let system_plan = if host_supports_system_sync() {
-        system_plan_from_lockfile(lockfile).ok()
+        system_plan_from_lockfile(&lockfile).ok()
     } else {
         None
     };
@@ -1331,17 +1588,22 @@ async fn cmd_status() -> Result<(), RpxError> {
     }
 
     if !mismatches.is_empty() {
-        return Err(StatusError::OutOfSync { mismatches }.into());
+        return Err(StatusError::OutOfSync { mismatches });
     }
 
     status("Project is in sync");
     Ok(())
 }
 
-fn cmd_clean() -> Result<(), RpxError> {
+fn cmd_clean() -> Result<(), CleanError> {
+    let current_dir =
+        env::current_dir().map_err(|source| CleanError::WorkingDirectoryUnavailable { source })?;
     let mut removed_any = false;
 
-    removed_any |= remove_dir_if_exists(&project_library_root_path(), "project library")?;
+    removed_any |= remove_dir_if_exists(
+        &project_library_root_path(&current_dir),
+        "project library",
+    )?;
     removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory")?;
 
     if removed_any {
@@ -1352,7 +1614,7 @@ fn cmd_clean() -> Result<(), RpxError> {
     Ok(())
 }
 
-fn remove_dir_if_exists(path: &Path, label: &str) -> Result<bool, RpxError> {
+fn remove_dir_if_exists(path: &Path, label: &str) -> Result<bool, CleanError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -1365,150 +1627,36 @@ fn remove_dir_if_exists(path: &Path, label: &str) -> Result<bool, RpxError> {
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DefaultRepositoryPreference {
-    FromLockfileOrDefault,
-    Enabled,
-    Disabled,
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid package constraint {package}: {details}")]
+#[diagnostic(
+    code(rpx::add::invalid_constraint),
+    help("Use PACKAGE@OPERATORVERSION, for example digest@>=0.6.37.")
+)]
+struct AddPackageParseError {
+    package: String,
+    details: String,
 }
 
-impl DefaultRepositoryPreference {
-    fn from_flags(default_repo: bool, no_default_repo: bool) -> Self {
-        if default_repo {
-            Self::Enabled
-        } else if no_default_repo {
-            Self::Disabled
-        } else {
-            Self::FromLockfileOrDefault
-        }
-    }
-
-    async fn enabled(self, description: &RDescription, lockfile: Option<&Lockfile>) -> bool {
-        match self {
-            Self::Enabled => true,
-            Self::Disabled => false,
-            Self::FromLockfileOrDefault => match lockfile {
-                Some(lockfile) => locked_default_repository_enabled(description, lockfile)
-                    .await
-                    .unwrap_or(true),
-                None => true,
-            },
-        }
-    }
-}
-
-async fn effective_package_repositories(
-    description: &RDescription,
-    default_repository_enabled: bool,
-) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoryError> {
-    let additional_repositories =
-        description
-            .additional_repositories()
-            .map_err(|source| RepositoryError::InvalidData {
-                resource: "Additional_repositories in DESCRIPTION".to_string(),
-                details: source.to_string(),
-            })?;
-    let mut repositories = futures_util::future::join_all(
-        additional_repositories
-            .map(|url| async move { <dyn PackageRepository>::from_url(url.as_str()).await }),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()?;
-
-    if default_repository_enabled {
-        repositories.insert(0, default_repository().await?);
-    }
-
-    let remotes = git_remotes(description, Path::new(DESCRIPTION_NAME)).map_err(|source| {
-        RepositoryError::InvalidData {
-            resource: "Remotes in DESCRIPTION".to_string(),
-            details: source.to_string(),
-        }
-    })?;
-    repositories.extend(
-        remotes
-            .into_iter()
-            .map(|remote| {
-                GitRepository::new(remote)
-                    .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-
-    Ok(repositories)
-}
-
-fn roots_from_description(description: &RDescription) -> Result<BTreeSet<Relation>, LockError> {
-    let imports = description
-        .imports()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    let depends = description
-        .depends()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    let linking_to = description
-        .linking_to()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    let suggests = description
-        .suggests()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-
-    Ok(imports
-        .chain(depends)
-        .chain(linking_to)
-        .chain(suggests)
-        .filter(|relation| relation.package() != "R")
-        .collect())
-}
-
-fn project_repository(project: &Project, description: &RDescription) -> Arc<LocalRepository> {
-    Arc::new(
-        LocalRepository::new(project.path().to_path_buf()).with_description(description.clone()),
-    )
-}
-
-fn roots_contain_package(roots: &BTreeSet<Relation>, package: &str) -> bool {
-    roots.iter().any(|relation| relation.package() == package)
-}
-
-#[derive(Debug)]
-struct AddPackage {
-    name: String,
-    relation: Option<Relation>,
-}
-
-impl AddPackage {
-    fn display(&self) -> String {
-        self.relation
-            .as_ref()
-            .map_or_else(|| self.name.clone(), ToString::to_string)
-    }
-}
-
-fn parse_add_package(package: &str) -> Result<AddPackage, AddError> {
+fn parse_add_package(package: &str) -> Result<Relation, AddPackageParseError> {
     if package.is_empty() || package.chars().any(char::is_whitespace) {
-        return Err(invalid_add_constraint(
-            package,
-            "package specifications cannot contain whitespace",
-        ));
+        return Err(AddPackageParseError {
+            package: package.to_string(),
+            details: "package specifications cannot contain whitespace".to_string(),
+        });
     }
 
     let Some((name, constraint)) = package.split_once('@') else {
-        return Ok(AddPackage {
-            name: package.to_string(),
-            relation: None,
+        return Relation::any(package).map_err(|source| AddPackageParseError {
+            package: package.to_string(),
+            details: source.to_string(),
         });
     };
     if name.is_empty() {
-        return Err(invalid_add_constraint(package, "package name is missing"));
+        return Err(AddPackageParseError {
+            package: package.to_string(),
+            details: "package name is missing".to_string(),
+        });
     }
 
     let (operator, version) = [">=", "<=", "==", "!=", ">", "<"]
@@ -1518,16 +1666,23 @@ fn parse_add_package(package: &str) -> Result<AddPackage, AddError> {
                 .strip_prefix(operator)
                 .map(|version| (operator, version))
         })
-        .ok_or_else(|| {
-            invalid_add_constraint(package, "version constraint operator is missing or invalid")
+        .ok_or_else(|| AddPackageParseError {
+            package: package.to_string(),
+            details: "version constraint operator is missing or invalid".to_string(),
         })?;
     if version.is_empty() {
-        return Err(invalid_add_constraint(package, "version is missing"));
+        return Err(AddPackageParseError {
+            package: package.to_string(),
+            details: "version is missing".to_string(),
+        });
     }
 
     let version = version
         .parse::<Version>()
-        .map_err(|details| invalid_add_constraint(package, details.to_string()))?;
+        .map_err(|source| AddPackageParseError {
+            package: package.to_string(),
+            details: source.to_string(),
+        })?;
     let requirement = match operator {
         ">=" => VersionRequirement::GreaterThanEqual(version),
         "<=" => VersionRequirement::LessThanEqual(version),
@@ -1538,273 +1693,10 @@ fn parse_add_package(package: &str) -> Result<AddPackage, AddError> {
         _ => unreachable!("constraint operator was selected from a fixed set"),
     };
 
-    Ok(AddPackage {
-        name: name.to_string(),
-        relation: Some(
-            Relation::new(name, requirement)
-                .map_err(|source| invalid_add_constraint(package, source.to_string()))?,
-        ),
-    })
-}
-
-fn invalid_add_constraint(package: &str, details: impl Into<String>) -> AddError {
-    AddError::InvalidConstraint {
+    Relation::new(name, requirement).map_err(|source| AddPackageParseError {
         package: package.to_string(),
-        details: details.into(),
-    }
-}
-
-async fn add_relations_for_packages(
-    repositories: &[Arc<dyn PackageRepository>],
-    packages: &[String],
-) -> Result<BTreeSet<Relation>, RpxError> {
-    let non_base_packages = packages
-        .iter()
-        .filter(|package| !is_base_package(package))
-        .cloned()
-        .collect::<Vec<_>>();
-    let latest_versions = latest_package_versions_for_add(repositories, &non_base_packages).await?;
-    let mut relations = BTreeSet::new();
-
-    for package in packages {
-        if is_base_package(package) {
-            relations.insert(Relation::any(package).map_err(|source| {
-                LockError::ResolveFailed {
-                    details: source.to_string(),
-                }
-            })?);
-            continue;
-        }
-
-        let latest = latest_versions
-            .get(package)
-            .expect("latest version should exist for every non-base package");
-        relations.extend(
-            pinned_package_relations(package, latest.version())
-                .map_err(|details| LockError::ResolveFailed { details })?,
-        );
-    }
-
-    Ok(relations)
-}
-
-async fn latest_package_versions_for_add(
-    repositories: &[Arc<dyn PackageRepository>],
-    packages: &[String],
-) -> Result<BTreeMap<String, PackageVersion>, RpxError> {
-    if packages.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let requested = packages.iter().cloned().collect::<BTreeSet<_>>();
-    let mut selected = BTreeMap::<String, PackageVersion>::new();
-    let mut known_packages = BTreeSet::<String>::new();
-    let package_indexes =
-        futures_util::future::join_all(repositories.iter().map(|repository| async {
-            repository
-                .packages()
-                .await
-                .map_err(|details| (repository.to_string(), details))
-        }))
-        .await;
-
-    for result in package_indexes {
-        let available = result.map_err(|(repository, source)| {
-            if let Some(repository) = inaccessible_git_repository(&source) {
-                return LockError::GitRepositoryUnavailable {
-                    repository: repository.to_string(),
-                };
-            }
-
-            LockError::RepositoryIndexFailed {
-                repository,
-                details: source.to_string(),
-            }
-        })?;
-        known_packages.extend(available.keys().cloned());
-
-        for package in &requested {
-            let Some(version) = available.get(package) else {
-                continue;
-            };
-
-            match selected.entry(package.clone()) {
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if version.version() > entry.get().version() {
-                        entry.insert(version.clone());
-                    }
-                }
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(version.clone());
-                }
-            }
-        }
-    }
-
-    let missing = requested
-        .iter()
-        .filter(|package| !selected.contains_key(*package))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(AddError::PackageNotFound {
-            help: package_not_found_help(&missing, &known_packages),
-            packages: missing.join(", "),
-        }
-        .into());
-    }
-
-    Ok(selected)
-}
-
-const PACKAGE_SUGGESTION_THRESHOLD: f64 = 0.84;
-const MAX_PACKAGE_SUGGESTIONS: usize = 5;
-
-fn package_not_found_help(missing: &[String], known_packages: &BTreeSet<String>) -> String {
-    let suggestions = missing
-        .iter()
-        .filter_map(|package| {
-            let suggestions = package_suggestions(package, known_packages);
-            (!suggestions.is_empty())
-                .then(|| format!("For {package}, did you mean {}?", suggestions.join(", ")))
-        })
-        .collect::<Vec<_>>();
-
-    if suggestions.is_empty() {
-        "Check the package name or add a repository that contains it.".to_string()
-    } else {
-        suggestions.join(" ")
-    }
-}
-
-fn package_suggestions(package: &str, known_packages: &BTreeSet<String>) -> Vec<String> {
-    let package_lower = package.to_ascii_lowercase();
-    let mut scored = known_packages
-        .iter()
-        .filter(|candidate| candidate.as_str() != package)
-        .filter_map(|candidate| {
-            let candidate_lower = candidate.to_ascii_lowercase();
-            let score = strsim::jaro_winkler(&package_lower, &candidate_lower);
-            (score >= PACKAGE_SUGGESTION_THRESHOLD).then(|| (score, candidate.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .partial_cmp(&left.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.1.cmp(&right.1))
-    });
-
-    scored
-        .into_iter()
-        .take(MAX_PACKAGE_SUGGESTIONS)
-        .map(|(_, package)| package)
-        .collect()
-}
-
-fn pinned_package_relations(package: &str, latest: &Version) -> Result<Vec<Relation>, String> {
-    let next_major = next_major_version(latest)?;
-    Ok(vec![
-        Relation::new(
-            package,
-            VersionRequirement::GreaterThanEqual(latest.clone()),
-        )
-        .map_err(|error| error.to_string())?,
-        Relation::new(package, VersionRequirement::LessThan(next_major))
-            .map_err(|error| error.to_string())?,
-    ])
-}
-
-fn next_major_version(version: &Version) -> Result<Version, String> {
-    let major = version
-        .components()
-        .first()
-        .ok_or_else(|| format!("latest version is not semver-like: {version}"))?;
-    let next_major = major
-        .checked_add(1)
-        .ok_or_else(|| format!("latest version major component is too large: {version}"))?;
-
-    format!("{next_major}.0.0")
-        .parse()
-        .map_err(|error| format!("failed to build next major version for {version}: {error}"))
-}
-
-fn apply_added_packages_to_description(
-    description: &mut RDescription,
-    added_relations: &BTreeSet<Relation>,
-) -> Result<(), RpxError> {
-    let added_packages = added_relations
-        .iter()
-        .map(|relation| relation.package().to_string())
-        .collect::<BTreeSet<_>>();
-    remove_packages_from_description_dependencies(description, &added_packages)?;
-
-    let added_imports = added_relations
-        .iter()
-        .filter(|relation| !is_base_package(relation.package()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    if !added_imports.is_empty() {
-        let imports = description
-            .imports()
-            .map_err(|source| LockError::ResolveFailed {
-                details: source.to_string(),
-            })?
-            .chain(added_imports)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        description.set_imports(imports);
-    }
-
-    Ok(())
-}
-
-fn remove_packages_from_description_dependencies(
-    description: &mut RDescription,
-    packages: &BTreeSet<String>,
-) -> Result<(), RpxError> {
-    let depends = description
-        .depends()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    description.set_depends(depends.filter(|dependency| !packages.contains(dependency.package())));
-
-    let imports = description
-        .imports()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    description.set_imports(imports.filter(|dependency| !packages.contains(dependency.package())));
-
-    let linking_to = description
-        .linking_to()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    description
-        .set_linking_to(linking_to.filter(|dependency| !packages.contains(dependency.package())));
-
-    let suggests = description
-        .suggests()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    description
-        .set_suggests(suggests.filter(|dependency| !packages.contains(dependency.package())));
-
-    let enhances = description
-        .enhances()
-        .map_err(|source| LockError::ResolveFailed {
-            details: source.to_string(),
-        })?;
-    description
-        .set_enhances(enhances.filter(|dependency| !packages.contains(dependency.package())));
-    Ok(())
+        details: source.to_string(),
+    })
 }
 
 async fn load_sysreq_snapshot_for_lock(
@@ -1843,10 +1735,11 @@ fn load_sysreq_snapshot_for_lock_blocking(
 }
 
 async fn sync_packages(
+    project_library: &Path,
     required: RequiredPackages,
     installed: BTreeMap<String, PackageVersion>,
     r_version: &semver::Version,
-) -> Result<(), RpxError> {
+) -> Result<(), SyncError> {
     let packages_to_remove = installed
         .iter()
         .filter(|(name, installed_version)| {
@@ -1872,18 +1765,18 @@ async fn sync_packages(
         })
         .collect();
 
-    remove_packages_from_venv(&packages_to_remove).map_err(r::RError::Remove)?;
-    install_required_packages(packages_to_install, retained, r_version).await?;
+    remove_packages_from_venv(project_library, &packages_to_remove)?;
+    install_required_packages(project_library, packages_to_install, retained, r_version).await?;
 
     Ok(())
 }
 
 fn package_requires_install(required: &PackageVersion, installed: Option<&PackageVersion>) -> bool {
-    required
-        .repository()
-        .as_ref()
-        .downcast_ref::<GitRepository>()
-        .is_some()
+    let repository = required.repository().as_ref();
+
+    // Git and local sources can change without changing their package version.
+    repository.downcast_ref::<GitRepository>().is_some()
+        || repository.downcast_ref::<LocalRepository>().is_some()
         || installed != Some(required)
 }
 
@@ -1895,21 +1788,19 @@ pub(crate) fn exit_with_status(code: Option<i32>) {
 
 async fn hydrate_resolved_packages(
     selected: BTreeMap<String, PackageVersion>,
-) -> Result<RequiredPackages, RpxError> {
+) -> Result<RequiredPackages, RepositoryError> {
     // TODO: make sure the web requests are under a central semaphore in the repos not here
     futures_util::future::join_all(selected.into_iter().map(|(name, version)| async move {
         let description = version
             .repository()
             .description(&name, version.version())
-            .await
-            .map_err(lock_error_from_repository)?;
+            .await?;
 
-        Ok::<_, LockError>((name, (version, description)))
+        Ok::<_, RepositoryError>((name, (version, description)))
     }))
     .await
     .into_iter()
-    .collect::<Result<RequiredPackages, _>>()
-    .map_err(Into::into)
+    .collect()
 }
 
 async fn lockfile_from_resolution(
@@ -2071,10 +1962,10 @@ fn sync_system_dependencies(
     lockfile: &Lockfile,
     install_system: bool,
     install_only_system: bool,
-) -> Result<(), RpxError> {
+) -> Result<(), SyncError> {
     if !host_supports_system_sync() {
         if install_system || install_only_system {
-            return Err(SyncError::UnsupportedSystemInstall.into());
+            return Err(SyncError::UnsupportedSystemInstall);
         }
         return Ok(());
     }
@@ -2090,7 +1981,7 @@ fn handle_system_requirements(
     plan: &SystemDependencyPlan,
     install_system: bool,
     install_only_system: bool,
-) -> Result<(), RpxError> {
+) -> Result<(), SyncError> {
     let explicit_install = install_system || install_only_system;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let mut plan = plan.clone();
@@ -2153,7 +2044,7 @@ fn handle_system_requirements(
         let ui = SystemDepsUi::start();
         if let Err(error) = install_system_dependencies(&plan) {
             ui.fail();
-            return Err(SyncError::SystemDependenciesFailed { details: error }.into());
+            return Err(SyncError::SystemDependenciesFailed { details: error });
         }
         ui.finish();
         if install_only_system {
@@ -2172,7 +2063,7 @@ fn handle_system_requirements(
             let ui = SystemDepsUi::start();
             if let Err(error) = install_system_dependencies(&plan) {
                 ui.fail();
-                return Err(SyncError::SystemDependenciesFailed { details: error }.into());
+                return Err(SyncError::SystemDependenciesFailed { details: error });
             }
             ui.finish();
             Ok(())
@@ -2259,6 +2150,7 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
 }
 
 async fn install_required_packages(
+    project_library: &Path,
     packages: RequiredPackages,
     retained: BTreeSet<String>,
     r_version: &semver::Version,
@@ -2287,6 +2179,7 @@ async fn install_required_packages(
         return Ok(());
     }
 
+    let project_library = project_library.to_path_buf();
     let r_version = Arc::new(r_version.clone());
     let required_names = Arc::new(
         retained
@@ -2318,6 +2211,7 @@ async fn install_required_packages(
             let install_installed_tx = installed_tx.clone();
             let install_shared_pool = Arc::clone(&shared_pool);
             let install_pool = Arc::clone(&install_pool);
+            let install_project_library = project_library.clone();
             install_tasks.spawn(
                 async move {
                     wait_for_package_dependencies(
@@ -2345,7 +2239,7 @@ async fn install_required_packages(
 
                     install_package_directory(
                         &project_path,
-                        &project_library_path(),
+                        &install_project_library,
                         "project package",
                     )
                     .await
@@ -2375,6 +2269,7 @@ async fn install_required_packages(
             let install_installed_tx = installed_tx.clone();
             let install_shared_pool = Arc::clone(&shared_pool);
             let install_pool = Arc::clone(&install_pool);
+            let install_project_library = project_library.clone();
             install_tasks.spawn(
                 async move {
                     wait_for_package_dependencies(
@@ -2411,7 +2306,7 @@ async fn install_required_packages(
                         .map_or(checkout.clone(), |subdirectory| checkout.join(subdirectory));
                     install_package_directory(
                         &package_root,
-                        &project_library_path(),
+                        &install_project_library,
                         &format!("{package_name} from Git"),
                     )
                     .await
@@ -2470,6 +2365,7 @@ async fn install_required_packages(
         let install_installed_tx = installed_tx.clone();
         let install_shared_pool = Arc::clone(&shared_pool);
         let install_pool = Arc::clone(&install_pool);
+        let install_project_library = project_library.clone();
         install_tasks.spawn(
             async move {
                 let prepared_artifact = prepared_rx
@@ -2504,6 +2400,7 @@ async fn install_required_packages(
                 })?;
 
                 let installed = install_prepared_package(
+                    install_project_library,
                     package_name,
                     package_version,
                     cache_key,
@@ -2731,6 +2628,7 @@ async fn prepare_locked_package_artifact_inner(
 }
 
 async fn install_prepared_package(
+    project_library: PathBuf,
     package: String,
     package_version: PackageVersion,
     cache_key: CompiledPackageCacheKey,
@@ -2749,20 +2647,26 @@ async fn install_prepared_package(
     span.pb_set_message(&package_stage_message(&package, &version, "installing"));
     span.pb_start();
 
-    install_prepared_package_inner(package, version, cache_key, prepared_artifact, span.clone())
-        .instrument(span)
-        .await
+    install_prepared_package_inner(
+        project_library,
+        package,
+        version,
+        cache_key,
+        prepared_artifact,
+        span.clone(),
+    )
+    .instrument(span)
+    .await
 }
 
 async fn install_prepared_package_inner(
+    project_library: PathBuf,
     package: String,
     version: String,
     cache_key: CompiledPackageCacheKey,
     prepared_artifact: Option<(PathBuf, String)>,
     span: tracing::Span,
 ) -> Result<String, String> {
-    let project_library = project_library_path();
-
     match prepared_artifact {
         None => {
             span.record("artifact_kind", "compiled-cache");
@@ -2802,6 +2706,7 @@ async fn install_downloaded_package(
     let temp_library = build_temp_library_path(&package, &unique_build_token());
 
     install_local_package(
+        &project_library,
         &artifact_path,
         &package,
         &version,
@@ -3011,9 +2916,9 @@ mod tests {
         apply_added_packages_to_description, effective_package_repositories,
         lock_error_from_resolution, lockfile_from_resolution, package_not_found_help,
         package_rules_from_lockfile, parse_add_package, pinned_package_relations,
-        remove_packages_from_description_dependencies, required_package_install_order,
-        roots_from_description,
+        required_package_install_order, roots_from_description,
     };
+    use crate::description::remove_dependencies;
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, Lockfile, Repository, SystemRequirements,
     };
@@ -3555,7 +3460,7 @@ Imports: zoo, cli, cli
     }
 
     #[test]
-    fn removes_packages_from_all_description_dependency_fields() {
+    fn removes_packages_from_project_dependency_fields() {
         let mut description = RDescription::parse(
             "Package: testpkg
 Version: 0.1.0
@@ -3571,7 +3476,7 @@ Enhances: removeMe, keepEnhances
         );
         let packages = BTreeSet::from(["removeMe".to_string()]);
 
-        remove_packages_from_description_dependencies(&mut description, &packages)
+        remove_dependencies(&PathBuf::from("."), &mut description, &packages)
             .expect("description should update");
 
         assert_eq!(
@@ -3600,8 +3505,12 @@ Enhances: removeMe, keepEnhances
             "keepSuggests"
         );
         assert_eq!(
-            description.enhances().unwrap().next().unwrap().to_string(),
-            "keepEnhances"
+            description
+                .enhances()
+                .unwrap()
+                .map(|relation| relation.to_string())
+                .collect::<Vec<_>>(),
+            ["removeMe", "keepEnhances"]
         );
     }
 

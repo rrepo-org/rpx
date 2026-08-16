@@ -1,5 +1,13 @@
+use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
+use thiserror::Error;
+
+pub const LOCKFILE_NAME: &str = "rpx.lock";
 
 pub const LOCKFILE_VERSION: u32 = 5;
 pub const LOCKFILE_REVISION: u32 = 0;
@@ -198,6 +206,91 @@ mod package_version {
         let value = String::deserialize(deserializer)?;
         value.parse().map_err(D::Error::custom)
     }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum LockfileReadError {
+    #[error("failed to read rpx.lock at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::lockfile_read_failed))]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse rpx.lock at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::lockfile_parse_failed))]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("{} needs to be updated", path.display())]
+    #[diagnostic(
+        code(rpx::project::lockfile_outdated),
+        help("Run `rpx lock` to update it.")
+    )]
+    OutdatedLockfile { path: PathBuf },
+
+    #[error("{} was created by a newer version of rpx", path.display())]
+    #[diagnostic(
+        code(rpx::project::lockfile_from_newer_rpx),
+        help("Update rpx and try again.")
+    )]
+    NewerLockfile { path: PathBuf },
+}
+
+pub fn read_lockfile(path: &PathBuf) -> Result<Lockfile, LockfileReadError> {
+    let path = path.join(LOCKFILE_NAME);
+    let contents = fs::read_to_string(&path).map_err(|source| LockfileReadError::Read {
+        path: path.clone(),
+        source,
+    })?;
+
+    let header = serde_json::from_str::<LockfileHeader>(&contents).map_err(|source| {
+        LockfileReadError::Parse {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    if header.version < LOCKFILE_VERSION {
+        return Err(LockfileReadError::OutdatedLockfile { path: path });
+    }
+    if header.version > LOCKFILE_VERSION {
+        return Err(LockfileReadError::NewerLockfile { path: path });
+    }
+
+    let lockfile = serde_json::from_str::<Lockfile>(&contents)
+        .map_err(|source| LockfileReadError::Parse { path: path, source })?;
+
+    Ok(lockfile)
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum LockfileWriteError {
+    #[error("failed to serialize rpx.lock: {source}")]
+    #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("failed to write rpx.lock at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::lockfile_write_failed))]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+pub fn write_lockfile(path: &PathBuf, lockfile: &Lockfile) -> Result<(), LockfileWriteError> {
+    let path = path.join(LOCKFILE_NAME);
+    let contents = serde_json::to_string_pretty(lockfile)
+        .map_err(|source| LockfileWriteError::Serialize { source })?;
+    fs::write(&path, format!("{contents}\n"))
+        .map_err(|source| LockfileWriteError::Write { path: path, source })
 }
 
 #[cfg(test)]
@@ -498,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_manifest_and_package_relations() {
+    fn round_trips_description_and_package_relations() {
         let requirements = BTreeSet::from([
             relation("cli"),
             relation("digest (>= 0.6.37)"),

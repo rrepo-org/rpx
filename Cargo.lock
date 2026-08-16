@@ -2465,7 +2465,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "strsim",
  "tar",
  "testcontainers",
  "thiserror",

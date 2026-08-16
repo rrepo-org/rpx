@@ -15,6 +15,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 use crate::repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository};
 
 const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
+#[deprecated]
 const BASE_PACKAGES: &[&str] = &[
     "base",
     "compiler",
@@ -425,6 +426,7 @@ fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVer
     }
 }
 
+#[deprecated]
 pub fn is_base_package(package: &str) -> bool {
     BASE_PACKAGES.contains(&package)
 }

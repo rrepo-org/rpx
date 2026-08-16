@@ -1,9 +1,8 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::{PackageError, RDescription, Relation, Remote, RemoteSource, VersionError};
+use r_description::RDescription;
 use std::{
-    cell::OnceCell,
-    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -12,202 +11,84 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    lockfile::{self, LOCKFILE_VERSION, Lockfile, LockfileHeader},
-    repository::{
-        GitRepository, LocalRepository, PackageRepository, RepositoryError, default_repository,
-        parse_repository_url,
+    description::{
+        ConfiguredRepositoriesError, ConfiguredRepository, DESCRIPTION_NAME, DescriptionParseError,
+        configured_repositories, project_dependencies,
     },
-    resolver::{PackageVersion, is_base_package},
+    lockfile::{self, LOCKFILE_NAME, Lockfile},
+    repository::{GitRepository, PackageRepository, RepositoryError},
+    resolver::PackageVersion,
 };
 
-pub const LOCKFILE_NAME: &str = "rpx.lock";
-pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
 pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum ProjectDiscoveryError {
-    #[error("failed to get current directory: {source}")]
-    #[diagnostic(code(rpx::project::current_dir_failed))]
-    CurrentDirectory {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::project::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
         #[source]
         source: std::io::Error,
     },
 
-    #[error("project root not found in current directory or any parent directory")]
-    #[diagnostic(code(rpx::project::not_found))]
-    NotFound,
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum ManifestReadError {
-    #[error("failed to read DESCRIPTION at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_read_failed))]
-    Read {
+    #[error("failed to inspect project root marker at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::root_marker_metadata))]
+    RootMarkerMetadata {
         path: PathBuf,
         #[source]
         source: std::io::Error,
-    },
-
-    #[error("failed to read {field} in DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_field_invalid))]
-    InvalidField {
-        path: PathBuf,
-        field: &'static str,
-        details: String,
     },
 
     #[error(
-        "unsupported Remotes source {kind} in DESCRIPTION at {}: {remote}",
-        path.display()
+        "project root not found from {} or any parent directory",
+        start.display()
     )]
     #[diagnostic(
-        code(rpx::project::manifest_remotes_unsupported),
-        help("Use a GitHub, GitLab, Bitbucket, or generic git remote.")
+        code(rpx::project::root_not_found),
+        help("Expected a .git, DESCRIPTION, or rpx.lock root marker.")
     )]
-    UnsupportedRemote {
-        path: PathBuf,
-        remote: String,
-        kind: String,
-    },
-
-    #[error(
-        "package {package} has multiple Remotes declarations in DESCRIPTION at {}",
-        path.display()
-    )]
-    #[diagnostic(code(rpx::project::manifest_remotes_duplicate_package))]
-    DuplicateRemotePackage { path: PathBuf, package: String },
+    RootNotFound { start: PathBuf },
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum LockfileReadError {
-    #[error("rpx.lock not found at {}", path.display())]
-    #[diagnostic(code(rpx::project::lockfile_not_found))]
-    NotFound { path: PathBuf },
+pub fn find_project_root() -> Result<PathBuf, ProjectDiscoveryError> {
+    let current_dir = env::current_dir()
+        .map_err(|source| ProjectDiscoveryError::WorkingDirectoryUnavailable { source })?;
 
-    #[error("failed to read rpx.lock at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::lockfile_read_failed))]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse rpx.lock at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::lockfile_parse_failed))]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-
-    #[error("{} needs to be updated", path.display())]
-    #[diagnostic(
-        code(rpx::project::lockfile_outdated),
-        help("Run `rpx lock` to update it.")
-    )]
-    OutdatedLockfile { path: PathBuf },
-
-    #[error("{} was created by a newer version of rpx", path.display())]
-    #[diagnostic(
-        code(rpx::project::lockfile_from_newer_rpx),
-        help("Update rpx and try again.")
-    )]
-    NewerLockfile { path: PathBuf },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum ManifestWriteError {
-    #[error("failed to write DESCRIPTION at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_write_failed))]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum LockfileWriteError {
-    #[error("failed to serialize rpx.lock: {source}")]
-    #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
-    Serialize {
-        #[source]
-        source: serde_json::Error,
-    },
-
-    #[error("failed to write rpx.lock at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::lockfile_write_failed))]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum LockedResolutionError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lockfile(#[from] LockfileReadError),
-
-    #[error("failed to read package requirements from DESCRIPTION: {details}")]
-    #[diagnostic(code(rpx::project::manifest_requirements_invalid))]
-    ManifestRequirements { details: String },
-
-    #[error("rpx.lock does not match the current project configuration")]
-    #[diagnostic(
-        code(rpx::project::locked_resolution_invalid),
-        help("Run `rpx lock` to update rpx.lock.")
-    )]
-    Validation {
-        #[related]
-        failures: Vec<LockedResolutionFailure>,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum LockedResolutionFailure {
-    #[error("locked repository {repository} at index {index} is invalid: {source}")]
-    #[diagnostic(code(rpx::project::locked_repository_invalid))]
-    InvalidRepository {
-        index: usize,
-        repository: url::Url,
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("repository configuration no longer matches rpx.lock")]
-    #[diagnostic(code(rpx::project::repositories_changed))]
-    RepositoriesChanged,
-
-    #[error("package requirements in DESCRIPTION no longer match rpx.lock")]
-    #[diagnostic(code(rpx::project::requirements_changed))]
-    PackageRequirementsChanged,
-
-    #[error("rpx.lock was generated for R {locked}, but current R is {current}")]
-    #[diagnostic(code(rpx::project::r_version_changed))]
-    RVersionChanged {
-        locked: semver::Version,
-        current: semver::Version,
-    },
+    current_dir
+        .ancestors()
+        .find_map(|directory| {
+            [
+                (".git", false),
+                (DESCRIPTION_NAME, true),
+                (LOCKFILE_NAME, true),
+            ]
+            .into_iter()
+            .find_map(|(name, file_only)| {
+                let path = directory.join(name);
+                match fs::metadata(&path) {
+                    Ok(metadata) if !file_only || metadata.is_file() => {
+                        Some(Ok(directory.to_path_buf()))
+                    }
+                    Ok(_) => None,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(source) => Some(Err(ProjectDiscoveryError::RootMarkerMetadata {
+                        path,
+                        source,
+                    })),
+                }
+            })
+        })
+        .unwrap_or_else(|| Err(ProjectDiscoveryError::RootNotFound { start: current_dir }))
 }
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum LockedPackagesError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Manifest(#[from] ManifestReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lockfile(#[from] LockfileReadError),
-
     #[error("DESCRIPTION at {} is missing required field {field}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_missing_field))]
+    #[diagnostic(code(rpx::project::description_missing_field))]
     MissingField { path: PathBuf, field: &'static str },
 
     #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::project::manifest_invalid_version))]
+    #[diagnostic(code(rpx::project::description_invalid_version))]
     InvalidVersion { path: PathBuf, details: String },
 
     #[error("invalid locked version {version} for {package}: {details}")]
@@ -250,348 +131,159 @@ pub enum LockedPackagesError {
     InvalidLockedDescription { package: String, details: String },
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum ProjectError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Discovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Manifest(#[from] ManifestReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lockfile(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ManifestWrite(#[from] ManifestWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedPackages(#[from] LockedPackagesError),
-}
-
-pub struct Project {
-    path: PathBuf,
-    description: OnceCell<RDescription>,
-    lockfile: OnceCell<Lockfile>,
-}
-
-impl Project {
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            description: OnceCell::new(),
-            lockfile: OnceCell::new(),
-        }
-    }
-
-    pub fn discover() -> Result<Self, ProjectDiscoveryError> {
-        let current_dir = env::current_dir()
-            .map_err(|source| ProjectDiscoveryError::CurrentDirectory { source })?;
-
-        current_dir
-            .ancestors()
-            .find(|directory| {
-                directory.join(".git").exists()
-                    || directory.join(DESCRIPTION_NAME).is_file()
-                    || directory.join(LOCKFILE_NAME).is_file()
-            })
-            .map(|directory| Self::new(directory.to_path_buf()))
-            .ok_or(ProjectDiscoveryError::NotFound)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn description(&self) -> Result<&RDescription, ManifestReadError> {
-        if let Some(description) = self.description.get() {
-            return Ok(description);
-        }
-
-        let path = self.path.join(DESCRIPTION_NAME);
-        let contents = fs::read_to_string(&path).map_err(|source| ManifestReadError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let description = RDescription::parse(&contents);
-
-        Ok(self.description.get_or_init(|| description))
-    }
-
-    pub fn lockfile(&self) -> Result<&Lockfile, LockfileReadError> {
-        self.read_lockfile()
-    }
-
-    fn read_lockfile(&self) -> Result<&Lockfile, LockfileReadError> {
-        if let Some(lockfile) = self.lockfile.get() {
-            return Ok(lockfile);
-        }
-
-        let path = self.path.join(LOCKFILE_NAME);
-        let error_path = path_relative_to_current_dir(&path);
-        let contents = fs::read_to_string(&path).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                LockfileReadError::NotFound {
-                    path: error_path.clone(),
-                }
-            } else {
-                LockfileReadError::Read {
-                    path: error_path.clone(),
-                    source,
-                }
-            }
-        })?;
-        let header = serde_json::from_str::<LockfileHeader>(&contents).map_err(|source| {
-            LockfileReadError::Parse {
-                path: error_path.clone(),
-                source,
-            }
-        })?;
-        if header.version < LOCKFILE_VERSION {
-            return Err(LockfileReadError::OutdatedLockfile { path: error_path });
-        }
-        if header.version > LOCKFILE_VERSION {
-            return Err(LockfileReadError::NewerLockfile { path: error_path });
-        }
-        let lockfile = serde_json::from_str::<Lockfile>(&contents).map_err(|source| {
-            LockfileReadError::Parse {
-                path: error_path,
-                source,
-            }
-        })?;
-
-        Ok(self.lockfile.get_or_init(|| lockfile))
-    }
-
-    pub fn lockfile_optional(&self) -> Result<Option<&Lockfile>, LockfileReadError> {
-        let path = self.path.join(LOCKFILE_NAME);
-        if !path
-            .try_exists()
-            .map_err(|source| LockfileReadError::Read {
-                path: path_relative_to_current_dir(&path),
-                source,
-            })?
-        {
-            return Ok(None);
-        }
-
-        self.read_lockfile().map(Some)
-    }
-
-    pub fn write_description(&self, description: &RDescription) -> Result<(), ManifestWriteError> {
-        let path = self.path.join(DESCRIPTION_NAME);
-        fs::write(&path, description.to_string())
-            .map_err(|source| ManifestWriteError::Write { path, source })
-    }
-
-    pub fn write_lockfile(&self, lockfile: &Lockfile) -> Result<(), LockfileWriteError> {
-        let contents = serde_json::to_string_pretty(lockfile)
-            .map_err(|source| LockfileWriteError::Serialize { source })?;
-        let path = self.path.join(LOCKFILE_NAME);
-        fs::write(&path, format!("{contents}\n")).map_err(|source| LockfileWriteError::Write {
-            path: path_relative_to_current_dir(&path),
-            source,
-        })
-    }
-
-    pub fn locked_packages(&self) -> Result<BTreeMap<String, PackageVersion>, LockedPackagesError> {
-        let description = self.description()?;
-        Ok(self
-            .required_packages_from_lockfile(description)?
-            .into_iter()
-            .map(|(name, (version, _))| (name, version))
-            .collect())
-    }
-
-    pub fn required_packages_from_lockfile(
-        &self,
-        root_description: &RDescription,
-    ) -> Result<RequiredPackages, LockedPackagesError> {
-        let lockfile = self.lockfile()?;
-        let mut packages = lockfile
-            .packages
-            .iter()
-            .filter(|(name, _)| !is_base_package(name))
-            .map(|(name, package)| {
-                let repository = lockfile
-                    .repos
-                    .iter()
-                    .find(|repository| repository.url() == &package.repository)
-                    .ok_or_else(|| LockedPackagesError::RepositoryNotFound {
-                        package: name.clone(),
-                        repository: package.repository.clone(),
-                    })?;
-                let repository =
-                    <dyn PackageRepository>::from_lockfile(repository).map_err(|source| {
-                        LockedPackagesError::Repository {
-                            package: name.clone(),
-                            source,
-                        }
-                    })?;
-
-                let description = locked_package_description(name, package)?;
-
-                Ok((
-                    name.clone(),
-                    (
-                        PackageVersion::new(package.version.clone(), repository),
-                        Arc::new(description),
-                    ),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, LockedPackagesError>>()?;
-
-        let (package, version) = self.root_package_for(root_description)?;
-        packages.insert(package, (version, Arc::new(root_description.clone())));
-
-        Ok(packages)
-    }
-
-    fn root_package_for(
-        &self,
-        description: &RDescription,
-    ) -> Result<(String, PackageVersion), LockedPackagesError> {
-        let path = self.path.join(DESCRIPTION_NAME);
-        let package = description.package().map_err(|source| match source {
-            PackageError::Missing => LockedPackagesError::MissingField {
-                path: path.clone(),
-                field: "Package",
-            },
-            source @ PackageError::Duplicate(_) => LockedPackagesError::InvalidLockedDescription {
-                package: "project".to_string(),
-                details: source.to_string(),
-            },
-        })?;
-        let version = description.version().map_err(|source| match source {
-            VersionError::Missing => LockedPackagesError::MissingField {
-                path: path.clone(),
-                field: "Version",
-            },
-            source => LockedPackagesError::InvalidVersion {
-                path,
-                details: source.to_string(),
-            },
-        })?;
-        let repository: Arc<dyn PackageRepository> =
-            Arc::new(LocalRepository::new(self.path.clone()).with_description(description.clone()));
-
-        Ok((package, PackageVersion::new(version, repository)))
-    }
-
-    pub fn validate_locked_resolution(
-        &self,
-        description: &RDescription,
-        repositories: &[Arc<dyn PackageRepository>],
-        r_version: &semver::Version,
-    ) -> Result<&Lockfile, LockedResolutionError> {
-        let lockfile = self.lockfile()?;
-        let repository_validation = lockfile
-            .repos
-            .iter()
-            .enumerate()
-            .map(|(index, locked)| {
-                <dyn PackageRepository>::from_lockfile(locked)
-                    .map(|locked| {
-                        repositories
-                            .get(index)
-                            .is_some_and(|current| locked.equals(current.as_ref()))
-                    })
-                    .map_err(|source| LockedResolutionFailure::InvalidRepository {
-                        index,
-                        repository: locked.url().clone(),
-                        source,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let repositories_changed = lockfile.repos.len() != repositories.len()
-            || repository_validation
+pub fn required_packages_from_lockfile(
+    lockfile: &Lockfile,
+) -> Result<RequiredPackages, LockedPackagesError> {
+    let packages = lockfile
+        .packages
+        .iter()
+        .map(|(name, package)| {
+            let repository = lockfile
+                .repos
                 .iter()
-                .any(|result| matches!(result, Ok(false)));
-        let roots = description_roots(description)
-            .map_err(|details| LockedResolutionError::ManifestRequirements { details })?;
-        let failures = repository_validation
-            .into_iter()
-            .filter_map(Result::err)
-            .chain(repositories_changed.then_some(LockedResolutionFailure::RepositoriesChanged))
-            .chain(
-                (lockfile.requirements != roots)
-                    .then_some(LockedResolutionFailure::PackageRequirementsChanged),
-            )
-            .chain(
-                (&lockfile.r != r_version).then(|| LockedResolutionFailure::RVersionChanged {
-                    locked: lockfile.r.clone(),
-                    current: r_version.clone(),
-                }),
-            )
-            .collect::<Vec<_>>();
+                .find(|repository| repository.url() == &package.repository)
+                .ok_or_else(|| LockedPackagesError::RepositoryNotFound {
+                    package: name.clone(),
+                    repository: package.repository.clone(),
+                })?;
+            let repository =
+                <dyn PackageRepository>::from_lockfile(repository).map_err(|source| {
+                    LockedPackagesError::Repository {
+                        package: name.clone(),
+                        source,
+                    }
+                })?;
 
-        if failures.is_empty() {
-            Ok(lockfile)
-        } else {
-            Err(LockedResolutionError::Validation { failures })
-        }
-    }
+            let description = locked_package_description(name, package)?;
+
+            Ok((
+                name.clone(),
+                (
+                    PackageVersion::new(package.version.clone(), repository),
+                    Arc::new(description),
+                ),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, LockedPackagesError>>()?;
+
+    Ok(packages)
 }
 
-pub(crate) fn git_remotes(
+#[derive(Debug, Error, Diagnostic)]
+pub enum LockedResolutionError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Parse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] ConfiguredRepositoriesError),
+
+    #[error("rpx.lock does not match the current project configuration")]
+    #[diagnostic(
+        code(rpx::project::locked_resolution_invalid),
+        help("Run `rpx lock` to update rpx.lock.")
+    )]
+    Validation {
+        #[related]
+        failures: Vec<LockedResolutionFailure>,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum LockedResolutionFailure {
+    #[error("locked repository {repository} at index {index} is invalid: {source}")]
+    #[diagnostic(code(rpx::project::locked_repository_invalid))]
+    InvalidRepository {
+        index: usize,
+        repository: url::Url,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("repository configuration no longer matches rpx.lock")]
+    #[diagnostic(code(rpx::project::repositories_changed))]
+    RepositoriesChanged,
+
+    #[error("package requirements in DESCRIPTION no longer match rpx.lock")]
+    #[diagnostic(code(rpx::project::requirements_changed))]
+    PackageRequirementsChanged,
+
+    #[error("rpx.lock was generated for R {locked}, but current R is {current}")]
+    #[diagnostic(code(rpx::project::r_version_changed))]
+    RVersionChanged {
+        locked: semver::Version,
+        current: semver::Version,
+    },
+}
+
+pub fn validate_locked_resolution(
+    project_path: &PathBuf,
     description: &RDescription,
-    path: &Path,
-) -> Result<Vec<Remote>, ManifestReadError> {
-    let remotes = description
-        .remotes()
-        .map_err(|source| ManifestReadError::InvalidField {
-            path: path.to_path_buf(),
-            field: "Remotes",
-            details: source.to_string(),
-        })?;
-    let mut packages = BTreeSet::new();
-    let mut validated = Vec::new();
+    r_version: &semver::Version,
+    lockfile: &Lockfile,
+) -> Result<(), LockedResolutionError> {
+    let repositories = configured_repositories(project_path, description)?;
+    let repository_validation = lockfile
+        .repos
+        .iter()
+        .zip(&repositories)
+        .enumerate()
+        .map(|(index, (locked, configured))| {
+            let matches = match configured {
+                ConfiguredRepository::Base(url) | ConfiguredRepository::Additional(url) => {
+                    Ok::<_, RepositoryError>(
+                        matches!(
+                            locked,
+                            lockfile::Repository::Rrepo { .. }
+                                | lockfile::Repository::CranLike { .. }
+                        ) && locked.url() == url,
+                    )
+                }
+                ConfiguredRepository::Git(remote) => {
+                    GitRepository::new(remote.clone()).and_then(|current| match locked {
+                        lockfile::Repository::Git { .. } => {
+                            <dyn PackageRepository>::from_lockfile(locked)
+                                .map(|locked| locked.equals(&current))
+                        }
+                        _ => Ok(false),
+                    })
+                }
+            };
 
-    for remote in remotes {
-        let kind = match &remote.source {
-            RemoteSource::GitHub(_)
-            | RemoteSource::GitLab(_)
-            | RemoteSource::Bitbucket(_)
-            | RemoteSource::Git(_) => None,
-            RemoteSource::Unspecified(_) => Some("unspecified".to_string()),
-            RemoteSource::Cran(_) => Some("cran".to_string()),
-            RemoteSource::Url(_) => Some("url".to_string()),
-            RemoteSource::Local(_) => Some("local".to_string()),
-            RemoteSource::Svn(_) => Some("svn".to_string()),
-            RemoteSource::Bioconductor(_) => Some("bioconductor".to_string()),
-            RemoteSource::Unknown(remote) => Some(remote.kind.clone()),
-        };
-        if let Some(kind) = kind {
-            return Err(ManifestReadError::UnsupportedRemote {
-                path: path.to_path_buf(),
-                remote: remote.to_string(),
-                kind,
-            });
-        }
-        if let Some(package) = &remote.package
-            && !packages.insert(package.clone())
-        {
-            return Err(ManifestReadError::DuplicateRemotePackage {
-                path: path.to_path_buf(),
-                package: package.clone(),
-            });
-        }
-        validated.push(remote);
+            matches.map_err(|source| LockedResolutionFailure::InvalidRepository {
+                index,
+                repository: locked.url().clone(),
+                source,
+            })
+        })
+        .collect::<Vec<_>>();
+    let repositories_changed = lockfile.repos.len() != repositories.len()
+        || repository_validation
+            .iter()
+            .any(|result| matches!(result, Ok(false)));
+    let roots = project_dependencies(project_path, description)?;
+    let failures = repository_validation
+        .into_iter()
+        .filter_map(Result::err)
+        .chain(repositories_changed.then_some(LockedResolutionFailure::RepositoriesChanged))
+        .chain(
+            (lockfile.requirements != roots)
+                .then_some(LockedResolutionFailure::PackageRequirementsChanged),
+        )
+        .chain(
+            (&lockfile.r != r_version).then(|| LockedResolutionFailure::RVersionChanged {
+                locked: lockfile.r.clone(),
+                current: r_version.clone(),
+            }),
+        )
+        .collect::<Vec<_>>();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(LockedResolutionError::Validation { failures })
     }
-
-    Ok(validated)
 }
 
 fn locked_package_description(
@@ -610,86 +302,6 @@ fn locked_package_description(
     Ok(description)
 }
 
-pub(crate) async fn locked_default_repository_enabled(
-    description: &RDescription,
-    lockfile: &Lockfile,
-) -> Option<bool> {
-    let expected = description_repository_urls(description)?;
-
-    if lockfile
-        .repos
-        .iter()
-        .map(lockfile::Repository::url)
-        .eq(expected.iter())
-    {
-        return Some(false);
-    }
-
-    let default = default_repository().await.ok()?;
-    infer_locked_default_repository_enabled(&expected, lockfile, default.as_ref())
-}
-
-fn description_repository_urls(description: &RDescription) -> Option<Vec<url::Url>> {
-    let additional = description
-        .additional_repositories()
-        .ok()?
-        .map(|repository| parse_repository_url(repository.as_str()).ok())
-        .collect::<Option<Vec<_>>>()?;
-    let remotes = git_remotes(description, Path::new(DESCRIPTION_NAME))
-        .ok()?
-        .into_iter()
-        .map(|remote| {
-            let repository = GitRepository::new(remote).ok()?;
-            url::Url::try_from(repository.remote()).ok()
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    Some(additional.into_iter().chain(remotes).collect())
-}
-
-fn infer_locked_default_repository_enabled(
-    expected: &[url::Url],
-    lockfile: &Lockfile,
-    default: &dyn PackageRepository,
-) -> Option<bool> {
-    if lockfile
-        .repos
-        .iter()
-        .map(lockfile::Repository::url)
-        .eq(expected.iter())
-    {
-        return Some(false);
-    }
-
-    let (locked_default, locked_additional) = lockfile.repos.split_first()?;
-    if !locked_additional
-        .iter()
-        .map(lockfile::Repository::url)
-        .eq(expected.iter())
-    {
-        return None;
-    }
-
-    let locked_default = <dyn PackageRepository>::from_lockfile(locked_default).ok()?;
-    locked_default.equals(default).then_some(true)
-}
-
-fn description_roots(description: &RDescription) -> Result<BTreeSet<Relation>, String> {
-    let imports = description.imports().map_err(|error| error.to_string())?;
-    let depends = description.depends().map_err(|error| error.to_string())?;
-    let linking_to = description
-        .linking_to()
-        .map_err(|error| error.to_string())?;
-    let suggests = description.suggests().map_err(|error| error.to_string())?;
-
-    Ok(imports
-        .chain(depends)
-        .chain(linking_to)
-        .chain(suggests)
-        .filter(|relation| relation.package() != "R")
-        .collect())
-}
-
 #[derive(Debug, Error, Diagnostic)]
 pub enum ProjectPathError {
     #[error("failed to get current directory: {source}")]
@@ -704,19 +316,15 @@ pub enum ProjectPathError {
     DescriptionNotFound,
 }
 
-pub fn new_project_description_path() -> Result<PathBuf, ProjectPathError> {
-    Ok(current_dir()?.join(DESCRIPTION_NAME))
-}
-
-pub fn project_library_path() -> PathBuf {
-    let library_path = project_library_root_path().join("library");
+pub fn project_library_path(path: &PathBuf) -> PathBuf {
+    let library_path = project_library_root_path(path).join("library");
 
     fs::create_dir_all(&library_path).expect("failed to create project library");
     library_path
 }
 
-pub fn project_library_root_path() -> PathBuf {
-    let project_key = hash_path(&project_root());
+pub fn project_library_root_path(path: &PathBuf) -> PathBuf {
+    let project_key = hash_path(path);
     project_dirs()
         .data_dir()
         .join("libraries")
@@ -748,32 +356,6 @@ pub fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
     path
 }
 
-#[deprecated]
-pub fn project_root() -> PathBuf {
-    project_root_result().unwrap_or_else(|error| panic!("{error}"))
-}
-
-#[deprecated]
-pub fn project_root_result() -> Result<PathBuf, ProjectPathError> {
-    let current_dir = current_dir()?;
-    let current_dir = current_dir
-        .canonicalize()
-        .unwrap_or_else(|_| current_dir.clone());
-
-    for candidate in current_dir.ancestors() {
-        if candidate.join(DESCRIPTION_NAME).exists() {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-
-    Err(ProjectPathError::DescriptionNotFound)
-}
-
-#[deprecated]
-fn current_dir() -> Result<PathBuf, ProjectPathError> {
-    env::current_dir().map_err(|source| ProjectPathError::CurrentDirFailed { source })
-}
-
 fn project_dirs() -> ProjectDirs {
     ProjectDirs::from("de", "scalerail", "rpx").expect("failed to resolve rpx data directory")
 }
@@ -782,13 +364,6 @@ fn ensure_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("failed to create cache directory");
     }
-}
-
-fn path_relative_to_current_dir(path: &Path) -> PathBuf {
-    env::current_dir()
-        .ok()
-        .and_then(|current_dir| pathdiff::diff_paths(path, current_dir))
-        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn hash_path(path: &Path) -> String {
@@ -932,7 +507,7 @@ mod tests {
 
         assert!(matches!(
             git_remotes(description, &path.join(DESCRIPTION_NAME)),
-            Err(ManifestReadError::InvalidField {
+            Err(DescriptionReadError::InvalidField {
                 field: "Remotes",
                 ..
             })
@@ -942,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_recovered_description_with_unrelated_syntax_issues() {
+    fn rejects_description_with_syntax_issues_without_caching_it() {
         let path = project_directory("recovered-description");
         fs::write(
             path.join(DESCRIPTION_NAME),
@@ -951,8 +526,17 @@ mod tests {
         .expect("DESCRIPTION should be written");
         let project = Project::new(path.clone());
 
+        assert!(matches!(
+            project.description(),
+            Err(DescriptionReadError::Parse(_))
+        ));
+
+        fs::write(
+            path.join(DESCRIPTION_NAME),
+            "Package: project\nVersion: 1.0.0\nImports: cli\n",
+        )
+        .expect("DESCRIPTION should be rewritten");
         let description = project.description().expect("DESCRIPTION should load");
-        assert!(!description.syntax_issues().is_empty());
         assert_eq!(
             description.package().expect("Package should be valid"),
             "project"
@@ -976,7 +560,7 @@ mod tests {
 
         assert!(matches!(
             git_remotes(&description, Path::new(DESCRIPTION_NAME)),
-            Err(ManifestReadError::UnsupportedRemote { kind, .. }) if kind == "url"
+            Err(DescriptionReadError::UnsupportedRemote { kind, .. }) if kind == "url"
         ));
     }
 
@@ -987,7 +571,7 @@ mod tests {
 
         assert!(matches!(
             git_remotes(&description, Path::new(DESCRIPTION_NAME)),
-            Err(ManifestReadError::DuplicateRemotePackage { package, .. })
+            Err(DescriptionReadError::DuplicateRemotePackage { package, .. })
                 if package == "dependency"
         ));
     }
@@ -1047,16 +631,14 @@ mod tests {
     }
 
     #[test]
-    fn optional_lockfile_returns_none_when_missing() {
+    fn reports_missing_lockfile() {
         let path = project_directory("missing-lockfile");
         let project = Project::new(path.clone());
 
-        assert!(
-            project
-                .lockfile_optional()
-                .expect("missing lockfile should be allowed")
-                .is_none()
-        );
+        assert!(matches!(
+            project.lockfile(),
+            Err(LockfileReadError::NotFound { .. })
+        ));
 
         fs::remove_dir_all(path).expect("project directory should be removed");
     }
@@ -1083,11 +665,7 @@ mod tests {
             description.to_string()
         );
         assert_eq!(
-            project
-                .lockfile_optional()
-                .expect("lockfile should load")
-                .expect("lockfile should exist")
-                .revision,
+            project.lockfile().expect("lockfile should load").revision,
             1
         );
 
@@ -1110,7 +688,7 @@ mod tests {
         let expected_path = path_relative_to_current_dir(&lockfile_path);
 
         let error = project
-            .lockfile_optional()
+            .lockfile()
             .expect_err("old lockfile should require an update");
         assert!(matches!(
             &error,

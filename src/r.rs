@@ -11,9 +11,7 @@ use r_description::Version;
 use thiserror::Error;
 use tokio::{process::Command, sync::OnceCell};
 
-use crate::{
-    project::project_library_path, repository::built_in_repository, resolver::PackageVersion,
-};
+use crate::{repository::built_in_repository, resolver::PackageVersion};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum RSubprocessError {
@@ -178,13 +176,13 @@ pub enum RError {
 }
 
 pub(crate) trait RVirtualEnv {
-    fn with_venv(program: impl AsRef<str>) -> Self;
+    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self;
 }
 
 impl RVirtualEnv for tokio::process::Command {
-    fn with_venv(program: impl AsRef<str>) -> Self {
+    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self {
         let mut command = tokio::process::Command::new(program.as_ref());
-        command.env("R_LIBS_USER", project_library_path());
+        command.env("R_LIBS_USER", project_library);
         command
     }
 }
@@ -193,6 +191,7 @@ static BASE_PACKAGES: OnceCell<Vec<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
 pub async fn install_local_package(
+    project_library: &Path,
     artifact_path: &Path,
     package: &str,
     version: &str,
@@ -224,7 +223,7 @@ pub async fn install_local_package(
     .replace("%PACKAGE%", &escape_r_string(package))
     .replace("%VERSION%", &escape_r_string(version));
 
-    let mut command = Command::with_venv("Rscript");
+    let mut command = Command::with_venv("Rscript", project_library);
     command.arg("-e").arg(expression);
     let output = run_subprocess(command, "Rscript").await;
 
@@ -236,7 +235,7 @@ pub async fn install_package_directory(
     target_library: &Path,
     target: &str,
 ) -> Result<(), PackageInstallError> {
-    let mut command = Command::with_venv("R");
+    let mut command = Command::with_venv("R", target_library);
     command
         .arg("CMD")
         .arg("INSTALL")
@@ -275,8 +274,9 @@ pub async fn base_packages() -> Result<Vec<String>, BasePackagesError> {
         .cloned()
 }
 
-pub async fn installed_packages() -> Result<BTreeMap<String, PackageVersion>, InstalledPackagesError>
-{
+pub async fn installed_packages(
+    project_library: &Path,
+) -> Result<BTreeMap<String, PackageVersion>, InstalledPackagesError> {
     let expression = concat!(
         "packages <- installed.packages(lib.loc = .libPaths()[1]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
@@ -284,7 +284,7 @@ pub async fn installed_packages() -> Result<BTreeMap<String, PackageVersion>, In
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let mut command = Command::with_venv("Rscript");
+    let mut command = Command::with_venv("Rscript", project_library);
     command.arg("-e").arg(expression);
     let output = run_subprocess(command, "Rscript")
         .await
@@ -295,14 +295,20 @@ pub async fn installed_packages() -> Result<BTreeMap<String, PackageVersion>, In
     parse_installed_packages(&stdout)
 }
 
-pub fn remove_packages_from_venv(packages: &BTreeSet<String>) -> Result<(), PackageRemovalError> {
+pub fn remove_packages_from_venv(
+    project_library: &Path,
+    packages: &BTreeSet<String>,
+) -> Result<(), PackageRemovalError> {
     packages
         .iter()
-        .try_for_each(|package| remove_package_from_venv(package))
+        .try_for_each(|package| remove_package_from_venv(project_library, package))
 }
 
-pub fn remove_package_from_venv(package: &str) -> Result<(), PackageRemovalError> {
-    let package_dir = project_library_path().join(package);
+pub fn remove_package_from_venv(
+    project_library: &Path,
+    package: &str,
+) -> Result<(), PackageRemovalError> {
+    let package_dir = project_library.join(package);
 
     if !package_dir.exists() {
         return Ok(());
@@ -436,7 +442,7 @@ fn write_install_log(
 }
 
 async fn fetch_base_packages() -> Result<Vec<String>, BasePackagesError> {
-    let mut command = Command::with_venv("Rscript");
+    let mut command = Command::new("Rscript");
     command
         .arg("-e")
         .arg("writeLines(rownames(installed.packages(priority = 'base')))");

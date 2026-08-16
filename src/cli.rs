@@ -26,20 +26,6 @@ pub enum Commands {
     )]
     Add {
         #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-
-        #[arg(
             help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
             value_name = "PACKAGE[@CONSTRAINTVERSION]",
             required = true
@@ -52,20 +38,6 @@ pub enum Commands {
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
     Remove {
-        #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-
         #[arg(
             help = "Package names to remove from the project's dependencies",
             value_name = "PACKAGE",
@@ -93,21 +65,7 @@ pub enum Commands {
         about = "Resolve project dependencies",
         long_about = "Resolve project dependencies from DESCRIPTION and write the resolved package set to rpx.lock without installing packages."
     )]
-    Lock {
-        #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-    },
+    Lock {},
 
     #[command(
         about = "Check project dependency state",
@@ -161,10 +119,13 @@ pub enum RepoCommands {
         #[arg(help = "Repository base URL", value_name = "URL", required = true)]
         url: String,
 
-        #[arg(long, help = "Also remove any stored API key for this repository")]
+        #[arg(
+            long,
+            help = "Also remove any stored API key for this repository's origin"
+        )]
         remove_credential: bool,
     },
 
-    #[command(about = "List configured repositories")]
+    #[command(about = "List resolved repositories")]
     List,
 }

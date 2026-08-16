@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
-    env,
     fmt::{Debug, Display},
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -35,13 +34,6 @@ static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
 
 pub fn built_in_repository() -> Arc<dyn PackageRepository> {
     BUILT_IN_REPOSITORY.clone()
-}
-
-pub(crate) async fn default_repository() -> Result<Arc<dyn PackageRepository>, RepositoryError> {
-    match env::var("RPX_REGISTRY_BASE_URL") {
-        Ok(url) => <dyn PackageRepository>::from_url(&url).await,
-        Err(_) => Ok(built_in_repository()),
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
