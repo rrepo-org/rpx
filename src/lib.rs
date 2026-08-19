@@ -68,7 +68,7 @@ use ui::SystemDepsUi;
 use crate::{
     cache::CompiledPackageCacheKey,
     description::{
-        DescriptionParseError, DescriptionReadError, DescriptionWriteError,
+        DependencyField, DescriptionParseError, DescriptionReadError, DescriptionWriteError,
         InitialDescriptionError, NamespaceWriteError, PackageNameDerivationError,
         RepositoriesFromDescriptionError, add_dependencies, derive_package_name,
         initial_description, project_dependencies, read_description, remove_dependencies,
@@ -205,7 +205,10 @@ pub async fn run() -> miette::Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init()?,
-        Commands::Add { packages } => cmd_add(&packages).await?,
+        Commands::Add {
+            packages,
+            dependency_type,
+        } => cmd_add(&packages, dependency_type.into()).await?,
         Commands::Remove { packages } => cmd_remove(&packages).await?,
         Commands::Run { command } => cmd_run(&command).await?,
         Commands::Lock {} => cmd_lock().await?,
@@ -366,7 +369,7 @@ enum AddError {
     Install(#[from] SyncError),
 }
 
-async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
+async fn cmd_add(packages: &[String], dependency_field: DependencyField) -> Result<(), AddError> {
     let current_dir = find_project_root()?;
     let added_relations = packages
         .iter()
@@ -391,7 +394,12 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
     };
     let r_version = r_version_async().await?;
 
-    add_dependencies(&current_dir, &mut description, &added_relations)?;
+    add_dependencies(
+        &current_dir,
+        &mut description,
+        &added_relations,
+        dependency_field,
+    )?;
 
     let desired_roots = project_dependencies(&current_dir, &description)?;
     let (root_name, root_version) = root_package(&current_dir, &description)?;
@@ -514,7 +522,12 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
         });
 
     if final_added_relations != added_relations {
-        add_dependencies(&current_dir, &mut description, &final_added_relations)?;
+        add_dependencies(
+            &current_dir,
+            &mut description,
+            &final_added_relations,
+            dependency_field,
+        )?;
         lockfile.requirements = project_dependencies(&current_dir, &description)?;
     }
 
