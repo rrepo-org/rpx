@@ -4,7 +4,7 @@ use git2::{
     Odb, Oid, ProxyOptions, Reference, RemoteCallbacks, RemoteRedirect, Repository,
     build::CheckoutBuilder,
 };
-use r_description::lossy::{HostedGitRemote, Remote, RemoteSource};
+use r_description::{HostedGitRemote, Remote, RemoteSource};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{self, Write as _},
@@ -121,19 +121,19 @@ impl GitUrl {
     }
 }
 
-impl TryFrom<&Remote> for GitUrl {
+impl TryFrom<Remote> for GitUrl {
     type Error = GitError;
 
-    fn try_from(remote: &Remote) -> Result<Self, Self::Error> {
-        match &remote.source {
+    fn try_from(remote: Remote) -> Result<Self, Self::Error> {
+        match remote.source {
             RemoteSource::GitHub(source) => {
-                Self::from_hosted(remote.host.as_deref(), "github.com", source)
+                Self::from_hosted(remote.host.as_deref(), "github.com", &source)
             }
             RemoteSource::GitLab(source) => {
-                Self::from_hosted(remote.host.as_deref(), "gitlab.com", source)
+                Self::from_hosted(remote.host.as_deref(), "gitlab.com", &source)
             }
             RemoteSource::Bitbucket(source) => {
-                Self::from_hosted(remote.host.as_deref(), "bitbucket.org", source)
+                Self::from_hosted(remote.host.as_deref(), "bitbucket.org", &source)
             }
             RemoteSource::Git(source) => Self::from_generic(&source.url),
             _ => Err(GitError::UnsupportedRemote),
@@ -978,19 +978,15 @@ pub(crate) mod tests {
             .expect("remote should parse");
 
         assert_eq!(
-            GitUrl::try_from(&github)
-                .expect("URL should build")
-                .as_str(),
+            GitUrl::try_from(github).expect("URL should build").as_str(),
             "https://github.com/owner/repository.git"
         );
         assert_eq!(
-            GitUrl::try_from(&gitlab)
-                .expect("URL should build")
-                .as_str(),
+            GitUrl::try_from(gitlab).expect("URL should build").as_str(),
             "https://code.example/group/subgroup/repository.git"
         );
         assert_eq!(
-            GitUrl::try_from(&bitbucket)
+            GitUrl::try_from(bitbucket)
                 .expect("URL should build")
                 .as_str(),
             "https://bitbucket.org/owner/repository.git"
@@ -1005,7 +1001,7 @@ pub(crate) mod tests {
             "git::git@example.com:team/repository.git",
         ] {
             let remote = value.parse::<Remote>().expect("remote should parse");
-            GitUrl::try_from(&remote).expect("Git URL should be accepted");
+            GitUrl::try_from(remote).expect("Git URL should be accepted");
         }
 
         for value in [
@@ -1017,7 +1013,7 @@ pub(crate) mod tests {
             "git::example.com:team/repository.git",
         ] {
             let remote = value.parse::<Remote>().expect("remote should parse");
-            assert!(GitUrl::try_from(&remote).is_err(), "{value} should fail");
+            assert!(GitUrl::try_from(remote).is_err(), "{value} should fail");
         }
     }
 

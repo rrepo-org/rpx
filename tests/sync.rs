@@ -94,6 +94,7 @@ fn runs_rpx_lock_from_current_library() {
 fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync";
+    let working_path = "/tmp/rpx-project-sync/nested";
     create_package_project(&container, project_path);
     let add_command = format!("cd {project_path} && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
@@ -108,7 +109,7 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     let before = read_project_file(&container, project_path, "rpx.lock");
     assert_package_state(&container, project_path, "digest", "FALSE");
 
-    let sync_command = format!("cd {project_path} && rpx sync");
+    let sync_command = format!("mkdir -p {working_path} && cd {working_path} && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 

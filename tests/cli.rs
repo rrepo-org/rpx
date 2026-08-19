@@ -32,6 +32,28 @@ fn runs_rpx_run_with_isolated_library() {
 }
 
 #[test]
+fn run_from_subdirectory_uses_project_library_and_preserves_working_directory() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-subdirectory";
+    let working_path = "/tmp/rpx-project-run-subdirectory/scripts/nested";
+    create_package_project(&container, project_path);
+
+    let command = format!(
+        "mkdir -p {working_path} && cd {working_path} && rpx run Rscript -e \"cat(getwd(), '\\n', .libPaths()[1], sep = '')\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some(working_path), "stdout was: {stdout}");
+    let library = lines.next().expect("library path should be printed");
+    assert!(
+        library.contains("/libraries/") && library.ends_with("/library"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
 fn runs_rpx_init_in_empty_directory() {
     let container = start_container();
     let project_path = "/tmp/new-rpx-project";
@@ -60,22 +82,6 @@ fn runs_rpx_init_in_empty_directory() {
         description.1.contains("Title: New Rpx Project"),
         "DESCRIPTION was: {}",
         description.1
-    );
-}
-
-#[test]
-fn fails_when_description_already_exists() {
-    let container = start_container();
-    let project_path = "/tmp/rpx-project-init-existing";
-    create_package_project(&container, project_path);
-
-    let command = format!("cd {project_path} && rpx init");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
-
-    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(
-        stderr.contains("DESCRIPTION already exists"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
@@ -125,7 +131,8 @@ fn clean_removes_project_library_and_cache_directories() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &check_before_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let clean_command = format!("cd {project_path} && rpx clean");
+    let working_path = "/tmp/rpx-clean/nested";
+    let clean_command = format!("mkdir -p {working_path} && cd {working_path} && rpx clean");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &clean_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(

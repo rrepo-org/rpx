@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "rpx")]
@@ -26,20 +26,6 @@ pub enum Commands {
     )]
     Add {
         #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-
-        #[arg(
             help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
             value_name = "PACKAGE[@CONSTRAINTVERSION]",
             required = true
@@ -52,20 +38,6 @@ pub enum Commands {
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
     Remove {
-        #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-
         #[arg(
             help = "Package names to remove from the project's dependencies",
             value_name = "PACKAGE",
@@ -93,21 +65,7 @@ pub enum Commands {
         about = "Resolve project dependencies",
         long_about = "Resolve project dependencies from DESCRIPTION and write the resolved package set to rpx.lock without installing packages."
     )]
-    Lock {
-        #[arg(
-            long,
-            conflicts_with = "no_default_repo",
-            help = "Use the built-in default repository during resolution"
-        )]
-        default_repo: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "default_repo",
-            help = "Do not use the built-in default repository during resolution"
-        )]
-        no_default_repo: bool,
-    },
+    Lock {},
 
     #[command(
         about = "Check project dependency state",
@@ -141,7 +99,7 @@ pub enum Commands {
     )]
     Clean,
 
-    #[command(about = "Manage additional repositories")]
+    #[command(about = "Manage package repositories")]
     Repo {
         #[command(subcommand)]
         command: RepoCommands,
@@ -150,21 +108,230 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum RepoCommands {
-    #[command(about = "Add an additional repository")]
-    Add {
-        #[arg(help = "Repository base URL", value_name = "URL", required = true)]
-        url: String,
-    },
+    #[command(about = "Add an additional repository (shortcut)")]
+    Add(RepoAdditionalAddArgs),
 
-    #[command(about = "Remove an additional repository")]
-    Remove {
-        #[arg(help = "Repository base URL", value_name = "URL", required = true)]
-        url: String,
-
-        #[arg(long, help = "Also remove any stored API key for this repository")]
-        remove_credential: bool,
-    },
+    #[command(about = "Remove an additional repository (shortcut)")]
+    Remove(RepoAdditionalRemoveArgs),
 
     #[command(about = "List configured repositories")]
-    List,
+    List(RepoListArgs),
+
+    #[command(about = "Manage the base repository")]
+    Base {
+        #[command(subcommand)]
+        command: RepoBaseCommands,
+    },
+
+    #[command(about = "Manage additional repositories")]
+    Additional {
+        #[command(subcommand)]
+        command: RepoAdditionalCommands,
+    },
+
+    #[command(about = "Manage remote package repositories")]
+    Remote {
+        #[command(subcommand)]
+        command: RepoRemoteCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoBaseCommands {
+    #[command(about = "Set the configured base repository")]
+    Set(RepoBaseSetArgs),
+
+    #[command(about = "Reset the configured base repository")]
+    Reset(RepoBaseResetArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoAdditionalCommands {
+    #[command(about = "Add an additional repository")]
+    Add(RepoAdditionalAddArgs),
+
+    #[command(about = "Remove an additional repository")]
+    Remove(RepoAdditionalRemoveArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoRemoteCommands {
+    #[command(about = "Add a remote package repository")]
+    Add(RepoRemoteArgs),
+
+    #[command(about = "Remove a remote package repository")]
+    Remove(RepoRemoteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RepoAdditionalAddArgs {
+    #[arg(help = "Repository base URL", value_name = "URL", required = true)]
+    pub url: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoAdditionalRemoveArgs {
+    #[arg(help = "Repository base URL", value_name = "URL", required = true)]
+    pub url: String,
+
+    #[arg(
+        long,
+        help = "Also remove any stored API key for this repository's origin"
+    )]
+    pub remove_credential: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoListArgs {
+    #[arg(long = "type", value_enum, help = "Show only one repository class")]
+    pub repository_type: Option<RepositoryType>,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoBaseSetArgs {
+    #[arg(help = "Repository base URL", value_name = "URL", required = true)]
+    pub url: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoBaseResetArgs {
+    #[arg(
+        long,
+        help = "Also remove any stored API key for the configured repository's origin"
+    )]
+    pub remove_credential: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RepoRemoteArgs {
+    #[arg(
+        help = "Remote repository specification",
+        value_name = "REMOTE",
+        required = true
+    )]
+    pub remote: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepositoryType {
+    Base,
+    Additional,
+    Remote,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> Commands {
+        Cli::try_parse_from(arguments)
+            .expect("command should parse")
+            .command
+    }
+
+    #[test]
+    fn parses_base_repository_commands() {
+        assert!(matches!(
+            parse(&["rpx", "repo", "base", "set", "https://example.test/cran"]),
+            Commands::Repo {
+                command: RepoCommands::Base {
+                    command: RepoBaseCommands::Set(RepoBaseSetArgs { url })
+                }
+            } if url == "https://example.test/cran"
+        ));
+        assert!(matches!(
+            parse(&["rpx", "repo", "base", "reset", "--remove-credential"]),
+            Commands::Repo {
+                command: RepoCommands::Base {
+                    command: RepoBaseCommands::Reset(RepoBaseResetArgs {
+                        remove_credential: true
+                    })
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_and_shortcut_additional_commands() {
+        for arguments in [
+            vec!["rpx", "repo", "add", "https://example.test/cran"],
+            vec![
+                "rpx",
+                "repo",
+                "additional",
+                "add",
+                "https://example.test/cran",
+            ],
+        ] {
+            assert!(matches!(
+                parse(&arguments),
+                Commands::Repo {
+                    command: RepoCommands::Add(RepoAdditionalAddArgs { url })
+                        | RepoCommands::Additional {
+                            command: RepoAdditionalCommands::Add(RepoAdditionalAddArgs { url })
+                        }
+                } if url == "https://example.test/cran"
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_explicit_and_shortcut_additional_removals() {
+        for arguments in [
+            vec![
+                "rpx",
+                "repo",
+                "remove",
+                "https://example.test/cran",
+                "--remove-credential",
+            ],
+            vec![
+                "rpx",
+                "repo",
+                "additional",
+                "remove",
+                "https://example.test/cran",
+                "--remove-credential",
+            ],
+        ] {
+            assert!(matches!(
+                parse(&arguments),
+                Commands::Repo {
+                    command: RepoCommands::Remove(RepoAdditionalRemoveArgs {
+                        url,
+                        remove_credential: true
+                    }) | RepoCommands::Additional {
+                        command: RepoAdditionalCommands::Remove(RepoAdditionalRemoveArgs {
+                            url,
+                            remove_credential: true
+                        })
+                    }
+                } if url == "https://example.test/cran"
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_remote_repository_commands_without_git_specific_types() {
+        assert!(matches!(
+            parse(&["rpx", "repo", "remote", "add", "github::owner/repository@main"]),
+            Commands::Repo {
+                command: RepoCommands::Remote {
+                    command: RepoRemoteCommands::Add(RepoRemoteArgs { remote })
+                }
+            } if remote == "github::owner/repository@main"
+        ));
+    }
+
+    #[test]
+    fn parses_repository_list_filter() {
+        assert!(matches!(
+            parse(&["rpx", "repo", "list", "--type", "remote"]),
+            Commands::Repo {
+                command: RepoCommands::List(RepoListArgs {
+                    repository_type: Some(RepositoryType::Remote)
+                })
+            }
+        ));
+    }
 }

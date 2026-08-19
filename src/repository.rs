@@ -6,13 +6,12 @@ mod rrepo;
 use crate::http;
 use crate::resolver::PackageVersion;
 use async_trait::async_trait;
-use r_description::lossless::{RDescription, Version};
+use r_description::{PackageError, RDescription, Version, VersionError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
-    env,
     fmt::{Debug, Display},
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -24,24 +23,22 @@ pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
-pub const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
+const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
 
-static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
-    Arc::new(RrepoRepository::new(
-        parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
-            .expect("built-in repository URL should be valid"),
-    ))
+static BUILT_IN_REPOSITORY_URL: LazyLock<Url> = LazyLock::new(|| {
+    parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
+        .expect("built-in repository URL should be valid")
 });
+
+static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> =
+    LazyLock::new(|| Arc::new(RrepoRepository::new(built_in_repository_url().clone())));
+
+pub fn built_in_repository_url() -> &'static Url {
+    &BUILT_IN_REPOSITORY_URL
+}
 
 pub fn built_in_repository() -> Arc<dyn PackageRepository> {
     BUILT_IN_REPOSITORY.clone()
-}
-
-pub(crate) async fn default_repository() -> Result<Arc<dyn PackageRepository>, RepositoryError> {
-    match env::var("RPX_REGISTRY_BASE_URL") {
-        Ok(url) => <dyn PackageRepository>::from_url(&url).await,
-        Err(_) => Ok(built_in_repository()),
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -78,18 +75,22 @@ pub enum RepositoryError {
         source: Arc<std::io::Error>,
     },
 
-    #[error("failed to parse DESCRIPTION {location}: {source}")]
-    Description {
+    #[error("failed to read Package from DESCRIPTION {location}: {source}")]
+    PackageField {
         location: String,
         #[source]
-        source: Arc<r_description::lossless::Error>,
+        source: Arc<PackageError>,
+    },
+
+    #[error("failed to read Version from DESCRIPTION {location}: {source}")]
+    VersionField {
+        location: String,
+        #[source]
+        source: Arc<VersionError>,
     },
 
     #[error("invalid {resource}: {details}")]
     InvalidData { resource: String, details: String },
-
-    #[error("DESCRIPTION at {path} is missing {field}")]
-    MissingField { path: PathBuf, field: &'static str },
 
     #[error("source package does not contain {package}/DESCRIPTION")]
     DescriptionNotFound { package: String },
@@ -107,13 +108,6 @@ pub enum RepositoryError {
         repository: String,
         #[source]
         source: Arc<crate::git::GitError>,
-    },
-
-    #[allow(dead_code)]
-    #[error("DESCRIPTION from {repository} is missing {field}")]
-    MissingRepositoryField {
-        repository: String,
-        field: &'static str,
     },
 
     #[allow(dead_code)]
@@ -157,10 +151,8 @@ impl dyn PackageRepository {
         self.as_any().downcast_ref()
     }
 
-    pub async fn from_url(value: &str) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
-        let value = value.trim();
-        let url = parse_repository_url(value)?;
-
+    pub async fn from_url(url: Url) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+        let value = url.to_string();
         let rrepo_url = url.clone();
         let rrepo_probe = async {
             http::rrepo_repository_packages(&rrepo_url)
@@ -235,7 +227,7 @@ impl dyn PackageRepository {
                         match cran_probe.await {
                             Ok(repository) => Ok(repository),
                             Err(cran_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.to_string(),
+                                url: value.clone(),
                                 rrepo: Box::new(rrepo_error),
                                 cran: Box::new(cran_error),
                             }),
@@ -251,7 +243,7 @@ impl dyn PackageRepository {
                         match rrepo_probe.await {
                             Ok(repository) => Ok(repository),
                             Err(rrepo_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.to_string(),
+                                url: value,
                                 rrepo: Box::new(rrepo_error),
                                 cran: Box::new(cran_error),
                             }),
@@ -329,6 +321,7 @@ impl dyn PackageRepository {
                     source: Arc::new(source),
                 }
             })?;
+            let url = parse_repository_url(url.as_str())?;
             let reference = match repository.reference() {
                 None => crate::lockfile::GitReference::DefaultBranch,
                 Some(reference) if is_commit_reference(reference, commit) => {
@@ -374,7 +367,7 @@ pub fn parse_repository_url(value: &str) -> Result<Url, RepositoryError> {
         value: value.to_string(),
     })?;
     url.path_segments_mut()
-        .map_err(|_| RepositoryError::InvalidUrl {
+        .map_err(|()| RepositoryError::InvalidUrl {
             value: value.to_string(),
         })?
         .pop_if_empty();
@@ -388,3 +381,25 @@ impl PartialEq for dyn PackageRepository {
 }
 
 impl Eq for dyn PackageRepository {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_canonical_repository_urls() {
+        assert_eq!(
+            parse_repository_url("  https://example.test/cran/  ")
+                .unwrap()
+                .as_str(),
+            "https://example.test/cran"
+        );
+        assert_eq!(
+            parse_repository_url("https://example.test/")
+                .unwrap()
+                .as_str(),
+            "https://example.test/"
+        );
+        assert!(parse_repository_url("mailto:packages@example.test").is_err());
+    }
+}

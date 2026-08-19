@@ -661,24 +661,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "deb822-derive"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83ef29a094bcb2b7dd0f609ace7f5a34ef9a62e0731ebd350637640320a3b15"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "deb822-fast"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "114c474fa4cd5d6d24bb5e68b36fa4ef70f5b830e3cc14a9b66a12e71a15aeb9"
-dependencies = [
- "deb822-derive",
-]
 
 [[package]]
 name = "deb822-lossless"
@@ -2184,15 +2170,13 @@ dependencies = [
 
 [[package]]
 name = "r-description-scalerail"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09fa1e2305a668f735fdec43415466e1390bd59714bd73c08aeeccc18317eb96"
+checksum = "6f006966a03fb5d072d8bf4355aa28349624047b6520e8172c4dc553a8a0c233"
 dependencies = [
- "deb822-derive",
- "deb822-fast",
  "deb822-lossless",
  "rowan",
- "serde",
+ "thiserror",
  "url",
 ]
 
@@ -2481,7 +2465,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "strsim",
  "tar",
  "testcontainers",
  "thiserror",

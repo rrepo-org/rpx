@@ -2,7 +2,7 @@ use super::{PackageRepository, RepositoryError};
 use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use moka::future::Cache;
-use r_description::lossless::{RDescription, Version};
+use r_description::{RDescription, Version};
 use reqwest::Url;
 use std::{
     any::Any,
@@ -25,11 +25,7 @@ impl std::fmt::Display for RrepoRepository {
 }
 
 impl RrepoRepository {
-    pub fn new(mut url: Url) -> Self {
-        url.path_segments_mut()
-            .expect("repository base URL should support path segments")
-            .pop_if_empty();
-
+    pub fn new(url: Url) -> Self {
         Self {
             url,
             packages: Cache::new(1),
@@ -131,13 +127,13 @@ impl PackageRepository for RrepoRepository {
                     .versions
                     .into_iter()
                     .map(|summary| {
-                        summary.version.parse::<Version>().map_err(|details| {
+                        summary.version.parse::<Version>().map_err(|source| {
                             RepositoryError::InvalidData {
                                 resource: format!(
                                     "package version {} for {package}",
                                     summary.version
                                 ),
-                                details,
+                                details: source.to_string(),
                             }
                         })
                     })
@@ -169,7 +165,7 @@ impl PackageRepository for RrepoRepository {
         self.descriptions
             .try_get_with(key, async {
                 let description =
-                    http::rrepo_package_description(&self.url, package, &version.to_string())
+                    http::rrepo_package_description(&self.url, package, version.as_ref())
                         .await
                         .map_err(|source| RepositoryError::Request {
                             source: Arc::new(source),
@@ -182,12 +178,8 @@ impl PackageRepository for RrepoRepository {
                         .await
                         .map_err(|source| RepositoryError::Response {
                             source: Arc::new(source),
-                        })?
-                        .parse::<RDescription>()
-                        .map_err(|source| RepositoryError::Description {
-                            location: format!("for {package} {version}"),
-                            source: Arc::new(source),
                         })?;
+                let description = RDescription::parse(&description);
 
                 tracing::trace!(
                     package,
