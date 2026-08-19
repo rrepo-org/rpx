@@ -25,11 +25,7 @@ impl std::fmt::Display for RrepoRepository {
 }
 
 impl RrepoRepository {
-    pub fn new(mut url: Url) -> Self {
-        url.path_segments_mut()
-            .expect("repository base URL should support path segments")
-            .pop_if_empty();
-
+    pub fn new(url: Url) -> Self {
         Self {
             url,
             packages: Cache::new(1),

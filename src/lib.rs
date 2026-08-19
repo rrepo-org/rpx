@@ -2,7 +2,7 @@ use clap::Parser;
 use futures_util::StreamExt;
 use miette::Diagnostic;
 use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
-use r_description::{RDescription, Relation, UrlMutationError, Version, VersionRequirement};
+use r_description::{RDescription, Relation, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -32,6 +32,7 @@ use tracing_subscriber::{
 
 mod cache;
 mod cli;
+mod commands;
 mod description;
 mod git;
 mod http;
@@ -44,7 +45,8 @@ mod resolver;
 mod sysreqs;
 mod ui;
 
-use cli::{Cli, Commands, RepoCommands};
+use cli::{Cli, Commands};
+use commands::repo;
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
     LockedResolutionError, LockedResolutionFailure, RequiredPackages, artifact_cache_path,
@@ -66,21 +68,23 @@ use ui::SystemDepsUi;
 use crate::{
     cache::CompiledPackageCacheKey,
     description::{
-        DescriptionParseError, DescriptionReadError, DescriptionWriteError, InitialDescriptionError,
-        NamespaceWriteError, PackageNameDerivationError, RepositoriesFromDescriptionError,
-        add_dependencies, additional_repositories, derive_package_name, initial_description,
-        project_dependencies, read_description, remove_dependencies,
+        DescriptionParseError, DescriptionReadError, DescriptionWriteError,
+        InitialDescriptionError, NamespaceWriteError, PackageNameDerivationError,
+        RepositoriesFromDescriptionError, add_dependencies, derive_package_name,
+        initial_description, project_dependencies, read_description, remove_dependencies,
         repositories_from_description, root_package, write_description, write_namespace_if_missing,
     },
     lockfile::{Lockfile, LockfileReadError, LockfileWriteError, read_lockfile, write_lockfile},
     project::{
-        LockedPackagesError, ProjectDiscoveryError, required_packages_from_lockfile,
-        validate_locked_resolution,
+        LockedPackagesError, ProjectDiscoveryError, find_project_root,
+        required_packages_from_lockfile, validate_locked_resolution,
     },
-    r::{BasePackagesError, RVersionError, RVirtualEnv, r_version_async, remove_packages_from_venv},
+    r::{
+        BasePackagesError, RVersionError, RVirtualEnv, r_version_async, remove_packages_from_venv,
+    },
     repository::{
         CranRepository, GitRepository, LocalRepository, PackageRepository, RepositoryError,
-        RrepoRepository, parse_repository_url,
+        RrepoRepository,
     },
     resolver::PackageVersion,
 };
@@ -88,176 +92,11 @@ use crate::{
 const SYNC_SHARED_WORKERS: usize = 50;
 const SYNC_INSTALL_WORKERS: usize = 8;
 
-#[derive(Debug, Error, Diagnostic)]
-enum RpxError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ProjectDiscovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Init(#[from] InitError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Repo(#[from] RepoError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Add(#[from] AddError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Remove(#[from] RemoveError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Run(#[from] RunError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lock(#[from] LockError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Sync(Box<SyncError>),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Clean(#[from] CleanError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    R(#[from] r::RError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Status(#[from] StatusError),
-}
-
 #[derive(Debug)]
 struct PackageVersionMismatch {
     package: String,
     installed: Version,
     expected: Version,
-}
-
-#[derive(Debug, Default)]
-struct StatusMismatches {
-    missing_packages: Vec<String>,
-    extra_packages: Vec<String>,
-    version_mismatches: Vec<PackageVersionMismatch>,
-    missing_system_packages: Vec<String>,
-    unsupported_system_rules: Vec<String>,
-}
-
-impl StatusMismatches {
-    fn is_empty(&self) -> bool {
-        self.missing_packages.is_empty()
-            && self.extra_packages.is_empty()
-            && self.version_mismatches.is_empty()
-            && self.missing_system_packages.is_empty()
-            && self.unsupported_system_rules.is_empty()
-    }
-}
-
-impl std::fmt::Display for StatusMismatches {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut groups = Vec::new();
-        if !self.missing_packages.is_empty() {
-            groups.push(format!(
-                "Required packages not installed:\n- {}",
-                self.missing_packages.join("\n- ")
-            ));
-        }
-        if !self.extra_packages.is_empty() {
-            groups.push(format!(
-                "Unexpected packages installed:\n- {}",
-                self.extra_packages.join("\n- ")
-            ));
-        }
-        if !self.version_mismatches.is_empty() {
-            let mismatches = self
-                .version_mismatches
-                .iter()
-                .map(|mismatch| {
-                    format!(
-                        "{} ({} installed, {} expected)",
-                        mismatch.package, mismatch.installed, mismatch.expected
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n- ");
-            groups.push(format!(
-                "Installed versions that differ from expected versions:\n- {mismatches}"
-            ));
-        }
-        if !self.missing_system_packages.is_empty() {
-            groups.push(format!(
-                "Missing system packages for this host:\n- {}",
-                self.missing_system_packages.join("\n- ")
-            ));
-        }
-        if !self.unsupported_system_rules.is_empty() {
-            groups.push(format!(
-                "System requirement rules without a host mapping:\n- {}",
-                self.unsupported_system_rules.join("\n- ")
-            ));
-        }
-
-        formatter.write_str(&groups.join("\n\n"))
-    }
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum StatusError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::status::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    BasePackages(#[from] BasePackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    InstalledPackages(#[from] r::InstalledPackagesError),
-
-    #[error("project is out of sync\n\n{mismatches}")]
-    #[diagnostic(
-        code(rpx::status::out_of_sync),
-        help("Run `rpx sync` to synchronize the project.")
-    )]
-    OutOfSync { mismatches: StatusMismatches },
-}
-
-impl From<SyncError> for RpxError {
-    fn from(error: SyncError) -> Self {
-        Self::Sync(Box::new(error))
-    }
 }
 
 fn lock_error_from_resolution(error: ResolutionError) -> LockError {
@@ -360,7 +199,25 @@ enum RpxWarning {
 ///
 /// Returns an error when command execution or diagnostic rendering fails.
 pub async fn run() -> miette::Result<()> {
-    run_inner().await?;
+    init_tracing();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Init => cmd_init()?,
+        Commands::Add { packages } => cmd_add(&packages).await?,
+        Commands::Remove { packages } => cmd_remove(&packages).await?,
+        Commands::Run { command } => cmd_run(&command).await?,
+        Commands::Lock {} => cmd_lock().await?,
+        Commands::Status => cmd_status().await?,
+        Commands::Sync {
+            install_system,
+            install_only_system,
+        } => cmd_sync(install_system, install_only_system).await?,
+        Commands::Clean => cmd_clean()?,
+        Commands::Repo { command } => repo::run(command).await?,
+    }
+
     Ok(())
 }
 
@@ -397,41 +254,6 @@ fn progress_bar_style() -> ProgressStyle {
         "{span_child_prefix}{spinner} {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes}",
     )
     .expect("progress bar style should be valid")
-}
-
-async fn run_inner() -> Result<(), RpxError> {
-    init_tracing();
-
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Init => cmd_init()?,
-        Commands::Add { packages } => cmd_add(&packages).await?,
-        Commands::Remove { packages } => cmd_remove(&packages).await?,
-        Commands::Run { command } => cmd_run(&command).await?,
-        Commands::Lock {} => cmd_lock().await?,
-        Commands::Status => cmd_status().await?,
-        Commands::Sync {
-            install_system,
-            install_only_system,
-        } => cmd_sync(install_system, install_only_system).await?,
-        Commands::Clean => cmd_clean()?,
-        Commands::Repo {
-            command: RepoCommands::Add { url },
-        } => cmd_repo_add(&url).await?,
-        Commands::Repo {
-            command:
-                RepoCommands::Remove {
-                    url,
-                    remove_credential,
-                },
-        } => cmd_repo_remove(&url, remove_credential).await?,
-        Commands::Repo {
-            command: RepoCommands::List,
-        } => cmd_repo_list().await?,
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -480,12 +302,9 @@ fn cmd_init() -> Result<(), InitError> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum AddError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::add::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -548,6 +367,7 @@ enum AddError {
 }
 
 async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
+    let current_dir = find_project_root()?;
     let added_relations = packages
         .iter()
         .map(|package| parse_add_package(package))
@@ -557,9 +377,6 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
         .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
         .map(|relation| relation.package().to_string())
         .collect::<BTreeSet<_>>();
-
-    let current_dir =
-        env::current_dir().map_err(|source| AddError::WorkingDirectoryUnavailable { source })?;
 
     let mut description = read_description(&current_dir)?;
     let old_lockfile = match read_lockfile(&current_dir) {
@@ -732,12 +549,9 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum RemoveError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::remove::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -796,9 +610,7 @@ enum RemoveError {
 }
 
 async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
-    let current_dir =
-        env::current_dir().map_err(|source| RemoveError::WorkingDirectoryUnavailable { source })?;
-
+    let current_dir = find_project_root()?;
     let mut description = read_description(&current_dir)?;
     let old_lockfile = match read_lockfile(&current_dir) {
         Ok(lockfile) => Some(lockfile),
@@ -931,7 +743,6 @@ async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
 
     sync_packages(&project_library, resolved, installed, &r_version).await?;
 
-
     if let Some(removed) = removed.into_iter().reduce(|mut packages, package| {
         packages.push_str(", ");
         packages.push_str(&package);
@@ -953,314 +764,10 @@ async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-enum RepoError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::repo::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionWrite(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error("failed to update Additional_repositories: {source}")]
-    #[diagnostic(code(rpx::repo::description_update_failed))]
-    DescriptionMutation {
-        #[source]
-        source: UrlMutationError,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lock(#[from] LockError),
-
-    #[error("failed to add repository {url}: {source}")]
-    #[diagnostic(code(rpx::repo::add_failed))]
-    Add {
-        url: String,
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("failed to remove repository {url}: {source}")]
-    #[diagnostic(code(rpx::repo::remove_failed))]
-    Remove {
-        url: String,
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("failed to remove repository credential: {details}")]
-    #[diagnostic(code(rpx::repo::credential_remove_failed))]
-    CredentialRemove { details: String },
-
-    #[error("failed to inspect repository credential: {details}")]
-    #[diagnostic(code(rpx::repo::credential_inspect_failed))]
-    CredentialInspect { details: String },
-}
-
-
-async fn cmd_repo_add(url: &str) -> Result<(), RepoError> {
-    let current_dir =
-        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
-    let mut description = read_description(&current_dir)?;
-    let new_repo_url = parse_repository_url(url).map_err(|source| RepoError::Add {
-        url: url.trim().to_string(),
-        source,
-    })?;
-
-    let mut additional_repositories = additional_repositories(&current_dir, &description)?;
-    if additional_repositories.iter().any(|existing| {
-        parse_repository_url(existing.as_str()).is_ok_and(|url| url == new_repo_url)
-    }) {
-        status(format_args!(
-            "Repository already configured: {}",
-            new_repo_url.as_str()
-        ));
-        return Ok(());
-    }
-
-    additional_repositories.push(new_repo_url.clone());
-    description
-        .set_additional_repositories(additional_repositories)
-        .map_err(|source| RepoError::DescriptionMutation {
-            source,
-        })?;
-
-    let old_lockfile = match read_lockfile(&current_dir) {
-        Ok(lockfile) => Some(lockfile),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(source.into()),
-    };
-    let r_version = r_version_async().await?;
-    let roots = project_dependencies(&current_dir, &description)?;
-    let repositories = repositories_from_description(&current_dir, &description)
-        .await
-        .map_err(LockError::from)?;
-    let preferred_versions = old_lockfile
-        .as_ref()
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected)
-        .await
-        .map_err(|source| LockError::PackageMetadata { source })?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
-
-    write_description(&current_dir, &description)?;
-    write_lockfile(&current_dir, &lockfile)?;
-    status(format_args!("Added repository {new_repo_url}"));
-    Ok(())
-}
-
-async fn cmd_repo_remove(url: &str, remove_credential: bool) -> Result<(), RepoError> {
-    let current_dir =
-        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
-    let mut description = read_description(&current_dir)?;
-    let base_url = parse_repository_url(url).map_err(|source| RepoError::Remove {
-        url: url.trim().to_string(),
-        source,
-    })?;
-    let normalized_url = base_url.to_string();
-
-    let mut additional_repositories = additional_repositories(&current_dir, &description)?;
-    let previous_len = additional_repositories.len();
-    additional_repositories.retain(|existing| {
-        parse_repository_url(existing.as_str()).map_or(true, |existing| existing != base_url)
-    });
-
-    if additional_repositories.len() == previous_len {
-        if remove_credential {
-            http::remove_stored_credential(&base_url).map_err(|error| {
-                RepoError::CredentialRemove {
-                    details: error.to_string(),
-                }
-            })?;
-            status(format_args!(
-                "Removed stored credential for {normalized_url}"
-            ));
-        }
-        status(format_args!("Repository not configured: {normalized_url}"));
-        return Ok(());
-    }
-
-    description
-        .set_additional_repositories(additional_repositories)
-        .map_err(|source| RepoError::DescriptionMutation {
-            source,
-        })?;
-
-    let old_lockfile = match read_lockfile(&current_dir) {
-        Ok(lockfile) => Some(lockfile),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(source.into()),
-    };
-    let r_version = r_version_async().await?;
-    let roots = project_dependencies(&current_dir, &description)?;
-    let repositories = repositories_from_description(&current_dir, &description)
-        .await
-        .map_err(LockError::from)?;
-    let preferred_versions = old_lockfile
-        .as_ref()
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected)
-        .await
-        .map_err(|source| LockError::PackageMetadata { source })?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
-
-    write_description(&current_dir, &description)?;
-    write_lockfile(&current_dir, &lockfile)?;
-
-    if remove_credential {
-        http::remove_stored_credential(&base_url).map_err(|error| RepoError::CredentialRemove {
-            details: error.to_string(),
-        })?;
-    }
-
-    status(format_args!("Removed repository {normalized_url}"));
-    Ok(())
-}
-
-async fn cmd_repo_list() -> Result<(), RepoError> {
-    let current_dir =
-        env::current_dir().map_err(|source| RepoError::WorkingDirectoryUnavailable { source })?;
-    let description = read_description(&current_dir)?;
-    let lockfile = read_lockfile(&current_dir)?;
-    let r_version = r_version_async().await?;
-    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
-
-    if lockfile.repos.is_empty() {
-        status("No repositories configured");
-        return Ok(());
-    }
-
-    lockfile.repos.iter().try_for_each(|repository| {
-        let url = repository.url();
-        let kind = match repository {
-            lockfile::Repository::Rrepo { .. } => "rrepo",
-            lockfile::Repository::CranLike { .. } => "CRAN-like",
-            lockfile::Repository::Git { .. } => {
-                status(format_args!("{url} [Git]"));
-                return Ok(());
-            }
-        };
-        let credential =
-            http::has_stored_credential(url).map_err(|error| RepoError::CredentialInspect {
-                details: error.to_string(),
-            })?;
-        status(format_args!(
-            "{url} [{kind}; {}]",
-            if credential {
-                "credential stored"
-            } else {
-                "no credential"
-            }
-        ));
-
-        Ok(())
-    })
-}
-
-#[derive(Debug, Error, Diagnostic)]
 enum RunError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::run::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error("failed to run {program}")]
     #[diagnostic(code(rpx::run::command_failed))]
@@ -1271,14 +778,12 @@ enum RunError {
     },
 }
 
-
 async fn cmd_run(command: &[String]) -> Result<(), RunError> {
+    let project_path = find_project_root()?;
     let (program, args) = command
         .split_first()
         .expect("run command requires at least one argument");
-    let current_dir =
-        env::current_dir().map_err(|source| RunError::WorkingDirectoryUnavailable { source })?;
-    let project_library = project_library_path(&current_dir);
+    let project_library = project_library_path(&project_path);
 
     let status = Command::with_venv(program, &project_library)
         .args(args)
@@ -1295,12 +800,9 @@ async fn cmd_run(command: &[String]) -> Result<(), RunError> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum LockError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::lock::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -1390,11 +892,53 @@ enum LockError {
     },
 }
 
+async fn resolve_lockfile_for_description(
+    current_dir: &Path,
+    description: &RDescription,
+    old_lockfile: Option<&Lockfile>,
+) -> Result<Lockfile, LockError> {
+    let r_version = r_version_async().await?;
+    let roots = project_dependencies(current_dir, description)?;
+    let repositories = repositories_from_description(current_dir, description).await?;
+    let preferred_versions = old_lockfile
+        .map(|lockfile| {
+            lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let root = Arc::new(
+        LocalRepository::new(current_dir.to_path_buf()).with_description(description.clone()),
+    );
+    let selected = resolve_from_registry(
+        repositories.clone(),
+        Arc::clone(&root),
+        roots.clone(),
+        preferred_versions,
+    )
+    .await
+    .map_err(lock_error_from_resolution)?;
+    let resolved = hydrate_resolved_packages(selected).await?;
+    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile).await;
+    lockfile_from_resolution(
+        roots,
+        &resolved
+            .iter()
+            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
+            .map(|(name, package)| (name.clone(), package.clone()))
+            .collect::<RequiredPackages>(),
+        &sysreq_db,
+        &repositories,
+        &r_version,
+    )
+    .await
+}
 
 async fn cmd_lock() -> Result<(), LockError> {
-    let current_dir =
-        env::current_dir().map_err(|source| LockError::WorkingDirectoryUnavailable { source })?;
-
+    let current_dir = find_project_root()?;
     let description = read_description(&current_dir)?;
     let old_lockfile = match read_lockfile(&current_dir) {
         Ok(lockfile) => Some(lockfile),
@@ -1406,44 +950,8 @@ async fn cmd_lock() -> Result<(), LockError> {
         Err(LockfileReadError::OutdatedLockfile { .. }) => None,
         Err(source) => return Err(source.into()),
     };
-    let r_version = r_version_async().await?;
-    let roots = project_dependencies(&current_dir, &description)?;
-    let repositories = repositories_from_description(&current_dir, &description).await?;
-    let preferred_versions = old_lockfile
-        .as_ref()
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected).await?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
+    let lockfile =
+        resolve_lockfile_for_description(&current_dir, &description, old_lockfile.as_ref()).await?;
     let changed = old_lockfile.as_ref() != Some(&lockfile);
     write_lockfile(&current_dir, &lockfile)?;
 
@@ -1457,12 +965,9 @@ async fn cmd_lock() -> Result<(), LockError> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum SyncError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::sync::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -1530,11 +1035,8 @@ enum SyncError {
     },
 }
 
-
 async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), SyncError> {
-    let current_dir =
-        env::current_dir().map_err(|source| SyncError::WorkingDirectoryUnavailable { source })?;
-
+    let current_dir = find_project_root()?;
     let description = read_description(&current_dir)?;
     let lockfile = read_lockfile(&current_dir)?;
     let r_version = r_version_async().await?;
@@ -1564,10 +1066,117 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
     Ok(())
 }
 
-async fn cmd_status() -> Result<(), StatusError> {
-    let current_dir =
-        env::current_dir().map_err(|source| StatusError::WorkingDirectoryUnavailable { source })?;
+#[derive(Debug, Default)]
+struct StatusMismatches {
+    missing_packages: Vec<String>,
+    extra_packages: Vec<String>,
+    version_mismatches: Vec<PackageVersionMismatch>,
+    missing_system_packages: Vec<String>,
+    unsupported_system_rules: Vec<String>,
+}
 
+impl StatusMismatches {
+    fn is_empty(&self) -> bool {
+        self.missing_packages.is_empty()
+            && self.extra_packages.is_empty()
+            && self.version_mismatches.is_empty()
+            && self.missing_system_packages.is_empty()
+            && self.unsupported_system_rules.is_empty()
+    }
+}
+
+impl std::fmt::Display for StatusMismatches {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut groups = Vec::new();
+        if !self.missing_packages.is_empty() {
+            groups.push(format!(
+                "Required packages not installed:\n- {}",
+                self.missing_packages.join("\n- ")
+            ));
+        }
+        if !self.extra_packages.is_empty() {
+            groups.push(format!(
+                "Unexpected packages installed:\n- {}",
+                self.extra_packages.join("\n- ")
+            ));
+        }
+        if !self.version_mismatches.is_empty() {
+            let mismatches = self
+                .version_mismatches
+                .iter()
+                .map(|mismatch| {
+                    format!(
+                        "{} ({} installed, {} expected)",
+                        mismatch.package, mismatch.installed, mismatch.expected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            groups.push(format!(
+                "Installed versions that differ from expected versions:\n- {mismatches}"
+            ));
+        }
+        if !self.missing_system_packages.is_empty() {
+            groups.push(format!(
+                "Missing system packages for this host:\n- {}",
+                self.missing_system_packages.join("\n- ")
+            ));
+        }
+        if !self.unsupported_system_rules.is_empty() {
+            groups.push(format!(
+                "System requirement rules without a host mapping:\n- {}",
+                self.unsupported_system_rules.join("\n- ")
+            ));
+        }
+
+        formatter.write_str(&groups.join("\n\n"))
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum StatusError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
+    #[error("project is out of sync\n\n{mismatches}")]
+    #[diagnostic(
+        code(rpx::status::out_of_sync),
+        help("Run `rpx sync` to synchronize the project.")
+    )]
+    OutOfSync { mismatches: StatusMismatches },
+}
+
+async fn cmd_status() -> Result<(), StatusError> {
+    let current_dir = find_project_root()?;
     let description = read_description(&current_dir)?;
     let lockfile = read_lockfile(&current_dir)?;
     let r_version = r_version_async().await?;
@@ -1635,12 +1244,9 @@ async fn cmd_status() -> Result<(), StatusError> {
 
 #[derive(Debug, Error, Diagnostic)]
 enum CleanError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::clean::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectDiscovery(#[from] ProjectDiscoveryError),
 
     #[error("failed to remove {label} at {path}")]
     #[diagnostic(code(rpx::clean::remove_failed))]
@@ -1653,14 +1259,11 @@ enum CleanError {
 }
 
 fn cmd_clean() -> Result<(), CleanError> {
-    let current_dir =
-        env::current_dir().map_err(|source| CleanError::WorkingDirectoryUnavailable { source })?;
+    let current_dir = find_project_root()?;
     let mut removed_any = false;
 
-    removed_any |= remove_dir_if_exists(
-        &project_library_root_path(&current_dir),
-        "project library",
-    )?;
+    removed_any |=
+        remove_dir_if_exists(&project_library_root_path(&current_dir), "project library")?;
     removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory")?;
 
     if removed_any {

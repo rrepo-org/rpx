@@ -268,15 +268,6 @@ fn set_bearer_token(request: &mut reqwest::Request, token: &str) -> reqwest_midd
     Ok(())
 }
 
-pub fn has_stored_credential(base_url: &reqwest::Url) -> Result<bool, AuthError> {
-    let Some(scope) = AuthScope::from_url(base_url) else {
-        return Ok(false);
-    };
-    KeyringCredentialStore
-        .get(&scope)
-        .map(|token| token.is_some())
-}
-
 pub fn remove_stored_credential(base_url: &reqwest::Url) -> Result<(), AuthError> {
     let Some(scope) = AuthScope::from_url(base_url) else {
         return Ok(());

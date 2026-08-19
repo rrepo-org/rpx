@@ -152,29 +152,6 @@ pub enum PackageRemovalError {
     },
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum RError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Install(#[from] PackageInstallError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    InstalledPackages(#[from] InstalledPackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    BasePackages(#[from] BasePackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Version(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Remove(#[from] PackageRemovalError),
-}
-
 pub(crate) trait RVirtualEnv {
     fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self;
 }

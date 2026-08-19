@@ -23,14 +23,19 @@ pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
-pub const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
+const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
 
-static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
-    Arc::new(RrepoRepository::new(
-        parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
-            .expect("built-in repository URL should be valid"),
-    ))
+static BUILT_IN_REPOSITORY_URL: LazyLock<Url> = LazyLock::new(|| {
+    parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
+        .expect("built-in repository URL should be valid")
 });
+
+static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> =
+    LazyLock::new(|| Arc::new(RrepoRepository::new(built_in_repository_url().clone())));
+
+pub fn built_in_repository_url() -> &'static Url {
+    &BUILT_IN_REPOSITORY_URL
+}
 
 pub fn built_in_repository() -> Arc<dyn PackageRepository> {
     BUILT_IN_REPOSITORY.clone()
@@ -146,10 +151,8 @@ impl dyn PackageRepository {
         self.as_any().downcast_ref()
     }
 
-    pub async fn from_url(value: &str) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
-        let value = value.trim();
-        let url = parse_repository_url(value)?;
-
+    pub async fn from_url(url: Url) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+        let value = url.to_string();
         let rrepo_url = url.clone();
         let rrepo_probe = async {
             http::rrepo_repository_packages(&rrepo_url)
@@ -224,7 +227,7 @@ impl dyn PackageRepository {
                         match cran_probe.await {
                             Ok(repository) => Ok(repository),
                             Err(cran_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.to_string(),
+                                url: value.clone(),
                                 rrepo: Box::new(rrepo_error),
                                 cran: Box::new(cran_error),
                             }),
@@ -240,7 +243,7 @@ impl dyn PackageRepository {
                         match rrepo_probe.await {
                             Ok(repository) => Ok(repository),
                             Err(rrepo_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.to_string(),
+                                url: value,
                                 rrepo: Box::new(rrepo_error),
                                 cran: Box::new(cran_error),
                             }),
@@ -318,6 +321,7 @@ impl dyn PackageRepository {
                     source: Arc::new(source),
                 }
             })?;
+            let url = parse_repository_url(url.as_str())?;
             let reference = match repository.reference() {
                 None => crate::lockfile::GitReference::DefaultBranch,
                 Some(reference) if is_commit_reference(reference, commit) => {
@@ -377,3 +381,25 @@ impl PartialEq for dyn PackageRepository {
 }
 
 impl Eq for dyn PackageRepository {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_canonical_repository_urls() {
+        assert_eq!(
+            parse_repository_url("  https://example.test/cran/  ")
+                .unwrap()
+                .as_str(),
+            "https://example.test/cran"
+        );
+        assert_eq!(
+            parse_repository_url("https://example.test/")
+                .unwrap()
+                .as_str(),
+            "https://example.test/"
+        );
+        assert!(parse_repository_url("mailto:packages@example.test").is_err());
+    }
+}

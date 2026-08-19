@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::{
     description::{
-        ConfiguredRepositoriesError, ConfiguredRepository, DESCRIPTION_NAME, DescriptionParseError,
-        configured_repositories, project_dependencies,
+        ConfiguredRepository, DESCRIPTION_NAME, DescriptionParseError, configured_repositories,
+        project_dependencies,
     },
     lockfile::{self, LOCKFILE_NAME, Lockfile},
     repository::{GitRepository, PackageRepository, RepositoryError},
@@ -174,10 +174,6 @@ pub enum LockedResolutionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Parse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Repositories(#[from] ConfiguredRepositoriesError),
 
     #[error("rpx.lock does not match the current project configuration")]
     #[diagnostic(

@@ -1,12 +1,11 @@
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use r_description::{
     AdditionalRepositoriesError, DependsError, FieldMutationError, ImportsError, LinkingToError,
-    PackageError, RDescription, Relation, Remote, RemoteSource, RemotesError, SuggestsError, Url,
-    Version, VersionError,
+    PackageError, RDescription, Relation, Remote, RemoteMutationError, RemoteSource, RemotesError,
+    SuggestsError, Url, UrlMutationError, Version, VersionError,
 };
 use std::{
     collections::BTreeSet,
-    env,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,7 +13,8 @@ use std::{
 use thiserror::Error;
 
 use crate::repository::{
-    BUILT_IN_REPOSITORY_BASE_URL, GitRepository, PackageRepository, RepositoryError,
+    GitRepository, PackageRepository, RepositoryError, built_in_repository_url,
+    parse_repository_url,
 };
 
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
@@ -94,7 +94,6 @@ impl DescriptionParseIssue {
         }
     }
 }
-
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum DescriptionReadError {
@@ -867,7 +866,16 @@ pub(crate) fn additional_repositories(
 ) -> Result<Vec<Url>, DescriptionParseError> {
     description
         .additional_repositories()
-        .map(|repositories| repositories.collect())
+        .map(|repositories| {
+            repositories
+                .map(|mut repository| {
+                    if let Ok(mut segments) = repository.path_segments_mut() {
+                        segments.pop_if_empty();
+                    }
+                    repository
+                })
+                .collect()
+        })
         .map_err(|source| {
             let issues = match &source {
                 AdditionalRepositoriesError::Invalid(occurrences) => occurrences
@@ -905,19 +913,15 @@ pub fn base_repository(
 
                 if duplicate {
                     issues.push(DescriptionParseIssue::Positioned {
-                        error: "Config/rpx/base-repository field is declared multiple times"
-                            .into(),
+                        error: "Config/rpx/base-repository field is declared multiple times".into(),
                         span: span.clone().into(),
                     });
                 }
 
-                match Url::parse(value.value()) {
+                match parse_repository_url(value.value()) {
                     Ok(url) => repository = Some(url),
                     Err(source) => issues.push(DescriptionParseIssue::Positioned {
-                        error: format!(
-                            "Config/rpx/base-repository contains an invalid URL: {source}"
-                        )
-                        .into(),
+                        error: Box::new(source),
                         span: span.into(),
                     }),
                 }
@@ -943,6 +947,99 @@ pub fn set_base_repository(
     description.set_field(BASE_REPOSITORY_FIELD, repository.as_str())
 }
 
+pub fn reset_base_repository(description: &mut RDescription) {
+    description.remove_field(BASE_REPOSITORY_FIELD);
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum RepositoryMutationError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Description(#[from] DescriptionParseError),
+
+    #[error("failed to update Additional_repositories: {source}")]
+    #[diagnostic(code(rpx::description::additional_repositories_update_failed))]
+    Additional {
+        #[from]
+        source: UrlMutationError,
+    },
+
+    #[error("failed to update Remotes: {source}")]
+    #[diagnostic(code(rpx::description::remotes_update_failed))]
+    Remote {
+        #[from]
+        source: RemoteMutationError,
+    },
+}
+
+pub fn add_additional_repository(
+    path: &Path,
+    description: &mut RDescription,
+    repository: Url,
+) -> Result<bool, RepositoryMutationError> {
+    let mut repositories = additional_repositories(path, description)?;
+    if repositories.contains(&repository) {
+        return Ok(false);
+    }
+
+    repositories.push(repository);
+    description.set_additional_repositories(repositories)?;
+    Ok(true)
+}
+
+pub fn remove_additional_repository(
+    path: &Path,
+    description: &mut RDescription,
+    repository: &Url,
+) -> Result<bool, RepositoryMutationError> {
+    let mut repositories = additional_repositories(path, description)?;
+    let previous_len = repositories.len();
+    repositories.retain(|existing| existing != repository);
+    if repositories.len() == previous_len {
+        return Ok(false);
+    }
+
+    description.set_additional_repositories(repositories)?;
+    Ok(true)
+}
+
+pub fn add_remote_repository(
+    path: &Path,
+    description: &mut RDescription,
+    remote: Remote,
+) -> Result<bool, RepositoryMutationError> {
+    let mut configured = remotes(path, description)?;
+    if configured.contains(&remote) {
+        return Ok(false);
+    }
+
+    configured.push(remote);
+    let mut updated = description.clone();
+    updated.set_remotes(configured)?;
+    remotes(path, &updated)?;
+    *description = updated;
+    Ok(true)
+}
+
+pub fn remove_remote_repository(
+    path: &Path,
+    description: &mut RDescription,
+    remote: &Remote,
+) -> Result<bool, RepositoryMutationError> {
+    let mut configured = remotes(path, description)?;
+    let previous_len = configured.len();
+    configured.retain(|existing| existing != remote);
+    if configured.len() == previous_len {
+        return Ok(false);
+    }
+
+    let mut updated = description.clone();
+    updated.set_remotes(configured)?;
+    remotes(path, &updated)?;
+    *description = updated;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfiguredRepository {
     Base(Url),
@@ -950,55 +1047,24 @@ pub enum ConfiguredRepository {
     Additional(Url),
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum ConfiguredRepositoriesError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Description(#[from] DescriptionParseError),
-
-    #[error("RPX_REGISTRY_BASE_URL contains an invalid URL: {source}")]
-    #[diagnostic(code(rpx::description::invalid_base_repository_environment))]
-    InvalidEnvironmentUrl {
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error("RPX_REGISTRY_BASE_URL is not valid Unicode")]
-    #[diagnostic(code(rpx::description::invalid_base_repository_environment))]
-    EnvironmentNotUnicode,
-}
-
 pub fn configured_repositories(
     path: &Path,
     description: &RDescription,
-) -> Result<Vec<ConfiguredRepository>, ConfiguredRepositoriesError> {
-    let environment_base = match env::var("RPX_REGISTRY_BASE_URL") {
-        Ok(value) => Some(
-            Url::parse(&value)
-                .map_err(|source| ConfiguredRepositoriesError::InvalidEnvironmentUrl { source })?,
-        ),
-        Err(env::VarError::NotPresent) => None,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(ConfiguredRepositoriesError::EnvironmentNotUnicode);
-        }
-    };
-    let configured_base = environment_base
-        .is_none()
-        .then(|| base_repository(path, description));
+) -> Result<Vec<ConfiguredRepository>, DescriptionParseError> {
+    let configured_base = base_repository(path, description);
     let configured_remotes = remotes(path, description);
     let configured_additional = additional_repositories(path, description);
     let mut issues = Vec::new();
 
     let configured_base = match configured_base {
-        Some(Ok(repository)) => repository,
-        Some(Err(DescriptionParseError {
+        Ok(repository) => repository,
+        Err(DescriptionParseError {
             issues: base_issues,
             ..
-        })) => {
+        }) => {
             issues.extend(base_issues);
             None
         }
-        None => None,
     };
     let configured_remotes = match configured_remotes {
         Ok(remotes) => remotes,
@@ -1026,14 +1092,10 @@ pub fn configured_repositories(
             path.join(DESCRIPTION_NAME).display().to_string(),
             description.to_string(),
             issues,
-        )
-        .into());
+        ));
     }
 
-    let base = environment_base.or(configured_base).unwrap_or_else(|| {
-        Url::parse(BUILT_IN_REPOSITORY_BASE_URL)
-            .expect("built-in repository URL should be valid")
-    });
+    let base = configured_base.unwrap_or_else(|| built_in_repository_url().clone());
 
     Ok(std::iter::once(ConfiguredRepository::Base(base))
         .chain(
@@ -1053,7 +1115,7 @@ pub fn configured_repositories(
 pub enum RepositoriesFromDescriptionError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Configuration(#[from] ConfiguredRepositoriesError),
+    Configuration(#[from] DescriptionParseError),
 
     #[error("failed to configure {kind} repository: {source}")]
     #[diagnostic(code(rpx::description::repository_configuration_failed))]
@@ -1068,38 +1130,30 @@ pub async fn repositories_from_description(
     path: &Path,
     description: &RDescription,
 ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoriesFromDescriptionError> {
-    futures_util::future::join_all(
-        configured_repositories(path, description)?
-            .into_iter()
-            .map(|repository| async move {
-                match repository {
-                    ConfiguredRepository::Base(url) => {
-                        <dyn PackageRepository>::from_url(url.as_str())
-                            .await
-                            .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                                kind: "base",
-                                source,
-                            })
-                    }
-                    ConfiguredRepository::Git(remote) => GitRepository::new(remote)
-                        .map(|repository| {
-                            Arc::new(repository) as Arc<dyn PackageRepository>
-                        })
-                        .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                            kind: "Git",
-                            source,
-                        }),
-                    ConfiguredRepository::Additional(url) => {
-                        <dyn PackageRepository>::from_url(url.as_str())
-                            .await
-                            .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                                kind: "additional",
-                                source,
-                            })
-                    }
-                }
-            }),
-    )
+    futures_util::future::join_all(configured_repositories(path, description)?.into_iter().map(
+        |repository| async move {
+            match repository {
+                ConfiguredRepository::Base(url) => <dyn PackageRepository>::from_url(url)
+                    .await
+                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
+                        kind: "base",
+                        source,
+                    }),
+                ConfiguredRepository::Git(remote) => GitRepository::new(remote)
+                    .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
+                        kind: "Git",
+                        source,
+                    }),
+                ConfiguredRepository::Additional(url) => <dyn PackageRepository>::from_url(url)
+                    .await
+                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
+                        kind: "additional",
+                        source,
+                    }),
+            }
+        },
+    ))
     .await
     .into_iter()
     .collect()
@@ -1109,15 +1163,11 @@ pub async fn repositories_from_description(
 mod tests {
     use super::*;
     use std::{
-        ffi::OsString,
-        sync::{
-            Mutex,
-            atomic::{AtomicU64, Ordering},
-        },
+        env,
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-    static REGISTRY_ENVIRONMENT: Mutex<()> = Mutex::new(());
 
     struct TestDirectory(PathBuf);
 
@@ -1136,32 +1186,6 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    struct RegistryEnvironment(Option<OsString>);
-
-    impl RegistryEnvironment {
-        fn set(value: Option<&str>) -> Self {
-            let previous = env::var_os("RPX_REGISTRY_BASE_URL");
-            unsafe {
-                match value {
-                    Some(value) => env::set_var("RPX_REGISTRY_BASE_URL", value),
-                    None => env::remove_var("RPX_REGISTRY_BASE_URL"),
-                }
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for RegistryEnvironment {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(value) => env::set_var("RPX_REGISTRY_BASE_URL", value),
-                    None => env::remove_var("RPX_REGISTRY_BASE_URL"),
-                }
-            }
         }
     }
 
@@ -1506,7 +1530,7 @@ mod tests {
         );
         assert!(base_repository(Path::new("."), &description).is_err());
 
-        let expected = Url::parse("https://replacement.example/cran").unwrap();
+        let expected = parse_repository_url("https://replacement.example/cran").unwrap();
         set_base_repository(&mut description, &expected).expect("base repository should be set");
 
         assert_eq!(description.field_values(BASE_REPOSITORY_FIELD).len(), 1);
@@ -1514,6 +1538,67 @@ mod tests {
             base_repository(Path::new("."), &description).unwrap(),
             Some(expected)
         );
+
+        reset_base_repository(&mut description);
+        assert_eq!(base_repository(Path::new("."), &description).unwrap(), None);
+    }
+
+    #[test]
+    fn adds_and_removes_normalized_additional_repositories() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://first.example/cran/\n",
+        );
+        let first = parse_repository_url("https://first.example/cran").unwrap();
+        let second = parse_repository_url("https://second.example/cran").unwrap();
+
+        assert!(
+            !add_additional_repository(Path::new("."), &mut description, first.clone()).unwrap()
+        );
+        assert!(
+            add_additional_repository(Path::new("."), &mut description, second.clone()).unwrap()
+        );
+        assert!(remove_additional_repository(Path::new("."), &mut description, &first).unwrap());
+        assert_eq!(
+            additional_repositories(Path::new("."), &description).unwrap(),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn adds_and_removes_remote_repositories_without_losing_source_details() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/existing@main\n",
+        );
+        let remote: Remote = "alias=gitlab@code.example::group/repository/subdir@develop"
+            .parse()
+            .unwrap();
+
+        assert!(add_remote_repository(Path::new("."), &mut description, remote.clone()).unwrap());
+        assert!(!add_remote_repository(Path::new("."), &mut description, remote.clone()).unwrap());
+        let configured = remotes(Path::new("."), &description).unwrap();
+        assert_eq!(configured[1], remote);
+        assert_eq!(configured[1].package.as_deref(), Some("alias"));
+        assert_eq!(configured[1].host.as_deref(), Some("code.example"));
+
+        assert!(remove_remote_repository(Path::new("."), &mut description, &remote).unwrap());
+        assert_eq!(
+            remotes(Path::new("."), &description).unwrap(),
+            vec!["github::owner/existing@main".parse::<Remote>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn unsupported_remote_addition_does_not_mutate_description() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/existing\n",
+        );
+        let original = description.clone();
+        let unsupported = "archive=url::https://example.test/package.tar.gz"
+            .parse::<Remote>()
+            .unwrap();
+
+        assert!(add_remote_repository(Path::new("."), &mut description, unsupported).is_err());
+        assert_eq!(description, original);
     }
 
     #[test]
@@ -1531,10 +1616,8 @@ mod tests {
 
     #[test]
     fn configures_base_git_and_additional_repositories_in_order() {
-        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
-        let _environment = RegistryEnvironment::set(None);
         let description = RDescription::parse(
-            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://base.example/cran\nRemotes: github::owner/repository@main\nAdditional_repositories: https://additional.example/cran\n",
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://base.example/cran/\nRemotes: github::owner/repository@main\nAdditional_repositories: https://additional.example/cran/\n",
         );
 
         let repositories = configured_repositories(Path::new("."), &description)
@@ -1558,63 +1641,25 @@ mod tests {
 
     #[test]
     fn configures_builtin_base_repository_by_default() {
-        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
-        let _environment = RegistryEnvironment::set(None);
         let repositories = configured_repositories(Path::new("."), &RDescription::parse(""))
             .expect("default repository should configure");
 
         assert_eq!(
             repositories,
             [ConfiguredRepository::Base(
-                Url::parse(BUILT_IN_REPOSITORY_BASE_URL).unwrap()
+                built_in_repository_url().clone()
             )]
         );
-    }
-
-    #[test]
-    fn environment_base_repository_overrides_description_configuration() {
-        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
-        let _environment = RegistryEnvironment::set(Some("https://environment.example/cran"));
-        let description = RDescription::parse(
-            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\n",
-        );
-
-        let repositories = configured_repositories(Path::new("."), &description)
-            .expect("environment repository should configure");
-
-        assert_eq!(
-            repositories,
-            [ConfiguredRepository::Base(
-                Url::parse("https://environment.example/cran").unwrap()
-            )]
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_environment_base_repository() {
-        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
-        let _environment = RegistryEnvironment::set(Some("not-a-url"));
-
-        assert!(matches!(
-            configured_repositories(Path::new("."), &RDescription::parse("")),
-            Err(ConfiguredRepositoriesError::InvalidEnvironmentUrl { .. })
-        ));
     }
 
     #[test]
     fn aggregates_repository_configuration_errors() {
-        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
-        let _environment = RegistryEnvironment::set(None);
         let description = RDescription::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\nRemotes: archive=url::https://example.com/pkg.tar.gz\nAdditional_repositories: also-not-a-url\n",
         );
 
-        let ConfiguredRepositoriesError::Description(error) =
-            configured_repositories(Path::new("."), &description)
-                .expect_err("repositories should be invalid")
-        else {
-            panic!("expected DESCRIPTION configuration errors");
-        };
+        let error = configured_repositories(Path::new("."), &description)
+            .expect_err("repositories should be invalid");
 
         assert_eq!(error.count, 3);
     }

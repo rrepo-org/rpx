@@ -167,38 +167,37 @@ The package universe is the set of package versions and metadata available to th
 
 By default, `rpx` uses the public rrepo-backed CRAN universe at `https://upstream.rrepo.dev/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
 
-Projects can add additional repositories. `rpx` supports rrepo API repositories, CRAN repositories, and CRAN-like repositories:
+Projects can configure a base repository, additional rrepo or CRAN-like repositories, and package remotes:
 
 ```bash
-rpx repo add https://cloud.r-project.org
+rpx repo base set https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo additional add https://cloud.r-project.org
 rpx repo add https://packagemanager.posit.co/cran/latest
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo remote add github::owner/repository@main
 rpx repo list
-rpx repo remove https://packagemanager.posit.co/cran/latest
+rpx repo additional remove https://cloud.r-project.org
+rpx repo remote remove github::owner/repository@main
+rpx repo base reset
 ```
+
+`rpx repo add` and `rpx repo remove` are shortcuts for the corresponding `rpx repo additional` commands. Remote arguments use the same syntax as the `Remotes` field in `DESCRIPTION`.
 
 The base repository is always enabled. A useful setup is to keep the built-in base universe and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
 
 ```bash
-rpx repo add https://packagemanager.posit.co/cran/latest
+rpx repo additional add https://packagemanager.posit.co/cran/latest
 ```
 
 During locking, `rpx` merges versions across enabled repositories. Existing locked versions are preferred when they are still available from enabled repositories. If the same version is available from multiple repositories, the earlier repository wins for the locked source URL.
 
 When a repository requires authentication, `rpx` prompts for an API key and stores it in the operating system keyring for that repository's origin.
 
-You can override the default public registry root with `RPX_REGISTRY_BASE_URL`:
-
-```bash
-RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
-```
-
-Projects can set `Config/rpx/base-repository` in `DESCRIPTION` to replace the built-in base repository. `RPX_REGISTRY_BASE_URL` takes precedence when set.
+Projects can set `Config/rpx/base-repository` in `DESCRIPTION` to replace the built-in base repository. When the field is absent, `rpx` uses the built-in repository.
 
 For private package universes, add an rrepo repository for your organization:
 
 ```bash
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo additional add https://<org-slug>.rrepo.dev/<repo-slug>
 ```
 
 ## rrepo

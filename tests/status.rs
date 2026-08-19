@@ -6,12 +6,13 @@ use common::*;
 fn runs_rpx_status_for_clean_project() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-clean";
+    let working_path = "/tmp/rpx-project-status-clean/nested";
     create_package_project(&container, project_path);
     let setup_command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let status_command = format!("cd {project_path} && rpx status");
+    let status_command = format!("mkdir -p {working_path} && cd {working_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(

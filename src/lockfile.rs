@@ -120,28 +120,23 @@ mod relation_set {
 }
 
 mod repository_url {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use crate::repository::parse_repository_url;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
     use url::Url;
 
     pub fn serialize<S>(url: &Url, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        canonicalize_repository_url(url.clone()).serialize(serializer)
+        url.serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Url, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Url::deserialize(deserializer).map(canonicalize_repository_url)
-    }
-
-    fn canonicalize_repository_url(mut url: Url) -> Url {
-        if let Ok(mut segments) = url.path_segments_mut() {
-            segments.pop_if_empty();
-        }
-        url
+        let value = String::deserialize(deserializer)?;
+        parse_repository_url(&value).map_err(D::Error::custom)
     }
 }
 
@@ -570,13 +565,13 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_repository_urls_on_serialization_and_deserialization() {
+    fn serializes_canonical_repository_urls_and_canonicalizes_deserialization() {
         let repository = Repository::Rrepo {
-            url: url("https://api.rrepo.org/cran/"),
+            url: url("https://api.rrepo.org/cran"),
         };
         let package = Package {
             version: package_version("1.0.0"),
-            repository: url("https://api.rrepo.org/cran/"),
+            repository: url("https://api.rrepo.org/cran"),
             dependencies: BTreeSet::new(),
         };
 

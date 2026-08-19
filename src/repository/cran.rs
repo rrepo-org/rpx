@@ -28,11 +28,7 @@ impl std::fmt::Display for CranRepository {
 }
 
 impl CranRepository {
-    pub fn new(mut url: Url, archives: ArchiveSupport) -> Self {
-        url.path_segments_mut()
-            .expect("repository base URL should support path segments")
-            .pop_if_empty();
-
+    pub fn new(url: Url, archives: ArchiveSupport) -> Self {
         Self {
             url,
             archives,

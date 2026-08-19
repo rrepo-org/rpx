@@ -82,9 +82,10 @@ fn reports_pubgrub_no_solution_explanation() {
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add";
+    let working_path = "/tmp/rpx-project-add/subdir";
     create_package_project(&container, project_path);
 
-    let command = format!("cd {project_path} && rpx add digest");
+    let command = format!("mkdir -p {working_path} && cd {working_path} && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -92,8 +93,8 @@ fn runs_rpx_add_inside_custom_r_image() {
         stdout.contains("Added digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
-    assert_package_state(&container, project_path, "digest", "TRUE");
-    assert_package_state(&container, project_path, "testpkg", "TRUE");
+    assert_package_state(&container, working_path, "digest", "TRUE");
+    assert_package_state(&container, working_path, "testpkg", "TRUE");
 
     let lockfile =
         serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
@@ -244,6 +245,7 @@ fn records_base_package_as_runtime_requirement() {
 fn runs_rpx_remove_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-remove";
+    let working_path = "/tmp/rpx-project-remove/nested";
     create_package_project(&container, project_path);
 
     let add_command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
@@ -251,7 +253,8 @@ fn runs_rpx_remove_inside_custom_r_image() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "digest", "TRUE");
 
-    let remove_command = format!("cd {project_path} && rpx remove digest");
+    let remove_command =
+        format!("mkdir -p {working_path} && cd {working_path} && rpx remove digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
@@ -357,6 +360,7 @@ fn adds_and_removes_multiple_packages() {
 fn runs_rpx_lock_without_installing_packages() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-lock";
+    let working_path = "/tmp/rpx-project-lock/nested";
     write_description(
         &container,
         project_path,
@@ -370,7 +374,7 @@ Maintainer: Test Author <test@example.com>
 Imports: digest",
     );
 
-    let command = format!("cd {project_path} && rpx lock");
+    let command = format!("mkdir -p {working_path} && cd {working_path} && rpx lock");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
