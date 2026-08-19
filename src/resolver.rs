@@ -403,13 +403,17 @@ fn dependency_constraints_from_description(
         .chain(linking_to)
         .filter(|relation| relation.package() != "R")
         .filter(|relation| !is_base_package(relation.package()))
-        .map(|relation| {
-            (
-                relation.package().to_string(),
-                package_version_range_from_relation(&relation),
-            )
-        })
-        .collect())
+        .fold(
+            DependencyConstraints::default(),
+            |mut dependencies, relation| {
+                let range = package_version_range_from_relation(&relation);
+                dependencies
+                    .entry(relation.package().to_string())
+                    .and_modify(|existing| *existing = existing.intersection(&range))
+                    .or_insert(range);
+                dependencies
+            },
+        ))
 }
 
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
@@ -620,6 +624,27 @@ mod tests {
         let dependencies = dependency_constraints_from_description(&description)
             .expect("transitive Suggests should not be consumed");
         assert!(dependencies.contains_key("cli"));
+    }
+
+    #[test]
+    fn intersects_transitive_constraints_across_dependency_fields() {
+        let description = RDescription::parse(
+            "Package: example\nVersion: 1.0.0\nDepends: cli (>= 1.0.0)\nImports: cli (< 2.0.0)\n",
+        );
+
+        let dependencies = dependency_constraints_from_description(&description)
+            .expect("hard dependencies should parse");
+        let range = dependencies.get("cli").expect("cli should be a dependency");
+        let candidate = |version: &str| {
+            PackageVersion::new(
+                Version::from_str(version).expect("valid test version"),
+                built_in_repository(),
+            )
+        };
+
+        assert!(!range.contains(&candidate("0.9.0")));
+        assert!(range.contains(&candidate("1.5.0")));
+        assert!(!range.contains(&candidate("2.0.0")));
     }
 
     #[tokio::test]

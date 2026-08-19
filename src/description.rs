@@ -614,11 +614,14 @@ pub fn add_dependencies(
         .chain(suggests_issues)
         .collect::<Vec<_>>();
 
-    let (depends, imports, linking_to, suggests) =
+    let (mut depends, mut imports, mut linking_to, mut suggests) =
         match (depends, imports, linking_to, suggests) {
-            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => {
-                (depends, imports, linking_to, suggests)
-            }
+            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => (
+                depends.collect::<BTreeSet<_>>(),
+                imports.collect::<BTreeSet<_>>(),
+                linking_to.collect::<BTreeSet<_>>(),
+                suggests.collect::<BTreeSet<_>>(),
+            ),
             _ => {
                 return Err(DescriptionParseError::new(
                     path.join(DESCRIPTION_NAME).display().to_string(),
@@ -634,20 +637,16 @@ pub fn add_dependencies(
         .map(|dependency| dependency.package().to_string())
         .collect::<BTreeSet<_>>();
 
-    description.set_depends(
-        depends.filter(|dependency| !added_packages.contains(dependency.package())),
-    );
-    description.set_imports(
-        imports
-            .filter(|dependency| !added_packages.contains(dependency.package()))
-            .chain(dependencies.iter().cloned()),
-    );
-    description.set_linking_to(
-        linking_to.filter(|dependency| !added_packages.contains(dependency.package())),
-    );
-    description.set_suggests(
-        suggests.filter(|dependency| !added_packages.contains(dependency.package())),
-    );
+    depends.retain(|dependency| !added_packages.contains(dependency.package()));
+    imports.retain(|dependency| !added_packages.contains(dependency.package()));
+    imports.extend(dependencies.iter().cloned());
+    linking_to.retain(|dependency| !added_packages.contains(dependency.package()));
+    suggests.retain(|dependency| !added_packages.contains(dependency.package()));
+
+    description.set_depends(depends);
+    description.set_imports(imports);
+    description.set_linking_to(linking_to);
+    description.set_suggests(suggests);
 
     Ok(())
 }
@@ -740,11 +739,14 @@ pub fn remove_dependencies(
         .chain(suggests_issues)
         .collect::<Vec<_>>();
 
-    let (depends, imports, linking_to, suggests) =
+    let (mut depends, mut imports, mut linking_to, mut suggests) =
         match (depends, imports, linking_to, suggests) {
-            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => {
-                (depends, imports, linking_to, suggests)
-            }
+            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => (
+                depends.collect::<BTreeSet<_>>(),
+                imports.collect::<BTreeSet<_>>(),
+                linking_to.collect::<BTreeSet<_>>(),
+                suggests.collect::<BTreeSet<_>>(),
+            ),
             _ => {
                 return Err(DescriptionParseError::new(
                     path.join(DESCRIPTION_NAME).display().to_string(),
@@ -755,12 +757,15 @@ pub fn remove_dependencies(
             }
         };
 
-    description.set_depends(depends.filter(|dependency| !packages.contains(dependency.package())));
-    description.set_imports(imports.filter(|dependency| !packages.contains(dependency.package())));
-    description
-        .set_linking_to(linking_to.filter(|dependency| !packages.contains(dependency.package())));
-    description
-        .set_suggests(suggests.filter(|dependency| !packages.contains(dependency.package())));
+    depends.retain(|dependency| !packages.contains(dependency.package()));
+    imports.retain(|dependency| !packages.contains(dependency.package()));
+    linking_to.retain(|dependency| !packages.contains(dependency.package()));
+    suggests.retain(|dependency| !packages.contains(dependency.package()));
+
+    description.set_depends(depends);
+    description.set_imports(imports);
+    description.set_linking_to(linking_to);
+    description.set_suggests(suggests);
 
     Ok(())
 }
