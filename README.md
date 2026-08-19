@@ -40,22 +40,31 @@ Imports:
     examplepkg (< 2.0.0)
 ```
 
-The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint.
+The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint. Packages are added to `Imports` by default; use a dependency-type flag to select another field:
+
+```bash
+rpx add --depends package
+rpx add --imports package
+rpx add --linking-to package
+rpx add --suggests package
+```
+
+The flags are mutually exclusive. `--dev` is an alias for `--suggests`. `Enhances` is not currently supported.
 
 This uses semver because the major version is the common place to signal breaking changes. R packages do not universally follow semver, so this is not a guarantee that every `1.x` release is compatible or every `2.x` release is incompatible. It is a default constraint that is safer than leaving the dependency open-ended.
 
 For `0.x` packages, `rpx` records the selected version as the lower bound and `< 1.0.0` as the upper bound.
 
 To set a constraint yourself, use `PACKAGE@OPERATORVERSION`. For example, this writes
-`digest (>= 0.6.37)` to `Imports`:
+`digest (>= 0.6.37)` to `Suggests`:
 
 ```bash
-rpx add 'digest@>=0.6.37'
+rpx add --dev 'digest@>=0.6.37'
 ```
 
 Supported operators are `<`, `<=`, `==`, `!=`, `>=`, and `>`. A constrained add replaces every
 existing relation for that package in `DESCRIPTION` before adding the requested relation to
-`Imports`.
+the selected field.
 
 ## Install
 
