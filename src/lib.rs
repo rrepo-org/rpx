@@ -135,79 +135,6 @@ enum RpxError {
     Status(#[from] StatusError),
 }
 
-#[derive(Debug, Error, Diagnostic)]
-enum RepoError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::repo::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionWrite(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error("failed to update Additional_repositories: {source}")]
-    #[diagnostic(code(rpx::repo::description_update_failed))]
-    DescriptionMutation {
-        #[source]
-        source: UrlMutationError,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lock(#[from] LockError),
-
-    #[error("failed to add repository {url}: {source}")]
-    #[diagnostic(code(rpx::repo::add_failed))]
-    Add {
-        url: String,
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("failed to remove repository {url}: {source}")]
-    #[diagnostic(code(rpx::repo::remove_failed))]
-    Remove {
-        url: String,
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("failed to remove repository credential: {details}")]
-    #[diagnostic(code(rpx::repo::credential_remove_failed))]
-    CredentialRemove { details: String },
-
-    #[error("failed to inspect repository credential: {details}")]
-    #[diagnostic(code(rpx::repo::credential_inspect_failed))]
-    CredentialInspect { details: String },
-}
-
 #[derive(Debug)]
 struct PackageVersionMismatch {
     package: String,
@@ -329,117 +256,6 @@ impl From<SyncError> for RpxError {
     }
 }
 
-#[derive(Debug, Error, Diagnostic)]
-enum RunError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::run::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to run {program}")]
-    #[diagnostic(code(rpx::run::command_failed))]
-    CommandFailed {
-        program: String,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum LockError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::lock::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Repositories(#[from] RepositoriesFromDescriptionError),
-
-    #[error("failed to load resolved package metadata: {source}")]
-    #[diagnostic(code(rpx::lock::package_metadata_failed))]
-    PackageMetadata {
-        #[from]
-        source: RepositoryError,
-    },
-
-    #[error("failed to prepare package requirements: {details}")]
-    #[diagnostic(
-        code(rpx::lock::resolve_failed),
-        help("Check package names and version constraints in DESCRIPTION.")
-    )]
-    ResolveFailed { details: String },
-
-    #[error("package requirements are incompatible\n\n{explanation}")]
-    #[diagnostic(
-        code(rpx::lock::no_solution),
-        help("Adjust package constraints in DESCRIPTION and try again.")
-    )]
-    NoSolution { explanation: String },
-
-    #[error("repository operation failed: {source}")]
-    #[diagnostic(code(rpx::lock::repository_failed))]
-    Repository {
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("could not access Git repository {repository}")]
-    #[diagnostic(
-        code(rpx::lock::git_repository_unavailable),
-        help(
-            "Check that the repository exists. For private repositories, configure Git credentials."
-        )
-    )]
-    GitRepositoryUnavailable { repository: String },
-
-    #[error("failed to resolve package set")]
-    #[diagnostic(
-        code(rpx::lock::resolve_failed),
-        help("Check package names and version constraints in DESCRIPTION.")
-    )]
-    Resolution {
-        #[source]
-        source: ResolutionError,
-    },
-
-    #[error("repository {repository} cannot be written to the lockfile")]
-    #[diagnostic(code(rpx::lock::unsupported_repository))]
-    UnsupportedRepository { repository: String },
-
-    #[error("invalid system requirements database commit {commit}: {source}")]
-    #[diagnostic(code(rpx::lock::invalid_sysreq_commit))]
-    InvalidSystemRequirementsCommit {
-        commit: String,
-        #[source]
-        source: git2::Error,
-    },
-}
-
 fn lock_error_from_resolution(error: ResolutionError) -> LockError {
     if let ResolutionError::Provider(provider) = &error {
         let source = match provider {
@@ -485,100 +301,6 @@ fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
         return None;
     };
     Some(remote)
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum SyncError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::sync::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedPackages(#[from] LockedPackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    InstalledPackages(#[from] r::InstalledPackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RemovePackages(#[from] r::PackageRemovalError),
-
-    #[error(
-        "system dependency installation is currently supported only on supported Linux distributions/package managers"
-    )]
-    #[diagnostic(code(rpx::sync::unsupported_system_install))]
-    UnsupportedSystemInstall,
-
-    #[error("failed to refresh package metadata: {details}")]
-    #[diagnostic(code(rpx::sync::metadata_refresh_failed))]
-    MetadataRefreshFailed { details: String },
-
-    #[error("failed to install system dependencies: {details}")]
-    #[diagnostic(code(rpx::sync::system_dependencies_failed))]
-    SystemDependenciesFailed { details: String },
-
-    #[error("failed to prepare source artifacts: {details}")]
-    #[diagnostic(code(rpx::sync::download_failed))]
-    DownloadArtifactsFailed { details: String },
-
-    #[error("failed to install project package: {source}")]
-    #[diagnostic(code(rpx::sync::project_install_failed))]
-    ProjectPackageInstall {
-        #[source]
-        source: r::PackageInstallError,
-    },
-
-    #[error("failed to install package {package}: {source}")]
-    #[diagnostic(code(rpx::sync::package_install_failed))]
-    PackageInstall {
-        package: String,
-        #[source]
-        source: r::PackageInstallError,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum CleanError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::clean::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to remove {label} at {path}")]
-    #[diagnostic(code(rpx::clean::remove_failed))]
-    RemoveFailed {
-        label: String,
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -692,7 +414,19 @@ async fn run_inner() -> Result<(), RpxError> {
             install_only_system,
         } => cmd_sync(install_system, install_only_system).await?,
         Commands::Clean => cmd_clean()?,
-        Commands::Repo { command } => cmd_repo(command).await?,
+        Commands::Repo {
+            command: RepoCommands::Add { url },
+        } => cmd_repo_add(&url).await?,
+        Commands::Repo {
+            command:
+                RepoCommands::Remove {
+                    url,
+                    remove_credential,
+                },
+        } => cmd_repo_remove(&url, remove_credential).await?,
+        Commands::Repo {
+            command: RepoCommands::List,
+        } => cmd_repo_list().await?,
     }
 
     Ok(())
@@ -816,6 +550,11 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
         .iter()
         .map(|package| parse_add_package(package))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let unconstrained_packages = added_relations
+        .iter()
+        .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
+        .map(|relation| relation.package().to_string())
+        .collect::<BTreeSet<_>>();
 
     let current_dir =
         env::current_dir().map_err(|source| AddError::WorkingDirectoryUnavailable { source })?;
@@ -840,7 +579,7 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
     let root =
         Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
 
-    let (lockfile, mut resolved) = match old_lockfile.as_ref().map(|lockfile| {
+    let (mut lockfile, mut resolved) = match old_lockfile.as_ref().map(|lockfile| {
         (
             lockfile,
             validate_locked_resolution(&current_dir, &description, &r_version, lockfile),
@@ -922,8 +661,46 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
         }
     };
 
+    let final_added_relations = unconstrained_packages.iter().fold(
+        added_relations.clone(),
+        |mut relations, package| {
+            let (selected, _) = resolved
+                .get(package)
+                .expect("resolved package map should contain every added package");
+            let version = selected.version();
+            let next_major = format!("{}.0.0", version.major() + 1)
+                .parse::<Version>()
+                .expect("next major version should be valid");
+
+            relations.retain(|relation| {
+                relation.package() != package
+                    || !matches!(relation.requirement(), VersionRequirement::Any)
+            });
+            relations.insert(
+                Relation::new(
+                    package,
+                    VersionRequirement::GreaterThanEqual(version.clone()),
+                )
+                .expect("previously parsed package name should remain valid"),
+            );
+            relations.insert(
+                Relation::new(package, VersionRequirement::LessThan(next_major))
+                    .expect("previously parsed package name should remain valid"),
+            );
+
+            relations
+        },
+    );
+
+    if final_added_relations != added_relations {
+        add_dependencies(&current_dir, &mut description, &final_added_relations)?;
+        lockfile.requirements = project_dependencies(&current_dir, &description)?;
+    }
+
     // The lockfile contains only external packages, but sync also needs the local
     // root. Reinsert it with the in-memory DESCRIPTION used during resolution.
+    let root =
+        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
     resolved.insert(
         root_name,
         (
@@ -1171,16 +948,79 @@ async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
     Ok(())
 }
 
-async fn cmd_repo(command: RepoCommands) -> Result<(), RepoError> {
-    match command {
-        RepoCommands::Add { url } => cmd_repo_add(&url).await,
-        RepoCommands::Remove {
-            url,
-            remove_credential,
-        } => cmd_repo_remove(&url, remove_credential).await,
-        RepoCommands::List => cmd_repo_list().await,
-    }
+#[derive(Debug, Error, Diagnostic)]
+enum RepoError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::repo::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionWrite(#[from] DescriptionWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error("failed to update Additional_repositories: {source}")]
+    #[diagnostic(code(rpx::repo::description_update_failed))]
+    DescriptionMutation {
+        #[source]
+        source: UrlMutationError,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error("failed to add repository {url}: {source}")]
+    #[diagnostic(code(rpx::repo::add_failed))]
+    Add {
+        url: String,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to remove repository {url}: {source}")]
+    #[diagnostic(code(rpx::repo::remove_failed))]
+    Remove {
+        url: String,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to remove repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_remove_failed))]
+    CredentialRemove { details: String },
+
+    #[error("failed to inspect repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_inspect_failed))]
+    CredentialInspect { details: String },
 }
+
 
 async fn cmd_repo_add(url: &str) -> Result<(), RepoError> {
     let current_dir =
@@ -1409,6 +1249,25 @@ async fn cmd_repo_list() -> Result<(), RepoError> {
     })
 }
 
+#[derive(Debug, Error, Diagnostic)]
+enum RunError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::run::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to run {program}")]
+    #[diagnostic(code(rpx::run::command_failed))]
+    CommandFailed {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+
 async fn cmd_run(command: &[String]) -> Result<(), RunError> {
     let (program, args) = command
         .split_first()
@@ -1429,6 +1288,100 @@ async fn cmd_run(command: &[String]) -> Result<(), RunError> {
     exit_with_status(status.code());
     Ok(())
 }
+
+#[derive(Debug, Error, Diagnostic)]
+enum LockError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::lock::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileWrite(#[from] LockfileWriteError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::lock::package_metadata_failed))]
+    PackageMetadata {
+        #[from]
+        source: RepositoryError,
+    },
+
+    #[error("failed to prepare package requirements: {details}")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    ResolveFailed { details: String },
+
+    #[error("package requirements are incompatible\n\n{explanation}")]
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Adjust package constraints in DESCRIPTION and try again.")
+    )]
+    NoSolution { explanation: String },
+
+    #[error("repository operation failed: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    Repository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable { repository: String },
+
+    #[error("failed to resolve package set")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    Resolution {
+        #[source]
+        source: ResolutionError,
+    },
+
+    #[error("repository {repository} cannot be written to the lockfile")]
+    #[diagnostic(code(rpx::lock::unsupported_repository))]
+    UnsupportedRepository { repository: String },
+
+    #[error("invalid system requirements database commit {commit}: {source}")]
+    #[diagnostic(code(rpx::lock::invalid_sysreq_commit))]
+    InvalidSystemRequirementsCommit {
+        commit: String,
+        #[source]
+        source: git2::Error,
+    },
+}
+
 
 async fn cmd_lock() -> Result<(), LockError> {
     let current_dir =
@@ -1493,6 +1446,82 @@ async fn cmd_lock() -> Result<(), LockError> {
     }
     Ok(())
 }
+
+#[derive(Debug, Error, Diagnostic)]
+enum SyncError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::sync::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionRead(#[from] DescriptionReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InstalledPackages(#[from] r::InstalledPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RemovePackages(#[from] r::PackageRemovalError),
+
+    #[error(
+        "system dependency installation is currently supported only on supported Linux distributions/package managers"
+    )]
+    #[diagnostic(code(rpx::sync::unsupported_system_install))]
+    UnsupportedSystemInstall,
+
+    #[error("failed to refresh package metadata: {details}")]
+    #[diagnostic(code(rpx::sync::metadata_refresh_failed))]
+    MetadataRefreshFailed { details: String },
+
+    #[error("failed to install system dependencies: {details}")]
+    #[diagnostic(code(rpx::sync::system_dependencies_failed))]
+    SystemDependenciesFailed { details: String },
+
+    #[error("failed to prepare source artifacts: {details}")]
+    #[diagnostic(code(rpx::sync::download_failed))]
+    DownloadArtifactsFailed { details: String },
+
+    #[error("failed to install project package: {source}")]
+    #[diagnostic(code(rpx::sync::project_install_failed))]
+    ProjectPackageInstall {
+        #[source]
+        source: r::PackageInstallError,
+    },
+
+    #[error("failed to install package {package}: {source}")]
+    #[diagnostic(code(rpx::sync::package_install_failed))]
+    PackageInstall {
+        package: String,
+        #[source]
+        source: r::PackageInstallError,
+    },
+}
+
 
 async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), SyncError> {
     let current_dir =
@@ -1593,6 +1622,25 @@ async fn cmd_status() -> Result<(), StatusError> {
 
     status("Project is in sync");
     Ok(())
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum CleanError {
+    #[error("failed to determine the current working directory: {source}")]
+    #[diagnostic(code(rpx::clean::working_directory_unavailable))]
+    WorkingDirectoryUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to remove {label} at {path}")]
+    #[diagnostic(code(rpx::clean::remove_failed))]
+    RemoveFailed {
+        label: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 fn cmd_clean() -> Result<(), CleanError> {
