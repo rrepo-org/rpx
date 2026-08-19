@@ -297,10 +297,40 @@ pub fn write_lockfile(path: &PathBuf, lockfile: &Lockfile) -> Result<(), Lockfil
 mod tests {
     use super::*;
     use relative_path::RelativePathBuf;
+    use serde::de::DeserializeOwned;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const SYSREQ_COMMIT: &str = "1111111111111111111111111111111111111111";
     const GIT_COMMIT: &str = "2222222222222222222222222222222222222222";
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let unique = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rpx-lockfile-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_rejected<T: DeserializeOwned>(value: serde_json::Value, field: &str) {
+        assert!(
+            serde_json::from_value::<T>(value).is_err(),
+            "invalid or missing {field} should fail"
+        );
+    }
 
     fn oid(value: &str) -> git2::Oid {
         value.parse().expect("OID should parse")
@@ -379,14 +409,14 @@ mod tests {
     }
 
     #[test]
-    fn serializes_v5_lockfile_shape() {
+    fn serializes_current_lockfile_wire_shape() {
         let actual = serde_json::to_value(sample_lockfile()).expect("lockfile should serialize");
 
         assert_eq!(
             actual,
             json!({
-                "version": 5,
-                "revision": 0,
+                "version": LOCKFILE_VERSION,
+                "revision": LOCKFILE_REVISION,
                 "r": "4.4.1",
                 "sysreqs": {
                     "db_commit": SYSREQ_COMMIT,
@@ -432,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_v5_lockfile() {
+    fn round_trips_current_lockfile() {
         let lockfile = sample_lockfile();
         let json = serde_json::to_string(&lockfile).expect("lockfile should serialize");
         let parsed = serde_json::from_str::<Lockfile>(&json).expect("lockfile should parse");
@@ -486,13 +516,19 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_git_reference_variants() {
-        for reference in [
-            GitReference::DefaultBranch,
-            GitReference::Named {
-                value: "refs/tags/v1.0.0".to_string(),
-            },
-            GitReference::Commit,
+    fn uses_exact_git_reference_wire_shapes() {
+        for (reference, expected) in [
+            (
+                GitReference::DefaultBranch,
+                json!({ "type": "default-branch" }),
+            ),
+            (
+                GitReference::Named {
+                    value: "refs/tags/v1.0.0".to_string(),
+                },
+                json!({ "type": "named", "value": "refs/tags/v1.0.0" }),
+            ),
+            (GitReference::Commit, json!({ "type": "commit" })),
         ] {
             let repository = Repository::Git {
                 url: url("https://github.com/example/repository.git"),
@@ -504,9 +540,16 @@ mod tests {
             let parsed = serde_json::from_value::<Repository>(json.clone())
                 .expect("repository should parse");
 
+            assert_eq!(json["reference"], expected);
             assert_eq!(parsed, repository);
             assert!(json.get("subdirectory").is_none());
         }
+
+        assert_eq!(
+            serde_json::to_value(ArchiveSupport::Unavailable)
+                .expect("archive support should serialize"),
+            "unavailable"
+        );
     }
 
     #[test]
@@ -527,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_repository_urls() {
+    fn canonicalizes_repository_urls_on_serialization_and_deserialization() {
         let repository = Repository::Rrepo {
             url: url("https://api.rrepo.org/cran/"),
         };
@@ -544,15 +587,29 @@ mod tests {
         assert_eq!(repository_json["url"], "https://api.rrepo.org/cran");
         assert_eq!(package_json["repository"], "https://api.rrepo.org/cran");
         assert_eq!(
-            serde_json::from_value::<Repository>(repository_json).expect("repository should parse"),
+            serde_json::from_value::<Repository>(json!({
+                "kind": "rrepo",
+                "url": "https://api.rrepo.org/cran/"
+            }))
+            .expect("repository should parse"),
             Repository::Rrepo {
                 url: url("https://api.rrepo.org/cran")
             }
         );
+        assert_eq!(
+            serde_json::from_value::<Package>(json!({
+                "version": "1.0.0",
+                "repository": "https://api.rrepo.org/cran/",
+                "dependencies": []
+            }))
+            .expect("package should parse")
+            .repository,
+            url("https://api.rrepo.org/cran")
+        );
     }
 
     #[test]
-    fn serializes_inverse_system_requirement_rules() {
+    fn serializes_system_requirement_rule_package_map() {
         let requirements = SystemRequirements {
             db_commit: Some(oid(SYSREQ_COMMIT)),
             rules: BTreeMap::from([(
@@ -591,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_description_and_package_relations() {
+    fn round_trips_root_requirements_and_locked_dependencies() {
         let requirements = BTreeSet::from([
             relation("cli"),
             relation("digest (>= 0.6.37)"),
@@ -632,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_oid_fields() {
+    fn round_trips_present_oid_fields() {
         let lockfile = sample_lockfile();
         let json = serde_json::to_value(&lockfile).expect("lockfile should serialize");
         let parsed = serde_json::from_value::<Lockfile>(json).expect("lockfile should parse");
@@ -642,5 +699,302 @@ mod tests {
             &parsed.repos[2],
             Repository::Git { commit, .. } if *commit == oid(GIT_COMMIT)
         ));
+    }
+
+    #[test]
+    fn read_lockfile_reports_missing_file_as_read_error() {
+        let directory = TestDirectory::new("missing");
+
+        let error = read_lockfile(&directory.0).expect_err("missing lockfile should fail");
+
+        assert!(matches!(
+            &error,
+            LockfileReadError::Read { path, source }
+                if path == &directory.0.join(LOCKFILE_NAME)
+                    && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_read_failed")
+        );
+    }
+
+    #[test]
+    fn writes_pretty_current_lockfile_and_reads_it_back() {
+        let directory = TestDirectory::new("round-trip");
+        let mut lockfile = sample_lockfile();
+        lockfile.revision = 17;
+
+        write_lockfile(&directory.0, &lockfile).expect("lockfile should be written");
+
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize")
+        );
+        assert_eq!(
+            fs::read_to_string(directory.0.join(LOCKFILE_NAME))
+                .expect("lockfile should be readable"),
+            expected
+        );
+        assert_eq!(
+            read_lockfile(&directory.0).expect("lockfile should parse"),
+            lockfile
+        );
+    }
+
+    #[test]
+    fn read_lockfile_reports_header_parse_error() {
+        let directory = TestDirectory::new("invalid-header");
+        fs::write(directory.0.join(LOCKFILE_NAME), r#"{"revision":0}"#)
+            .expect("lockfile should be written");
+
+        let error = read_lockfile(&directory.0).expect_err("header should be invalid");
+
+        assert!(matches!(
+            &error,
+            LockfileReadError::Parse { path, .. }
+                if path == &directory.0.join(LOCKFILE_NAME)
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_parse_failed")
+        );
+    }
+
+    #[test]
+    fn read_lockfile_rejects_outdated_version_before_full_schema_parse() {
+        let directory = TestDirectory::new("outdated");
+        fs::write(
+            directory.0.join(LOCKFILE_NAME),
+            format!(r#"{{"version":{},"obsolete":true}}"#, LOCKFILE_VERSION - 1),
+        )
+        .expect("lockfile should be written");
+
+        let error = read_lockfile(&directory.0).expect_err("old lockfile should fail");
+
+        assert!(matches!(
+            &error,
+            LockfileReadError::OutdatedLockfile { path }
+                if path == &directory.0.join(LOCKFILE_NAME)
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_outdated")
+        );
+    }
+
+    #[test]
+    fn read_lockfile_rejects_newer_version_before_full_schema_parse() {
+        let directory = TestDirectory::new("newer");
+        fs::write(
+            directory.0.join(LOCKFILE_NAME),
+            format!(r#"{{"version":{},"future":true}}"#, LOCKFILE_VERSION + 1),
+        )
+        .expect("lockfile should be written");
+
+        let error = read_lockfile(&directory.0).expect_err("new lockfile should fail");
+
+        assert!(matches!(
+            &error,
+            LockfileReadError::NewerLockfile { path }
+                if path == &directory.0.join(LOCKFILE_NAME)
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_from_newer_rpx")
+        );
+    }
+
+    #[test]
+    fn read_lockfile_reports_full_schema_parse_error_for_current_version() {
+        let directory = TestDirectory::new("invalid-current");
+        fs::write(
+            directory.0.join(LOCKFILE_NAME),
+            format!(r#"{{"version":{LOCKFILE_VERSION}}}"#),
+        )
+        .expect("lockfile should be written");
+
+        let error = read_lockfile(&directory.0).expect_err("schema should be incomplete");
+
+        assert!(matches!(
+            &error,
+            LockfileReadError::Parse { path, .. }
+                if path == &directory.0.join(LOCKFILE_NAME)
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_parse_failed")
+        );
+    }
+
+    #[test]
+    fn write_lockfile_reports_missing_parent_directory() {
+        let directory = TestDirectory::new("write-error");
+        let missing = directory.0.join("missing");
+
+        let error = write_lockfile(&missing, &minimal_lockfile())
+            .expect_err("missing parent should prevent writing");
+
+        assert!(matches!(
+            &error,
+            LockfileWriteError::Write { path, source }
+                if path == &missing.join(LOCKFILE_NAME)
+                    && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::project::lockfile_write_failed")
+        );
+    }
+
+    #[test]
+    fn omits_and_defaults_absent_system_requirements_commit() {
+        let requirements = SystemRequirements {
+            db_commit: None,
+            rules: BTreeMap::new(),
+        };
+
+        let json =
+            serde_json::to_value(&requirements).expect("system requirements should serialize");
+        let parsed = serde_json::from_value::<SystemRequirements>(json!({ "rules": {} }))
+            .expect("missing commit should default");
+
+        assert!(json.get("db_commit").is_none());
+        assert_eq!(parsed.db_commit, None);
+    }
+
+    #[test]
+    fn rejects_null_and_malformed_system_requirements_commit() {
+        assert_rejected::<SystemRequirements>(
+            json!({ "db_commit": null, "rules": {} }),
+            "null db_commit",
+        );
+        assert_rejected::<SystemRequirements>(
+            json!({ "db_commit": "not-an-oid", "rules": {} }),
+            "malformed db_commit",
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_custom_lockfile_scalars() {
+        let lockfile = serde_json::to_value(sample_lockfile()).expect("lockfile should serialize");
+        let cases = [
+            ("requirement", {
+                let mut value = lockfile.clone();
+                value["requirements"] = json!(["curl (>= invalid)"]);
+                value
+            }),
+            ("Git commit", {
+                let mut value = lockfile.clone();
+                value["repos"][2]["commit"] = json!("not-an-oid");
+                value
+            }),
+            ("system requirements commit", {
+                let mut value = lockfile.clone();
+                value["sysreqs"]["db_commit"] = json!("not-an-oid");
+                value
+            }),
+            ("package version", {
+                let mut value = lockfile.clone();
+                value["packages"]["curl"]["version"] = json!("invalid");
+                value
+            }),
+            ("repository URL", {
+                let mut value = lockfile.clone();
+                value["repos"][0]["url"] = json!("not-a-url");
+                value
+            }),
+        ];
+
+        for (field, value) in cases {
+            assert_rejected::<Lockfile>(value, field);
+        }
+    }
+
+    #[test]
+    fn requires_nested_lockfile_fields() {
+        assert_rejected::<SystemRequirements>(json!({}), "sysreqs.rules");
+        assert_rejected::<Repository>(json!({ "kind": "rrepo" }), "rrepo.url");
+        assert_rejected::<Repository>(
+            json!({ "kind": "cran-like", "archive_support": "available" }),
+            "cran-like.url",
+        );
+        assert_rejected::<Repository>(
+            json!({ "kind": "cran-like", "url": "https://example.com" }),
+            "cran-like.archive_support",
+        );
+        assert_rejected::<Repository>(
+            json!({
+                "kind": "git",
+                "reference": { "type": "commit" },
+                "commit": GIT_COMMIT
+            }),
+            "git.url",
+        );
+        assert_rejected::<Repository>(
+            json!({
+                "kind": "git",
+                "url": "https://example.com/repository.git",
+                "commit": GIT_COMMIT
+            }),
+            "git.reference",
+        );
+        assert_rejected::<Repository>(
+            json!({
+                "kind": "git",
+                "url": "https://example.com/repository.git",
+                "reference": { "type": "commit" }
+            }),
+            "git.commit",
+        );
+        assert_rejected::<GitReference>(json!({ "type": "named" }), "named reference value");
+        assert_rejected::<Package>(
+            json!({
+                "repository": "https://example.com",
+                "dependencies": []
+            }),
+            "package.version",
+        );
+        assert_rejected::<Package>(
+            json!({ "version": "1.0.0", "dependencies": [] }),
+            "package.repository",
+        );
+        assert_rejected::<Package>(
+            json!({
+                "version": "1.0.0",
+                "repository": "https://example.com"
+            }),
+            "package.dependencies",
+        );
+    }
+
+    #[test]
+    fn repository_url_returns_each_variant_url() {
+        for (repository, expected) in [
+            (
+                Repository::Rrepo {
+                    url: url("https://rrepo.example/cran"),
+                },
+                url("https://rrepo.example/cran"),
+            ),
+            (
+                Repository::CranLike {
+                    url: url("https://cran.example"),
+                    archive_support: ArchiveSupport::Unavailable,
+                },
+                url("https://cran.example"),
+            ),
+            (
+                Repository::Git {
+                    url: url("https://git.example/repository.git"),
+                    reference: GitReference::Commit,
+                    commit: oid(GIT_COMMIT),
+                    subdirectory: None,
+                },
+                url("https://git.example/repository.git"),
+            ),
+        ] {
+            assert_eq!(repository.url(), &expected);
+        }
     }
 }

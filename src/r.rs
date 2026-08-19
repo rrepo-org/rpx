@@ -187,7 +187,7 @@ impl RVirtualEnv for tokio::process::Command {
     }
 }
 
-static BASE_PACKAGES: OnceCell<Vec<String>> = OnceCell::const_new();
+static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
 pub async fn install_local_package(
@@ -267,11 +267,37 @@ fn install_command_result(
     }
 }
 
-pub async fn base_packages() -> Result<Vec<String>, BasePackagesError> {
-    BASE_PACKAGES
-        .get_or_try_init(fetch_base_packages)
-        .await
-        .cloned()
+pub async fn base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
+    #[cfg(test)]
+    let packages = BASE_PACKAGES
+        .get_or_init(|| async {
+            [
+                "base",
+                "compiler",
+                "datasets",
+                "graphics",
+                "grDevices",
+                "grid",
+                "methods",
+                "parallel",
+                "splines",
+                "stats",
+                "stats4",
+                "tcltk",
+                "tools",
+                "utils",
+                "testBasePackage",
+            ]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect()
+        })
+        .await;
+
+    #[cfg(not(test))]
+    let packages = BASE_PACKAGES.get_or_try_init(fetch_base_packages).await?;
+
+    Ok(packages.clone())
 }
 
 pub async fn installed_packages(
@@ -441,7 +467,7 @@ fn write_install_log(
     })
 }
 
-async fn fetch_base_packages() -> Result<Vec<String>, BasePackagesError> {
+async fn fetch_base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
     let mut command = Command::new("Rscript");
     command
         .arg("-e")

@@ -50,8 +50,8 @@ use project::{
     LockedResolutionError, LockedResolutionFailure, RequiredPackages, artifact_cache_path,
     build_temp_library_path, cache_dir_path, project_library_path, project_library_root_path,
 };
-use r::{install_local_package, install_package_directory, installed_packages};
-use resolver::{ResolutionError, is_base_package, resolve_from_registry};
+use r::{base_packages, install_local_package, install_package_directory, installed_packages};
+use resolver::{ResolutionError, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
@@ -77,7 +77,7 @@ use crate::{
         LockedPackagesError, ProjectDiscoveryError, required_packages_from_lockfile,
         validate_locked_resolution,
     },
-    r::{RVersionError, RVirtualEnv, r_version_async, remove_packages_from_venv},
+    r::{BasePackagesError, RVersionError, RVirtualEnv, r_version_async, remove_packages_from_venv},
     repository::{
         CranRepository, GitRepository, LocalRepository, PackageRepository, RepositoryError,
         RrepoRepository, parse_repository_url,
@@ -232,6 +232,10 @@ enum StatusError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
 
     #[error(transparent)]
@@ -261,9 +265,6 @@ fn lock_error_from_resolution(error: ResolutionError) -> LockError {
         let source = match provider {
             resolver::ProviderError::Repository(source)
             | resolver::ProviderError::DependencyMetadata { source, .. } => source,
-            resolver::ProviderError::InvalidDependencies { .. } => {
-                return LockError::Resolution { source: error };
-            }
         };
         if let Some(repository) = inaccessible_git_repository(source) {
             return LockError::GitRepositoryUnavailable {
@@ -279,6 +280,7 @@ fn lock_error_from_resolution(error: ResolutionError) -> LockError {
                 explanation: DefaultStringReporter::report(&derivation_tree),
             }
         }
+        ResolutionError::BasePackages(source) => LockError::BasePackages(source),
         source => LockError::Resolution { source },
     }
 }
@@ -661,9 +663,12 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
         }
     };
 
-    let final_added_relations = unconstrained_packages.iter().fold(
-        added_relations.clone(),
-        |mut relations, package| {
+    let base_packages = base_packages().await.map_err(LockError::BasePackages)?;
+    let final_added_relations = unconstrained_packages
+        .iter()
+        // Base packages are supplied by R and intentionally absent from the resolved map.
+        .filter(|package| !base_packages.contains(package.as_str()))
+        .fold(added_relations.clone(), |mut relations, package| {
             let (selected, _) = resolved
                 .get(package)
                 .expect("resolved package map should contain every added package");
@@ -689,8 +694,7 @@ async fn cmd_add(packages: &[String]) -> Result<(), AddError> {
             );
 
             relations
-        },
-    );
+        });
 
     if final_added_relations != added_relations {
         add_dependencies(&current_dir, &mut description, &final_added_relations)?;
@@ -1316,6 +1320,10 @@ enum LockError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
 
     #[error(transparent)]
@@ -1564,11 +1572,12 @@ async fn cmd_status() -> Result<(), StatusError> {
     let lockfile = read_lockfile(&current_dir)?;
     let r_version = r_version_async().await?;
     validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
+    let base_packages = base_packages().await?;
 
     let mut expected_packages = lockfile
         .packages
         .iter()
-        .filter(|(name, _)| !is_base_package(name))
+        .filter(|(name, _)| !base_packages.contains(*name))
         .map(|(name, package)| (name.clone(), package.version.clone()))
         .collect::<BTreeMap<_, _>>();
     let (root_name, root_version) = root_package(&current_dir, &description)?;
@@ -2960,643 +2969,346 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultRepositoryPreference, LockError, RequiredPackages,
-        apply_added_packages_to_description, effective_package_repositories,
-        lock_error_from_resolution, lockfile_from_resolution, package_not_found_help,
-        package_rules_from_lockfile, parse_add_package, pinned_package_relations,
-        required_package_install_order, roots_from_description,
+        LockError, RequiredPackages, lock_error_from_repository, lock_error_from_resolution,
+        lockfile_from_resolution, package_dependency_names, package_requires_install,
+        package_rules_from_lockfile, parse_add_package, required_package_install_order,
     };
-    use crate::description::remove_dependencies;
-    use crate::lockfile::{
-        LOCKFILE_REVISION, LOCKFILE_VERSION, Lockfile, Repository, SystemRequirements,
+    use crate::{
+        git::GitError,
+        r::BasePackagesError,
+        repository::{
+            GitRepository, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
+        },
+        resolver::{PackageVersion, ProviderError, RDependencyProvider, ResolutionError},
+        sysreqs::{SysreqDbSnapshot, SysreqRule},
     };
-    use crate::repository::{
-        GitRepository, LocalRepository, PackageRepository, RepositoryError, RrepoRepository,
-        built_in_repository,
-    };
-    use crate::resolver::{PackageVersion, RDependencyProvider, ResolutionError};
-    use crate::sysreqs::{SysreqDbSnapshot, SysreqRule};
+    use miette::Diagnostic;
     use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
-    use r_description::{RDescription, Relation, Remote, VersionRequirement};
+    use r_description::{RDescription, Relation, Remote, Version};
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::PathBuf,
         sync::Arc,
     };
 
-    fn required_packages(packages: &[(&str, &[&str])]) -> RequiredPackages {
+    fn version(value: &str) -> Version {
+        value.parse().expect("version fixture should parse")
+    }
+
+    fn relation(value: &str) -> Relation {
+        value.parse().expect("relation fixture should parse")
+    }
+
+    fn required_packages(packages: &[(&str, &str)]) -> RequiredPackages {
         packages
             .iter()
-            .map(|(name, dependencies)| {
-                let imports = (!dependencies.is_empty())
-                    .then(|| format!("Imports: {}\n", dependencies.join(", ")))
-                    .unwrap_or_default();
+            .map(|(name, fields)| {
                 let description =
-                    RDescription::parse(&format!("Package: {name}\nVersion: 1.0.0\n{imports}"));
-                let version = PackageVersion::new(
-                    "1.0.0".parse().expect("version should parse"),
-                    built_in_repository(),
-                );
-
-                ((*name).to_string(), (version, Arc::new(description)))
+                    RDescription::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
+                (
+                    (*name).to_string(),
+                    (
+                        PackageVersion::new(version("1.0.0"), built_in_repository()),
+                        Arc::new(description),
+                    ),
+                )
             })
             .collect()
     }
 
-    fn url(value: &str) -> url::Url {
-        value.parse().expect("URL should parse")
-    }
-
-    fn rrepo(value: &str) -> Repository {
-        Repository::Rrepo { url: url(value) }
-    }
-
-    fn lockfile(repos: Vec<Repository>) -> Lockfile {
-        Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            r: semver::Version::new(4, 5, 0),
-            sysreqs: SystemRequirements {
-                db_commit: None,
-                rules: BTreeMap::new(),
-            },
-            repos,
-            requirements: BTreeSet::new(),
-            packages: BTreeMap::new(),
+    fn git_access_error(remote: &str) -> RepositoryError {
+        RepositoryError::Git {
+            repository: remote.to_string(),
+            source: Arc::new(GitError::Access {
+                remote: remote.to_string(),
+                source: git2::Error::from_str("access denied"),
+            }),
         }
     }
 
-    #[tokio::test]
-    async fn rejects_local_repository_locking() {
-        let repositories: Vec<Arc<dyn PackageRepository>> = vec![Arc::new(LocalRepository::new(
-            PathBuf::from("vendor/example"),
-        ))];
-
-        let error = lockfile_from_resolution(
-            BTreeSet::new(),
-            &RequiredPackages::new(),
-            &crate::sysreqs::empty_snapshot(),
-            &repositories,
-            &semver::Version::new(4, 5, 0),
-        )
-        .await
-        .expect_err("local repositories should not be lockable");
-
-        assert!(matches!(
-            error,
-            LockError::Repository {
-                source: RepositoryError::InvalidData { resource, details }
-            } if resource == "lockfile repository"
-                && details.contains("unsupported repository")
-                && details.contains("vendor/example")
-        ));
-    }
-
-    #[tokio::test]
-    async fn resolves_default_repository_preference_from_flags_and_lock() {
-        let description = RDescription::parse(
-            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://extra.test/cran\n",
-        );
-        let extra_only = lockfile(vec![rrepo("https://extra.test/cran")]);
-
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(true, false),
-            DefaultRepositoryPreference::Enabled
-        );
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(false, true),
-            DefaultRepositoryPreference::Disabled
-        );
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(false, false),
-            DefaultRepositoryPreference::FromLockfileOrDefault
-        );
-        assert!(
-            DefaultRepositoryPreference::Enabled
-                .enabled(&description, Some(&extra_only))
-                .await
-        );
-        assert!(
-            !DefaultRepositoryPreference::Disabled
-                .enabled(&description, Some(&extra_only))
-                .await
-        );
-        assert!(
-            !DefaultRepositoryPreference::FromLockfileOrDefault
-                .enabled(&description, Some(&extra_only))
-                .await
-        );
-        assert!(
-            DefaultRepositoryPreference::FromLockfileOrDefault
-                .enabled(&description, None)
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn appends_git_remotes_after_registry_repositories() {
-        let description = RDescription::parse(
-            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/repository@main\n",
-        );
-
-        let repositories = effective_package_repositories(&description, true)
-            .await
-            .expect("repositories should load");
-
-        assert_eq!(repositories.len(), 2);
-        assert!(repositories[0].downcast_ref::<RrepoRepository>().is_some());
-        let git = repositories[1]
-            .downcast_ref::<GitRepository>()
-            .expect("remote should become a Git repository");
-        assert_eq!(
-            git.remote().to_string(),
-            "https://github.com/owner/repository.git"
-        );
-        assert_eq!(git.reference(), Some("main"));
-        assert_eq!(git.subdirectory(), None);
+    fn ordinary_repository_error() -> RepositoryError {
+        RepositoryError::InvalidData {
+            resource: "fixture".to_string(),
+            details: "invalid".to_string(),
+        }
     }
 
     #[test]
-    fn renders_pubgrub_no_solution_report() {
-        let error: PubGrubError<RDependencyProvider> =
-            PubGrubError::NoSolution(DerivationTree::External(External::NoVersions(
-                "testthat".to_string(),
-                Ranges::empty(),
-            )));
+    fn parse_add_package_accepts_supported_forms() {
+        for (input, expected) in [
+            ("dplyr", "dplyr"),
+            ("dplyr@>=1.0.0", "dplyr (>= 1.0.0)"),
+            ("dplyr@<=1.0.0", "dplyr (<= 1.0.0)"),
+            ("dplyr@==1.0.0", "dplyr (== 1.0.0)"),
+            ("dplyr@!=1.0.0", "dplyr (!= 1.0.0)"),
+            ("dplyr@>1.0.0", "dplyr (> 1.0.0)"),
+            ("dplyr@<1.0.0", "dplyr (< 1.0.0)"),
+        ] {
+            let parsed = parse_add_package(input).expect("supported form should parse");
+            assert_eq!(parsed.package(), "dplyr");
+            assert_eq!(parsed.to_string(), expected);
+        }
+    }
 
-        let error = lock_error_from_resolution(ResolutionError::PubGrub(error));
-        let LockError::NoSolution { explanation } = &error else {
-            panic!("no-solution error should have a dedicated diagnostic");
-        };
+    #[test]
+    fn parse_add_package_rejects_invalid_forms() {
+        for input in [
+            "",
+            "dplyr >= 1.0.0",
+            "@>=1.0.0",
+            "dplyr@=1.0.0",
+            "dplyr@>=",
+            "dplyr@>= 1.0.0",
+        ] {
+            assert!(parse_add_package(input).is_err(), "{input:?} should fail");
+        }
+    }
 
-        assert!(explanation.contains("testthat"));
+    #[test]
+    fn lock_error_from_resolution_maps_current_categories() {
+        let source: PubGrubError<RDependencyProvider> = PubGrubError::NoSolution(
+            DerivationTree::External(External::NoVersions("missing".into(), Ranges::empty())),
+        );
+        let error = lock_error_from_resolution(ResolutionError::PubGrub(source));
+        assert!(matches!(
+            &error,
+            LockError::NoSolution { explanation } if explanation.contains("missing")
+        ));
         assert_eq!(
-            miette::Diagnostic::code(&error)
-                .map(|code| code.to_string())
-                .as_deref(),
+            error.code().map(|code| code.to_string()).as_deref(),
             Some("rpx::lock::no_solution")
         );
-    }
 
-    #[test]
-    fn install_graph_includes_project_dependencies_and_dependents() {
-        let packages = required_packages(&[
-            ("hard", &["leaf"]),
-            ("leaf", &[]),
-            ("project", &["hard"]),
-            ("reverse", &["project"]),
-            ("unrelated", &[]),
-        ]);
-
-        let order = required_package_install_order(&packages).unwrap();
-        let position = |name: &str| order.iter().position(|package| package == name).unwrap();
-
-        assert!(position("leaf") < position("hard"));
-        assert!(position("hard") < position("project"));
-        assert!(position("project") < position("reverse"));
-        assert!(order.contains(&"unrelated".to_string()));
-    }
-
-    #[test]
-    fn builds_root_relations_from_description_constraints() {
-        let description = RDescription::parse(
-            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\nLinkingTo: cpp11\nSuggests: testthat (>= 3.0.0)\nEnhances: shiny\n",
-        );
-
-        assert_eq!(
-            roots_from_description(&description)
-                .expect("root relations should parse")
-                .into_iter()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "cli (>= 3.6.0)".to_string(),
-                "cpp11".to_string(),
-                "digest".to_string(),
-                "jsonlite (== 1.8.9)".to_string(),
-                "testthat (>= 3.0.0)".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_project_dependency_fields() {
-        let description =
-            RDescription::parse("Package: testpkg\nVersion: 0.1.0\nImports: cli (>= invalid)\n");
-
+        for provider in [
+            ProviderError::Repository(git_access_error("https://example.test/repo.git")),
+            ProviderError::DependencyMetadata {
+                repository: "fixture".into(),
+                source: git_access_error("ssh://git@example.test/repo.git"),
+            },
+        ] {
+            assert!(matches!(
+                lock_error_from_resolution(ResolutionError::Provider(provider)),
+                LockError::GitRepositoryUnavailable { repository }
+                    if repository.contains("example.test/repo.git")
+            ));
+        }
+        let base = BasePackagesError::InvalidUtf8 {
+            source: String::from_utf8(vec![0xff]).expect_err("invalid UTF-8 fixture"),
+        };
         assert!(matches!(
-            roots_from_description(&description),
-            Err(LockError::ResolveFailed { .. })
+            lock_error_from_resolution(ResolutionError::BasePackages(base)),
+            LockError::BasePackages(_)
+        ));
+        assert!(matches!(
+            lock_error_from_resolution(ResolutionError::Provider(ProviderError::Repository(
+                ordinary_repository_error()
+            ))),
+            LockError::Resolution { .. }
+        ));
+    }
+
+    #[test]
+    fn lock_error_from_repository_maps_current_categories() {
+        assert!(matches!(
+            lock_error_from_repository(git_access_error("https://example.test/private.git")),
+            LockError::GitRepositoryUnavailable { repository }
+                if repository == "https://example.test/private.git"
+        ));
+        assert!(matches!(
+            lock_error_from_repository(ordinary_repository_error()),
+            LockError::Repository { .. }
         ));
     }
 
     #[tokio::test]
-    async fn locks_v5_package_metadata_and_only_hard_dependencies() {
-        let description = RDescription::parse(
-            "Package: selectedpkg\nVersion: 0.1.0\nTitle: Selected Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: hardDepends\nImports: hardImports\nLinkingTo: hardLinking\nSuggests: nestedSuggestion\nEnhances: enhancedPackage\nSystemRequirements: libcurl\n",
-        );
-        let repository = built_in_repository();
-        let repository_url = repository
-            .to_lockfile()
-            .await
-            .expect("built-in repository should be lockable")
-            .url()
-            .clone();
-        let resolved = BTreeMap::from([(
-            "selectedpkg".to_string(),
-            (
-                PackageVersion::new(
-                    "0.1.0".parse().expect("version should parse"),
-                    Arc::clone(&repository),
-                ),
-                Arc::new(description),
-            ),
+    async fn lockfile_from_resolution_assembles_current_metadata() {
+        let requirements = BTreeSet::from([relation("selected (>= 1.0.0)")]);
+        let resolved = required_packages(&[(
+            "selected",
+            "Depends: R (>= 4.4), hardDepends\nImports: hardImports\nLinkingTo: hardLinking\nSuggests: optional\nSystemRequirements: libcurl\n",
         )]);
-        let requirements = BTreeSet::from(["selectedpkg (>= 0.1.0)"
-            .parse::<Relation>()
-            .expect("requirement should parse")]);
         let commit = "1111111111111111111111111111111111111111";
         let snapshot = SysreqDbSnapshot {
-            commit: commit.to_string(),
+            commit: commit.into(),
             rules: vec![SysreqRule {
-                id: "libcurl".to_string(),
-                patterns: vec!["libcurl".to_string()],
+                id: "libcurl".into(),
+                patterns: vec!["libcurl".into()],
                 dependencies: vec![],
             }],
             scripts: BTreeMap::new(),
         };
-
         let lockfile = lockfile_from_resolution(
             requirements.clone(),
             &resolved,
             &snapshot,
-            &[repository],
+            &[built_in_repository()],
             &semver::Version::new(4, 5, 1),
         )
         .await
-        .expect("resolution should become a lockfile");
-        let package = &lockfile.packages["selectedpkg"];
-
-        assert_eq!(
-            package
-                .dependencies
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec![
-                "hardDepends".to_string(),
-                "hardImports".to_string(),
-                "hardLinking".to_string(),
-            ]
-        );
-        assert_eq!(lockfile.version, LOCKFILE_VERSION);
-        assert_eq!(lockfile.revision, LOCKFILE_REVISION);
-        assert_eq!(lockfile.r, semver::Version::new(4, 5, 1));
+        .expect("resolution should lock");
+        let package = &lockfile.packages["selected"];
         assert_eq!(lockfile.requirements, requirements);
-        assert_eq!(lockfile.repos, vec![rrepo(repository_url.as_str())]);
-        assert_eq!(package.version.to_string(), "0.1.0");
-        assert_eq!(package.repository, repository_url);
+        assert_eq!(lockfile.r, semver::Version::new(4, 5, 1));
+        assert_eq!(lockfile.repos.len(), 1);
+        assert_eq!(lockfile.repos[0].url(), &package.repository);
+        assert_eq!(package.version, version("1.0.0"));
         assert_eq!(
-            lockfile.sysreqs.db_commit,
-            Some(commit.parse().expect("commit should parse"))
+            package.dependencies,
+            BTreeSet::from([
+                relation("R (>= 4.4)"),
+                relation("hardDepends"),
+                relation("hardImports"),
+                relation("hardLinking"),
+            ])
         );
+        assert_eq!(lockfile.sysreqs.db_commit, Some(commit.parse().unwrap()));
         assert_eq!(
             lockfile.sysreqs.rules,
-            BTreeMap::from([(
-                "libcurl".to_string(),
-                BTreeSet::from(["selectedpkg".to_string()]),
-            )])
+            BTreeMap::from([("libcurl".into(), BTreeSet::from(["selected".into()]))])
         );
     }
 
     #[tokio::test]
-    async fn locks_selected_git_package_with_pinned_repository() {
-        let commit = "1111111111111111111111111111111111111111"
-            .parse::<git2::Oid>()
-            .expect("commit should parse");
-        let remote = "github::owner/repository@main"
-            .parse::<Remote>()
-            .expect("remote should parse");
-        let repository: Arc<dyn PackageRepository> = Arc::new(
-            GitRepository::new(remote)
-                .expect("Git repository should construct")
-                .with_commit(commit),
-        );
-        let description = RDescription::parse("Package: gitfixture\nVersion: 1.0.0\n");
+    async fn lockfile_from_resolution_rejects_unprovided_repository() {
+        let local: Arc<dyn PackageRepository> =
+            Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
         let resolved = BTreeMap::from([(
-            "gitfixture".to_string(),
+            "selected".into(),
             (
-                PackageVersion::new(
-                    "1.0.0".parse().expect("version should parse"),
-                    Arc::clone(&repository),
-                ),
-                Arc::new(description),
+                PackageVersion::new(version("1.0.0"), local),
+                Arc::new(RDescription::parse("Package: selected\nVersion: 1.0.0\n")),
             ),
         )]);
-
-        let lockfile = lockfile_from_resolution(
-            BTreeSet::from([Relation::any("gitfixture").expect("valid gitfixture relation")]),
-            &resolved,
-            &crate::sysreqs::empty_snapshot(),
-            &[repository],
-            &semver::Version::new(4, 5, 0),
-        )
-        .await
-        .expect("Git resolution should become a lockfile");
-
         assert!(matches!(
-            &lockfile.repos[0],
-            Repository::Git {
-                url,
-                reference: crate::lockfile::GitReference::Named { value },
-                commit: locked_commit,
-                subdirectory: None,
-            } if url.as_str() == "https://github.com/owner/repository.git"
-                && value == "main"
-                && locked_commit == &commit
+            lockfile_from_resolution(
+                BTreeSet::new(), &resolved, &crate::sysreqs::empty_snapshot(),
+                &[built_in_repository()], &semver::Version::new(4, 5, 0),
+            ).await,
+            Err(LockError::UnsupportedRepository { repository })
+                if repository == "vendor/selected"
         ));
-        assert_eq!(
-            lockfile.packages["gitfixture"].repository.as_str(),
-            "https://github.com/owner/repository.git"
-        );
     }
 
     #[tokio::test]
-    async fn rejects_invalid_system_requirements_commit_when_locking() {
-        let repository = built_in_repository();
+    async fn lockfile_from_resolution_rejects_invalid_metadata() {
+        for field in ["Depends", "Imports", "LinkingTo"] {
+            let metadata = format!("{field}: broken (>= invalid)\n");
+            let resolved = required_packages(&[("selected", &metadata)]);
+            assert!(matches!(
+                lockfile_from_resolution(
+                    BTreeSet::new(),
+                    &resolved,
+                    &crate::sysreqs::empty_snapshot(),
+                    &[built_in_repository()],
+                    &semver::Version::new(4, 5, 0),
+                )
+                .await,
+                Err(LockError::ResolveFailed { .. })
+            ));
+        }
         let snapshot = SysreqDbSnapshot {
-            commit: "not-an-oid".to_string(),
+            commit: "not-an-oid".into(),
             rules: vec![],
             scripts: BTreeMap::new(),
         };
-
-        let error = lockfile_from_resolution(
-            BTreeSet::new(),
-            &RequiredPackages::new(),
-            &snapshot,
-            &[repository],
-            &semver::Version::new(4, 5, 0),
-        )
-        .await
-        .expect_err("invalid commit should prevent locking");
-
         assert!(matches!(
-            error,
-            LockError::InvalidSystemRequirementsCommit { commit, .. }
+            lockfile_from_resolution(
+                BTreeSet::new(), &RequiredPackages::new(), &snapshot,
+                &[built_in_repository()], &semver::Version::new(4, 5, 0),
+            ).await,
+            Err(LockError::InvalidSystemRequirementsCommit { commit, .. })
                 if commit == "not-an-oid"
         ));
     }
 
     #[test]
-    fn groups_locked_system_rules_by_package() {
+    fn package_dependency_names_uses_only_hard_dependencies() {
+        let description = RDescription::parse(
+            "Package: selected\nVersion: 1.0.0\nDepends: R, depends, duplicate\nImports: imports, duplicate\nLinkingTo: linking\nSuggests: suggested\n",
+        );
+        assert_eq!(
+            package_dependency_names(&description).unwrap(),
+            BTreeSet::from([
+                "depends".into(),
+                "duplicate".into(),
+                "imports".into(),
+                "linking".into()
+            ])
+        );
+        for field in ["Depends", "Imports", "LinkingTo"] {
+            let description = RDescription::parse(&format!(
+                "Package: selected\nVersion: 1.0.0\n{field}: broken (>= invalid)\n"
+            ));
+            assert!(package_dependency_names(&description).is_err());
+        }
+    }
+
+    #[test]
+    fn package_rules_from_lockfile_inverts_ordered_used_rules() {
         let rules = BTreeMap::from([
             (
-                "libcurl".to_string(),
-                BTreeSet::from(["curl".to_string(), "httr2".to_string()]),
+                "libcurl".into(),
+                BTreeSet::from(["curl".into(), "httr2".into()]),
             ),
-            ("openssl".to_string(), BTreeSet::from(["curl".to_string()])),
-            ("unused".to_string(), BTreeSet::new()),
+            ("openssl".into(), BTreeSet::from(["curl".into()])),
+            ("unused".into(), BTreeSet::new()),
         ]);
-
         assert_eq!(
             package_rules_from_lockfile(&rules),
             BTreeMap::from([
-                (
-                    "curl".to_string(),
-                    vec!["libcurl".to_string(), "openssl".to_string()],
-                ),
-                ("httr2".to_string(), vec!["libcurl".to_string()]),
+                ("curl".into(), vec!["libcurl".into(), "openssl".into()]),
+                ("httr2".into(), vec!["libcurl".into()]),
             ])
         );
     }
 
     #[test]
-    fn builds_pinned_package_relations_from_latest_version() {
-        let latest = "1.1.4".parse().unwrap();
-
-        assert_eq!(
-            pinned_package_relations("digest", &latest)
-                .unwrap()
-                .into_iter()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            vec![
-                "digest (>= 1.1.4)".to_string(),
-                "digest (< 2.0.0)".to_string(),
-            ]
+    fn package_requires_install_respects_source_and_version() {
+        let registry = PackageVersion::new(version("1.0.0"), built_in_repository());
+        let same = PackageVersion::new(version("1.0.0"), built_in_repository());
+        let old = PackageVersion::new(version("0.9.0"), built_in_repository());
+        assert!(package_requires_install(&registry, None));
+        assert!(!package_requires_install(&registry, Some(&same)));
+        assert!(package_requires_install(&registry, Some(&old)));
+        let local: Arc<dyn PackageRepository> =
+            Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
+        let git: Arc<dyn PackageRepository> = Arc::new(
+            GitRepository::new("github::owner/repository".parse::<Remote>().unwrap()).unwrap(),
         );
+        assert!(package_requires_install(
+            &PackageVersion::new(version("1.0.0"), local),
+            Some(&same)
+        ));
+        assert!(package_requires_install(
+            &PackageVersion::new(version("1.0.0"), git),
+            Some(&same)
+        ));
     }
 
     #[test]
-    fn parses_explicit_add_constraint() {
-        let package = parse_add_package("dplyr@>=1.0.0").expect("constraint should parse");
-
-        assert_eq!(package.name, "dplyr");
-        assert_eq!(
-            package
-                .relation
-                .expect("relation should be present")
-                .to_string(),
-            "dplyr (>= 1.0.0)"
-        );
-        assert_eq!(
-            parse_add_package("dplyr@!=1.0.0")
-                .expect("constraint should parse")
-                .relation
-                .expect("relation should be present")
-                .to_string(),
-            "dplyr (!= 1.0.0)"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_explicit_add_constraint() {
-        assert!(parse_add_package("dplyr@=1.0.0").is_err());
-        assert!(parse_add_package("dplyr@>=").is_err());
-        assert!(parse_add_package("dplyr@>= 1.0.0").is_err());
-    }
-
-    #[test]
-    fn constrained_add_replaces_existing_dependency_relations() {
-        let mut description = RDescription::parse(
-            "Package: testpkg
-Version: 0.1.0
-Title: Test Package
-Description: Test package for unit tests.
-License: MIT
-Depends: dplyr (>= 1.0.0), keepDepends
-Imports: dplyr (< 2.0.0), keepImports
-LinkingTo: dplyr, keepLinking
-Suggests: dplyr, keepSuggests
-Enhances: dplyr, keepEnhances
-",
-        );
-        let relation = Relation::new("dplyr", VersionRequirement::Equal("1.0.0".parse().unwrap()))
-            .expect("valid dplyr relation");
-
-        apply_added_packages_to_description(&mut description, &BTreeSet::from([relation]))
-            .expect("description should update");
-
-        assert_eq!(
-            description
-                .depends()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["keepDepends"]
-        );
-        assert_eq!(
-            description
-                .imports()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["dplyr (== 1.0.0)", "keepImports"]
-        );
-        assert_eq!(
-            description
-                .linking_to()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["keepLinking"]
-        );
-        assert_eq!(
-            description
-                .suggests()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["keepSuggests"]
-        );
-        assert_eq!(
-            description
-                .enhances()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["keepEnhances"]
-        );
-    }
-
-    #[test]
-    fn added_imports_are_sorted_and_deduplicated() {
-        let mut description = RDescription::parse(
-            "Package: testpkg
-Version: 0.1.0
-Imports: zoo, cli, cli
-",
-        );
-        let added = BTreeSet::from([
-            "dplyr".parse::<Relation>().expect("relation should parse"),
-            "askpass"
-                .parse::<Relation>()
-                .expect("relation should parse"),
-        ]);
-
-        apply_added_packages_to_description(&mut description, &added)
-            .expect("description should update");
-
-        assert_eq!(
-            description
-                .imports()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["askpass", "cli", "dplyr", "zoo"]
-        );
-    }
-
-    #[test]
-    fn removes_packages_from_project_dependency_fields() {
-        let mut description = RDescription::parse(
-            "Package: testpkg
-Version: 0.1.0
-Title: Test Package
-Description: Test package for unit tests.
-License: MIT
-Depends: R (>= 4.2), removeMe (>= 1.0), keepDepends
-Imports: removeMe, keepImports
-LinkingTo: removeMe, keepLinking
-Suggests: removeMe, keepSuggests
-Enhances: removeMe, keepEnhances
-",
-        );
-        let packages = BTreeSet::from(["removeMe".to_string()]);
-
-        remove_dependencies(&PathBuf::from("."), &mut description, &packages)
-            .expect("description should update");
-
-        assert_eq!(
-            description
-                .depends()
-                .unwrap()
-                .map(|relation| relation.package().to_string())
-                .collect::<Vec<_>>(),
-            vec!["R".to_string(), "keepDepends".to_string()]
-        );
-        assert_eq!(
-            description.imports().unwrap().next().unwrap().to_string(),
-            "keepImports"
-        );
-        assert_eq!(
-            description
-                .linking_to()
-                .unwrap()
-                .next()
-                .unwrap()
-                .to_string(),
-            "keepLinking"
-        );
-        assert_eq!(
-            description.suggests().unwrap().next().unwrap().to_string(),
-            "keepSuggests"
-        );
-        assert_eq!(
-            description
-                .enhances()
-                .unwrap()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            ["removeMe", "keepEnhances"]
-        );
-    }
-
-    #[test]
-    fn suggests_similar_package_names_for_missing_adds() {
-        let known = ["dplyr", "digest", "ggplot2", "jsonlite"]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(
-            package_not_found_help(&["dyplr".to_string(), "ggplot".to_string()], &known),
-            "For dyplr, did you mean dplyr? For ggplot, did you mean ggplot2?"
-        );
-    }
-
-    #[test]
-    fn installs_required_packages_in_dependency_order() {
+    fn required_package_install_order_is_complete_and_dependency_first() {
         let packages = required_packages(&[
-            ("AzureKeyVault", &["AzureRMR"]),
-            ("AzureRMR", &["httr2"]),
-            ("httr2", &[]),
+            ("dependent", "Imports: dependency, external\n"),
+            ("dependency", ""),
+            ("unrelated", ""),
         ]);
-
-        assert_eq!(
-            required_package_install_order(&packages).unwrap(),
-            vec![
-                "httr2".to_string(),
-                "AzureRMR".to_string(),
-                "AzureKeyVault".to_string()
-            ]
-        );
+        let order = required_package_install_order(&packages).unwrap();
+        let position = |name| order.iter().position(|package| package == name).unwrap();
+        assert!(position("dependency") < position("dependent"));
+        assert!(order.contains(&"unrelated".into()));
+        assert!(!order.contains(&"external".into()));
     }
 
     #[test]
-    fn rejects_cyclic_required_dependencies() {
-        let packages = required_packages(&[("a", &["b"]), ("b", &["a"])]);
-
-        required_package_install_order(&packages).expect_err("cycle should fail");
+    fn required_package_install_order_reports_all_blocked_names() {
+        let packages = required_packages(&[
+            ("a", "Imports: b\n"),
+            ("b", "Imports: a\n"),
+            ("c", "Imports: a\n"),
+        ]);
+        assert_eq!(
+            required_package_install_order(&packages).unwrap_err(),
+            "cyclic or unresolved package dependencies: a, b, c"
+        );
     }
 }

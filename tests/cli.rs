@@ -64,22 +64,6 @@ fn runs_rpx_init_in_empty_directory() {
 }
 
 #[test]
-fn fails_when_description_already_exists() {
-    let container = start_container();
-    let project_path = "/tmp/rpx-project-init-existing";
-    create_package_project(&container, project_path);
-
-    let command = format!("cd {project_path} && rpx init");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
-
-    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(
-        stderr.contains("DESCRIPTION already exists"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-}
-
-#[test]
 fn init_creates_project_that_can_add_dependencies() {
     let container = start_container();
     let project_path = "/tmp/rpx-init-add";

@@ -46,6 +46,10 @@ impl DescriptionParseError {
             issues,
         }
     }
+
+    pub fn messages(&self) -> Vec<String> {
+        self.issues.iter().map(ToString::to_string).collect()
+    }
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -351,7 +355,7 @@ pub fn root_package(
 }
 
 pub fn required_dependencies(
-    project_path: &Path,
+    source_name: impl Into<String>,
     description: &RDescription,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
     let imports = description.imports();
@@ -421,7 +425,7 @@ pub fn required_dependencies(
             .filter(|relation| relation.package() != "R")
             .collect()),
         _ => Err(DescriptionParseError::new(
-            project_path.join(DESCRIPTION_NAME).display().to_string(),
+            source_name,
             description.to_string(),
             issues,
         )),
@@ -1103,8 +1107,79 @@ pub async fn repositories_from_description(
 
 #[cfg(test)]
 mod tests {
-    use super::title_from_package_name;
-    use r_description::RDescription;
+    use super::*;
+    use std::{
+        ffi::OsString,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    static REGISTRY_ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let unique = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "rpx-description-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RegistryEnvironment(Option<OsString>);
+
+    impl RegistryEnvironment {
+        fn set(value: Option<&str>) -> Self {
+            let previous = env::var_os("RPX_REGISTRY_BASE_URL");
+            unsafe {
+                match value {
+                    Some(value) => env::set_var("RPX_REGISTRY_BASE_URL", value),
+                    None => env::remove_var("RPX_REGISTRY_BASE_URL"),
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for RegistryEnvironment {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => env::set_var("RPX_REGISTRY_BASE_URL", value),
+                    None => env::remove_var("RPX_REGISTRY_BASE_URL"),
+                }
+            }
+        }
+    }
+
+    fn relation_strings(
+        relations: Result<std::vec::IntoIter<Relation>, impl std::fmt::Debug>,
+    ) -> Vec<String> {
+        relations
+            .expect("relations should parse")
+            .map(|relation| relation.to_string())
+            .collect()
+    }
+
+    fn relation_set(relations: &[&str]) -> BTreeSet<Relation> {
+        relations
+            .iter()
+            .map(|relation| relation.parse().expect("relation should parse"))
+            .collect()
+    }
 
     #[test]
     fn derives_title_from_package_name() {
@@ -1112,6 +1187,436 @@ mod tests {
             title_from_package_name("my.package.name"),
             "My Package Name"
         );
+    }
+
+    #[test]
+    fn derives_initial_description_from_package_name() {
+        let description = initial_description("my.package").expect("description should initialize");
+
+        assert_eq!(description.package().unwrap(), "my.package");
+        assert_eq!(description.version().unwrap().to_string(), "0.1.0");
+        assert_eq!(description.title().unwrap(), "My Package");
+        assert_eq!(description.license().unwrap(), "MIT");
+    }
+
+    #[test]
+    fn derives_and_validates_package_names_from_directory_names() {
+        assert_eq!(
+            derive_package_name(Path::new("/tmp/my-project_name")).unwrap(),
+            "my.project.name"
+        );
+        assert!(matches!(
+            derive_package_name(Path::new("/tmp/123-project")),
+            Err(PackageNameDerivationError::MustStartWithLetter { .. })
+        ));
+        assert!(matches!(
+            derive_package_name(Path::new("/tmp/---")),
+            Err(PackageNameDerivationError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn reads_and_writes_description_without_caching_failures() {
+        let directory = TestDirectory::new("read-write");
+        let path = directory.0.join(DESCRIPTION_NAME);
+        fs::write(
+            &path,
+            "Package: project\nVersion: 1.0.0\nthis line is malformed\n",
+        )
+        .expect("malformed DESCRIPTION should be written");
+
+        assert!(matches!(
+            read_description(&directory.0),
+            Err(DescriptionReadError::Parse(_))
+        ));
+
+        let expected = RDescription::parse("Package: project\nVersion: 2.0.0\nImports: cli\n");
+        write_description(&directory.0, &expected).expect("DESCRIPTION should be written");
+        let actual = read_description(&directory.0).expect("DESCRIPTION should be reread");
+
+        assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn creates_namespace_only_when_missing() {
+        let directory = TestDirectory::new("namespace");
+        let namespace = directory.0.join("NAMESPACE");
+
+        write_namespace_if_missing(&directory.0).expect("NAMESPACE should be created");
+        fs::write(&namespace, "export(example)\n").expect("NAMESPACE should be populated");
+        write_namespace_if_missing(&directory.0).expect("existing NAMESPACE should be accepted");
+
+        assert_eq!(
+            fs::read_to_string(namespace).expect("NAMESPACE should be readable"),
+            "export(example)\n"
+        );
+    }
+
+    #[test]
+    fn parses_root_package_and_version() {
+        let description = RDescription::parse("Package: project\nVersion: 1.2.3\n");
+
+        let (package, version) =
+            root_package(Path::new("."), &description).expect("root should parse");
+
+        assert_eq!(package, "project");
+        assert_eq!(version.to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn reports_all_invalid_root_fields() {
+        let missing = RDescription::parse("");
+        let error = root_package(Path::new("."), &missing).expect_err("root should be invalid");
+        assert_eq!(error.count, 2);
+
+        let invalid = RDescription::parse("Package: one\nPackage: two\nVersion: invalid\n");
+        let error = root_package(Path::new("."), &invalid).expect_err("root should be invalid");
+        assert_eq!(error.count, 3);
+    }
+
+    #[test]
+    fn collects_project_dependencies_with_current_field_semantics() {
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\nImports: cli (>= 3.6.0), digest\nLinkingTo: cpp11\nSuggests: testthat (>= 3.0.0)\nEnhances: shiny\n",
+        );
+
+        assert_eq!(
+            project_dependencies(Path::new("."), &description)
+                .expect("project dependencies should parse")
+                .into_iter()
+                .map(|relation| relation.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "cli (>= 3.6.0)",
+                "cpp11",
+                "digest",
+                "jsonlite (== 1.8.9)",
+                "testthat (>= 3.0.0)",
+            ]
+        );
+        assert_eq!(
+            required_dependencies("DESCRIPTION", &description)
+                .expect("required dependencies should parse")
+                .into_iter()
+                .map(|relation| relation.to_string())
+                .collect::<Vec<_>>(),
+            ["cli (>= 3.6.0)", "cpp11", "digest", "jsonlite (== 1.8.9)",]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_project_dependency_fields_together() {
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nImports: cli (>= invalid)\nSuggests: testthat (< invalid)\n",
+        );
+
+        let error = project_dependencies(Path::new("."), &description)
+            .expect_err("dependencies should be invalid");
+
+        assert_eq!(error.count, 2);
+    }
+
+    #[test]
+    fn add_moves_packages_to_imports_and_leaves_enhances_untouched() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: dplyr (>= 1.0.0), keepDepends\nImports: dplyr (< 2.0.0), keepImports\nLinkingTo: dplyr, keepLinking\nSuggests: dplyr, keepSuggests\nEnhances: dplyr, keepEnhances\n",
+        );
+
+        add_dependencies(
+            Path::new("."),
+            &mut description,
+            &relation_set(&["dplyr (== 1.1.0)"]),
+        )
+        .expect("dependency should be added");
+
+        assert_eq!(relation_strings(description.depends()), ["keepDepends"]);
+        assert_eq!(
+            relation_strings(description.imports()),
+            ["dplyr (== 1.1.0)", "keepImports"]
+        );
+        assert_eq!(relation_strings(description.linking_to()), ["keepLinking"]);
+        assert_eq!(relation_strings(description.suggests()), ["keepSuggests"]);
+        assert_eq!(
+            relation_strings(description.enhances()),
+            ["dplyr", "keepEnhances"]
+        );
+    }
+
+    #[test]
+    fn add_semantically_deduplicates_every_rewritten_field() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: alpha, alpha\nImports: beta (>= 1.0), beta (>= 1.0.0), zoo\nLinkingTo: gamma, gamma\nSuggests: delta, delta\n",
+        );
+
+        add_dependencies(
+            Path::new("."),
+            &mut description,
+            &relation_set(&["askpass", "cli"]),
+        )
+        .expect("dependencies should be added");
+
+        assert_eq!(relation_strings(description.depends()), ["alpha"]);
+        assert_eq!(
+            relation_strings(description.imports()),
+            ["askpass", "beta (>= 1.0.0)", "cli", "zoo"]
+        );
+        assert_eq!(relation_strings(description.linking_to()), ["gamma"]);
+        assert_eq!(relation_strings(description.suggests()), ["delta"]);
+    }
+
+    #[test]
+    fn add_preserves_distinct_requirements_for_the_same_package() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nImports: cli (>= 1.0.0), cli (< 2.0.0)\n",
+        );
+
+        add_dependencies(Path::new("."), &mut description, &relation_set(&["digest"]))
+            .expect("dependency should be added");
+
+        assert_eq!(
+            relation_strings(description.imports()),
+            ["cli (< 2.0.0)", "cli (>= 1.0.0)", "digest"]
+        );
+    }
+
+    #[test]
+    fn add_is_transactional_when_any_dependency_field_is_invalid() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: cli\nImports: digest (>= invalid)\n",
+        );
+        let original = description.to_string();
+
+        assert!(
+            add_dependencies(
+                Path::new("."),
+                &mut description,
+                &relation_set(&["jsonlite"]),
+            )
+            .is_err()
+        );
+        assert_eq!(description.to_string(), original);
+    }
+
+    #[test]
+    fn empty_add_does_not_rewrite_existing_fields() {
+        let mut description =
+            RDescription::parse("Package: project\nVersion: 1.0.0\nImports: cli, cli\n");
+        let original = description.to_string();
+
+        add_dependencies(Path::new("."), &mut description, &BTreeSet::new())
+            .expect("empty add should succeed");
+
+        assert_eq!(description.to_string(), original);
+    }
+
+    #[test]
+    fn remove_normalizes_managed_fields_and_leaves_enhances_untouched() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), removeMe, keepDepends, keepDepends\nImports: removeMe, keepImports, keepImports\nLinkingTo: removeMe, keepLinking, keepLinking\nSuggests: removeMe, keepSuggests, keepSuggests\nEnhances: removeMe, keepEnhances, keepEnhances\n",
+        );
+
+        remove_dependencies(
+            Path::new("."),
+            &mut description,
+            &BTreeSet::from(["removeMe".to_string()]),
+        )
+        .expect("dependency should be removed");
+
+        assert_eq!(
+            relation_strings(description.depends()),
+            ["R (>= 4.2)", "keepDepends"]
+        );
+        assert_eq!(relation_strings(description.imports()), ["keepImports"]);
+        assert_eq!(relation_strings(description.linking_to()), ["keepLinking"]);
+        assert_eq!(relation_strings(description.suggests()), ["keepSuggests"]);
+        assert_eq!(
+            relation_strings(description.enhances()),
+            ["removeMe", "keepEnhances", "keepEnhances"]
+        );
+    }
+
+    #[test]
+    fn remove_is_transactional_when_any_dependency_field_is_invalid() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nDepends: cli\nSuggests: testthat (>= invalid)\n",
+        );
+        let original = description.to_string();
+
+        assert!(
+            remove_dependencies(
+                Path::new("."),
+                &mut description,
+                &BTreeSet::from(["cli".to_string()]),
+            )
+            .is_err()
+        );
+        assert_eq!(description.to_string(), original);
+    }
+
+    #[test]
+    fn parses_supported_git_remotes() {
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/github-package@main,\n gitlab@code.example::group/gitlab-package,\n bitbucket::owner/bitbucket-package/subdir@v1,\n generic=git::ssh://git@example.com/team/generic-package.git@develop\n",
+        );
+
+        let remotes = remotes(Path::new("."), &description).expect("remotes should parse");
+
+        assert_eq!(remotes.len(), 4);
+        assert!(matches!(remotes[0].source, RemoteSource::GitHub(_)));
+        assert!(matches!(remotes[1].source, RemoteSource::GitLab(_)));
+        assert!(matches!(remotes[2].source, RemoteSource::Bitbucket(_)));
+        assert!(matches!(remotes[3].source, RemoteSource::Git(_)));
+        assert_eq!(remotes[1].host.as_deref(), Some("code.example"));
+        assert_eq!(remotes[3].package.as_deref(), Some("generic"));
+    }
+
+    #[test]
+    fn rejects_malformed_unsupported_and_duplicate_remotes() {
+        let malformed =
+            RDescription::parse("Package: project\nVersion: 1.0.0\nRemotes: github::owner\n");
+        assert!(remotes(Path::new("."), &malformed).is_err());
+
+        let invalid = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: dependency=url::https://example.com/pkg.tar.gz, dependency=owner/repository\n",
+        );
+        let error = remotes(Path::new("."), &invalid).expect_err("remotes should be invalid");
+        assert_eq!(error.count, 2);
+    }
+
+    #[test]
+    fn parses_additional_repositories_in_source_order() {
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://first.example/cran, https://second.example/cran\n",
+        );
+
+        assert_eq!(
+            additional_repositories(Path::new("."), &description)
+                .expect("repositories should parse")
+                .into_iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>(),
+            ["https://first.example/cran", "https://second.example/cran"]
+        );
+    }
+
+    #[test]
+    fn parses_and_sets_base_repository() {
+        let mut description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://first.example/cran\nconfig/RPX/base-repository: https://second.example/cran\n",
+        );
+        assert!(base_repository(Path::new("."), &description).is_err());
+
+        let expected = Url::parse("https://replacement.example/cran").unwrap();
+        set_base_repository(&mut description, &expected).expect("base repository should be set");
+
+        assert_eq!(description.field_values(BASE_REPOSITORY_FIELD).len(), 1);
+        assert_eq!(
+            base_repository(Path::new("."), &description).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base_and_additional_repositories() {
+        let base = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\n",
+        );
+        assert!(base_repository(Path::new("."), &base).is_err());
+
+        let additional = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: not-a-url\n",
+        );
+        assert!(additional_repositories(Path::new("."), &additional).is_err());
+    }
+
+    #[test]
+    fn configures_base_git_and_additional_repositories_in_order() {
+        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
+        let _environment = RegistryEnvironment::set(None);
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://base.example/cran\nRemotes: github::owner/repository@main\nAdditional_repositories: https://additional.example/cran\n",
+        );
+
+        let repositories = configured_repositories(Path::new("."), &description)
+            .expect("repositories should configure");
+
+        assert!(matches!(
+            &repositories[0],
+            ConfiguredRepository::Base(url) if url.as_str() == "https://base.example/cran"
+        ));
+        assert!(matches!(
+            &repositories[1],
+            ConfiguredRepository::Git(remote)
+                if matches!(remote.source, RemoteSource::GitHub(_))
+        ));
+        assert!(matches!(
+            &repositories[2],
+            ConfiguredRepository::Additional(url)
+                if url.as_str() == "https://additional.example/cran"
+        ));
+    }
+
+    #[test]
+    fn configures_builtin_base_repository_by_default() {
+        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
+        let _environment = RegistryEnvironment::set(None);
+        let repositories = configured_repositories(Path::new("."), &RDescription::parse(""))
+            .expect("default repository should configure");
+
+        assert_eq!(
+            repositories,
+            [ConfiguredRepository::Base(
+                Url::parse(BUILT_IN_REPOSITORY_BASE_URL).unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn environment_base_repository_overrides_description_configuration() {
+        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
+        let _environment = RegistryEnvironment::set(Some("https://environment.example/cran"));
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\n",
+        );
+
+        let repositories = configured_repositories(Path::new("."), &description)
+            .expect("environment repository should configure");
+
+        assert_eq!(
+            repositories,
+            [ConfiguredRepository::Base(
+                Url::parse("https://environment.example/cran").unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_environment_base_repository() {
+        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
+        let _environment = RegistryEnvironment::set(Some("not-a-url"));
+
+        assert!(matches!(
+            configured_repositories(Path::new("."), &RDescription::parse("")),
+            Err(ConfiguredRepositoriesError::InvalidEnvironmentUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn aggregates_repository_configuration_errors() {
+        let _lock = REGISTRY_ENVIRONMENT.lock().unwrap();
+        let _environment = RegistryEnvironment::set(None);
+        let description = RDescription::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\nRemotes: archive=url::https://example.com/pkg.tar.gz\nAdditional_repositories: also-not-a-url\n",
+        );
+
+        let ConfiguredRepositoriesError::Description(error) =
+            configured_repositories(Path::new("."), &description)
+                .expect_err("repositories should be invalid")
+        else {
+            panic!("expected DESCRIPTION configuration errors");
+        };
+
+        assert_eq!(error.count, 3);
     }
 
     #[test]
@@ -1127,5 +1632,4 @@ mod tests {
             "serialized DESCRIPTION should parse:\n{contents}"
         );
     }
-
 }

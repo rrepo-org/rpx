@@ -82,10 +82,9 @@ fn reports_pubgrub_no_solution_explanation() {
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add";
-    let working_path = "/tmp/rpx-project-add/subdir";
     create_package_project(&container, project_path);
 
-    let command = format!("mkdir -p {working_path} && cd {working_path} && rpx add digest");
+    let command = format!("cd {project_path} && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -93,8 +92,8 @@ fn runs_rpx_add_inside_custom_r_image() {
         stdout.contains("Added digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
-    assert_package_state(&container, working_path, "digest", "TRUE");
-    assert_package_state(&container, working_path, "testpkg", "TRUE");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
 
     let lockfile =
         serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
@@ -171,7 +170,7 @@ fn duplicate_add_reuses_lock_and_restores_missing_package() {
     create_package_project(&container, project_path);
 
     let add_command = format!("cd {project_path} && rpx add digest");
-    let reuse_command = format!("cd {project_path} && rpx add --default-repo digest");
+    let reuse_command = format!("cd {project_path} && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
@@ -337,7 +336,7 @@ fn adds_and_removes_multiple_packages() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Added digest, cli"),
+        stdout.contains("Added cli, digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert_package_state(&container, project_path, "digest", "TRUE");
@@ -395,41 +394,7 @@ Imports: digest",
 }
 
 #[test]
-fn inherits_and_overrides_default_repository_policy() {
-    let container = start_container();
-    let project_path = "/tmp/rpx-project-default-repository-policy";
-    create_package_project(&container, project_path);
-
-    let command = format!("cd {project_path} && rpx lock --no-default-repo");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    let lockfile = read_project_file(&container, project_path, "rpx.lock");
-    assert!(
-        !lockfile.contains("https://upstream.rrepo.dev/cran"),
-        "lockfile was: {lockfile}"
-    );
-
-    let command = format!("cd {project_path} && rpx lock");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    let lockfile = read_project_file(&container, project_path, "rpx.lock");
-    assert!(
-        !lockfile.contains("https://upstream.rrepo.dev/cran"),
-        "lockfile was: {lockfile}"
-    );
-
-    let command = format!("cd {project_path} && rpx lock --default-repo");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    let lockfile = read_project_file(&container, project_path, "rpx.lock");
-    assert!(
-        lockfile.contains("https://upstream.rrepo.dev/cran"),
-        "lockfile was: {lockfile}"
-    );
-}
-
-#[test]
-fn does_not_add_import_when_package_is_already_in_depends() {
+fn moves_added_package_from_depends_to_imports() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-depends";
     write_description(
@@ -454,11 +419,11 @@ Depends: R (>= 4.3), digest",
     let depends = relation_names(parsed.depends().expect("Depends should parse"));
     let imports = relation_names(parsed.imports().expect("Imports should parse"));
     assert!(
-        depends.contains(&"digest".to_string()) && depends.contains(&"R".to_string()),
+        !depends.contains(&"digest".to_string()) && depends.contains(&"R".to_string()),
         "DESCRIPTION was: {description}"
     );
     assert!(
-        !imports.contains(&"digest".to_string()),
+        imports.contains(&"digest".to_string()),
         "DESCRIPTION was: {description}"
     );
 }

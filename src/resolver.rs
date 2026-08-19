@@ -12,26 +12,13 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use crate::repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository};
+use crate::{
+    description::required_dependencies,
+    r::{BasePackagesError, base_packages},
+    repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository},
+};
 
 const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
-#[deprecated]
-const BASE_PACKAGES: &[&str] = &[
-    "base",
-    "compiler",
-    "datasets",
-    "graphics",
-    "grDevices",
-    "grid",
-    "methods",
-    "parallel",
-    "splines",
-    "stats",
-    "stats4",
-    "tcltk",
-    "tools",
-    "utils",
-];
 #[derive(Debug, Clone, Error)]
 pub(crate) enum ProviderError {
     #[error(transparent)]
@@ -43,17 +30,13 @@ pub(crate) enum ProviderError {
         #[source]
         source: RepositoryError,
     },
-
-    #[error("invalid dependency metadata for {package} {version}: {details}")]
-    InvalidDependencies {
-        package: String,
-        version: Version,
-        details: String,
-    },
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum ResolutionError {
+    #[error(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
@@ -122,8 +105,9 @@ impl std::fmt::Display for PackageVersion {
 pub(crate) struct RDependencyProvider {
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
-    root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+    root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
     preferred_versions: BTreeMap<String, Version>,
+    base_packages: BTreeSet<String>,
     description_prefetch_permits: Arc<Semaphore>,
 }
 
@@ -131,14 +115,16 @@ impl RDependencyProvider {
     fn new(
         repositories: Vec<Arc<dyn PackageRepository>>,
         root: Arc<LocalRepository>,
-        root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+        root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
         preferred_versions: BTreeMap<String, Version>,
+        base_packages: BTreeSet<String>,
     ) -> Self {
         Self {
             repositories,
             root,
             root_dependencies,
             preferred_versions,
+            base_packages,
             description_prefetch_permits: Arc::new(Semaphore::new(DESCRIPTION_PREFETCH_WORKERS)),
         }
     }
@@ -283,7 +269,7 @@ impl DependencyProvider for RDependencyProvider {
             return Ok(Dependencies::Available(constraints));
         }
 
-        if is_base_package(package) {
+        if self.base_packages.contains(package) {
             return Ok(Dependencies::Available(DependencyConstraints::default()));
         }
 
@@ -294,14 +280,14 @@ impl DependencyProvider for RDependencyProvider {
                 source,
             })?;
 
-        let constraints =
-            dependency_constraints_from_description(&description).map_err(|details| {
-                ProviderError::InvalidDependencies {
-                    package: package.clone(),
-                    version: version.version.clone(),
-                    details,
-                }
-            })?;
+        let dependencies = dependencies_from_description(
+            format!("{package} {} from {}", version.version, version.repository),
+            &description,
+            &self.base_packages,
+        );
+        let Dependencies::Available(constraints) = dependencies else {
+            return Ok(dependencies);
+        };
 
         self.prefetch_descriptions(&constraints)?;
 
@@ -389,31 +375,20 @@ async fn choose_repository_version(
         .max())
 }
 
-fn dependency_constraints_from_description(
+fn dependencies_from_description(
+    source_name: impl Into<String>,
     description: &RDescription,
-) -> Result<DependencyConstraints<String, Ranges<PackageVersion>>, String> {
-    let depends = description.depends().map_err(|error| error.to_string())?;
-    let imports = description.imports().map_err(|error| error.to_string())?;
-    let linking_to = description
-        .linking_to()
-        .map_err(|error| error.to_string())?;
-
-    Ok(depends
-        .chain(imports)
-        .chain(linking_to)
-        .filter(|relation| relation.package() != "R")
-        .filter(|relation| !is_base_package(relation.package()))
-        .fold(
-            DependencyConstraints::default(),
-            |mut dependencies, relation| {
-                let range = package_version_range_from_relation(&relation);
-                dependencies
-                    .entry(relation.package().to_string())
-                    .and_modify(|existing| *existing = existing.intersection(&range))
-                    .or_insert(range);
-                dependencies
-            },
-        ))
+    base_packages: &BTreeSet<String>,
+) -> Dependencies<String, Ranges<PackageVersion>, String> {
+    match required_dependencies(source_name, description) {
+        Ok(relations) => {
+            Dependencies::Available(dependency_ranges_from_relations(&relations, base_packages))
+        }
+        Err(error) => Dependencies::Unavailable(format!(
+            "invalid dependency metadata: {}",
+            error.messages().join("; ")
+        )),
+    }
 }
 
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
@@ -430,17 +405,13 @@ fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVer
     }
 }
 
-#[deprecated]
-pub fn is_base_package(package: &str) -> bool {
-    BASE_PACKAGES.contains(&package)
-}
-
 pub(crate) async fn resolve_from_registry(
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, Version>,
 ) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
+    let base_packages = base_packages().await?;
     let root_count = root_relations.len();
     let span = tracing::info_span!(
         "resolve_dependencies",
@@ -462,9 +433,14 @@ pub(crate) async fn resolve_from_registry(
         let (root_package, root_version) = tokio::runtime::Handle::current()
             .block_on(root.package())
             .map_err(ProviderError::from)?;
-        let root_dependencies = dependency_ranges_from_relations(&root_relations);
-        let provider =
-            RDependencyProvider::new(repositories, root, root_dependencies, preferred_versions);
+        let root_dependencies = dependency_ranges_from_relations(&root_relations, &base_packages);
+        let provider = RDependencyProvider::new(
+            repositories,
+            root,
+            root_dependencies,
+            preferred_versions,
+            base_packages,
+        );
 
         let selected = resolve(&provider, root_package, root_version)?
             .into_iter()
@@ -484,18 +460,22 @@ pub(crate) async fn resolve_from_registry(
 
 fn dependency_ranges_from_relations(
     relations: &BTreeSet<Relation>,
-) -> BTreeMap<String, Ranges<PackageVersion>> {
+    base_packages: &BTreeSet<String>,
+) -> DependencyConstraints<String, Ranges<PackageVersion>> {
     relations
         .iter()
-        .filter(|relation| !is_base_package(relation.package()))
-        .fold(BTreeMap::new(), |mut dependencies, relation| {
-            let range = package_version_range_from_relation(relation);
-            dependencies
-                .entry(relation.package().to_string())
-                .and_modify(|existing| *existing = existing.intersection(&range))
-                .or_insert(range);
-            dependencies
-        })
+        .filter(|relation| !base_packages.contains(relation.package()))
+        .fold(
+            DependencyConstraints::default(),
+            |mut dependencies, relation| {
+                let range = package_version_range_from_relation(relation);
+                dependencies
+                    .entry(relation.package().to_string())
+                    .and_modify(|existing| *existing = existing.intersection(&range))
+                    .or_insert(range);
+                dependencies
+            },
+        )
 }
 
 #[cfg(test)]
@@ -610,9 +590,56 @@ mod tests {
             "Package: example\nVersion: 1.0.0\nImports: cli (>= invalid)\nSuggests: also-invalid (>= invalid)\n",
         );
 
-        let error = dependency_constraints_from_description(&description)
-            .expect_err("malformed Imports should fail dependency extraction");
-        assert!(error.contains("Imports"));
+        let Dependencies::Unavailable(reason) =
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+        else {
+            panic!("malformed Imports should make the package version unavailable");
+        };
+        assert!(reason.contains("Imports"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backtracks_from_version_with_malformed_dependency_metadata() {
+        let local_repository = local_repository("project", "1.0.0");
+        let mut metadata_repository = TestRepository::empty("remote metadata");
+        metadata_repository.descriptions.insert(
+            (
+                "example".to_string(),
+                Version::from_str("2.0.0").expect("valid test version"),
+            ),
+            Arc::new(RDescription::parse(
+                "Package: example\nVersion: 2.0.0\nImports: cli (>= invalid)\n",
+            )),
+        );
+        metadata_repository.descriptions.insert(
+            (
+                "example".to_string(),
+                Version::from_str("1.0.0").expect("valid test version"),
+            ),
+            Arc::new(RDescription::parse("Package: example\nVersion: 1.0.0\n")),
+        );
+        let metadata: Arc<dyn PackageRepository> = Arc::new(metadata_repository);
+        let latest = version("2.0.0", Arc::clone(&metadata));
+        let fallback = version("1.0.0", metadata);
+        let mut remote_repository = TestRepository::empty("remote index");
+        remote_repository
+            .packages
+            .insert("example".to_string(), latest.clone());
+        remote_repository.versions.insert(
+            "example".to_string(),
+            BTreeSet::from([fallback.clone(), latest]),
+        );
+
+        let selected = resolve_from_registry(
+            vec![Arc::new(remote_repository)],
+            local_repository,
+            BTreeSet::from([Relation::any("example").expect("valid example relation")]),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("resolution should reject only the malformed version");
+
+        assert_eq!(selected["example"], fallback);
     }
 
     #[test]
@@ -621,8 +648,11 @@ mod tests {
             "Package: example\nVersion: 1.0.0\nImports: cli\nSuggests: also-invalid (>= invalid)\n",
         );
 
-        let dependencies = dependency_constraints_from_description(&description)
-            .expect("transitive Suggests should not be consumed");
+        let Dependencies::Available(dependencies) =
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+        else {
+            panic!("malformed Suggests should not make the package version unavailable");
+        };
         assert!(dependencies.contains_key("cli"));
     }
 
@@ -632,8 +662,11 @@ mod tests {
             "Package: example\nVersion: 1.0.0\nDepends: cli (>= 1.0.0)\nImports: cli (< 2.0.0)\n",
         );
 
-        let dependencies = dependency_constraints_from_description(&description)
-            .expect("hard dependencies should parse");
+        let Dependencies::Available(dependencies) =
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+        else {
+            panic!("hard dependencies should be available");
+        };
         let range = dependencies.get("cli").expect("cli should be a dependency");
         let candidate = |version: &str| {
             PackageVersion::new(
@@ -803,8 +836,9 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
+            DependencyConstraints::default(),
             BTreeMap::new(),
-            BTreeMap::new(),
+            BTreeSet::new(),
         );
         let expected = root_version.clone();
         let incompatible =
@@ -835,8 +869,9 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
+            DependencyConstraints::default(),
             BTreeMap::new(),
-            BTreeMap::new(),
+            BTreeSet::new(),
         );
         let constraints =
             DependencyConstraints::from_iter([("project".to_string(), Ranges::full())]);
@@ -863,12 +898,13 @@ mod tests {
         )
         .expect("valid suggested relation");
         let roots = BTreeSet::from([suggested]);
-        let root_dependencies = dependency_ranges_from_relations(&roots);
+        let root_dependencies = dependency_ranges_from_relations(&roots, &BTreeSet::new());
         let provider = RDependencyProvider::new(
             Vec::new(),
             Arc::clone(&local_repository),
             root_dependencies,
             BTreeMap::new(),
+            BTreeSet::new(),
         );
 
         let Dependencies::Available(constraints) = tokio::task::spawn_blocking(move || {
@@ -897,7 +933,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
-            BTreeSet::from([Relation::any("base").expect("valid base relation")]),
+            BTreeSet::from([Relation::any("testBasePackage").expect("valid base relation")]),
             BTreeMap::new(),
         )
         .await
