@@ -65,6 +65,10 @@ fn runs_rpx_init_in_empty_directory() {
         stdout.contains("Initialized project at"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
+    assert!(
+        !stdout.contains("Synchronized project library"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 
     let description =
         run_shell_command(&container, &format!("cd {project_path} && cat DESCRIPTION"));

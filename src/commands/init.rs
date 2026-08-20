@@ -398,6 +398,10 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     } else {
         false
     };
+    if interactive {
+        cliclack::outro("Configuration complete").map_err(Error::InteractivePrompt)?;
+    }
+
     let mut description = initial_description(InitialDescriptionOptions {
         package_name: &package_name,
         title: &title,
@@ -458,22 +462,19 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         write_gitignore(&target)?;
     }
 
-    if interactive {
-        let message = if initialize_git {
-            format!(
-                "Initialized project and Git repository at {}",
-                target.display()
-            )
-        } else {
-            format!("Initialized project at {}", target.display())
-        };
-        cliclack::outro(message).map_err(Error::InteractivePrompt)?;
+    if initialize_git {
+        status(format_args!(
+            "Initialized project and Git repository at {}",
+            target.display()
+        ));
     } else {
         status(format_args!("Initialized project at {}", target.display()));
     }
     if target != current_dir {
-        status(format_args!("Next: cd `{}`", target.display()));
-        status("Then: run `rpx add <package>`");
+        status(format_args!(
+            "Next: cd into `{}` and run `rpx add <package>`",
+            target.display()
+        ));
     } else {
         status("Next: run `rpx add <package>`");
     }
@@ -496,11 +497,12 @@ fn prompt_for_target(current_dir: &Path) -> Result<PathBuf, Error> {
 }
 
 fn resolve_target(current_dir: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let target = if path.is_absolute() {
         path.to_path_buf()
     } else {
         current_dir.join(path)
-    }
+    };
+    target.components().collect()
 }
 
 fn validate_target(target: &Path) -> Result<(), Error> {
@@ -989,6 +991,14 @@ mod tests {
         assert_eq!(
             title_from_package_name("my.package.name"),
             "My Package Name"
+        );
+    }
+
+    #[test]
+    fn resolves_target_without_current_directory_components() {
+        assert_eq!(
+            resolve_target(Path::new("/tmp/packages"), Path::new("./my-package")),
+            Path::new("/tmp/packages/my-package")
         );
     }
 

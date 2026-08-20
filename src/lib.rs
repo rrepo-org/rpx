@@ -1023,7 +1023,9 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
         install_system,
         install_only_system,
     )
-    .await
+    .await?;
+    status("Synchronized project library");
+    Ok(())
 }
 
 pub(crate) async fn sync_project(
@@ -1054,7 +1056,6 @@ pub(crate) async fn sync_project(
     let project_library = project_library_path(&current_dir);
     let installed = installed_packages(&project_library).await?;
     sync_packages(&project_library, required, installed, r_version).await?;
-    status("Synchronized project library");
     Ok(())
 }
 
