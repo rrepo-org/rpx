@@ -189,40 +189,6 @@ pub fn write_namespace_if_missing(path: &Path) -> Result<(), NamespaceWriteError
     }
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum InitialDescriptionError {
-    #[error("failed to initialize DESCRIPTION")]
-    #[diagnostic(code(rpx::description::initializing_description))]
-    FieldMutation(#[from] r_description::FieldMutationError),
-}
-
-#[derive(Clone, Copy)]
-pub struct InitialDescriptionOptions<'a> {
-    pub package_name: &'a str,
-    pub title: &'a str,
-    pub description: &'a str,
-    pub authors_at_r: &'a str,
-    pub author: &'a str,
-    pub maintainer: &'a str,
-    pub license: &'a str,
-}
-
-pub fn initial_description(
-    options: InitialDescriptionOptions<'_>,
-) -> Result<RDescription, InitialDescriptionError> {
-    let mut description = RDescription::parse("");
-    description.set_package(options.package_name)?;
-    let version = "0.1.0".parse().expect("0.1.0 should parse");
-    description.set_version(&version);
-    description.set_title(options.title)?;
-    description.set_description(options.description)?;
-    description.set_license(options.license)?;
-    description.set_authors_at_r(options.authors_at_r)?;
-    description.set_author(options.author)?;
-    description.set_maintainer(options.maintainer)?;
-    Ok(description)
-}
-
 pub fn root_package(
     path: &Path,
     description: &RDescription,
@@ -1152,57 +1118,6 @@ mod tests {
             .iter()
             .map(|relation| relation.parse().expect("relation should parse"))
             .collect()
-    }
-
-    #[test]
-    fn derives_initial_description_from_package_name() {
-        let description = initial_description(InitialDescriptionOptions {
-            package_name: "my.package",
-            title: "My Package",
-            description: "Describe what this package does.",
-            authors_at_r: r#"person(given = "Package Author", email = "author@example.com", role = c("aut", "cre"))"#,
-            author: "Package Author [aut, cre]",
-            maintainer: "Package Author <author@example.com>",
-            license: "MIT + file LICENSE",
-        })
-        .expect("description should initialize");
-
-        assert_eq!(description.package().unwrap(), "my.package");
-        assert_eq!(description.version().unwrap().to_string(), "0.1.0");
-        assert_eq!(description.title().unwrap(), "My Package");
-        assert_eq!(
-            description.description().unwrap(),
-            "Describe what this package does."
-        );
-        assert_eq!(description.license().unwrap(), "MIT + file LICENSE");
-        let rendered = description.to_string();
-        assert!(rendered.contains(
-            "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))"
-        ));
-        assert!(rendered.contains("Author: Package Author [aut, cre]"));
-        assert!(rendered.contains("Maintainer: Package Author <author@example.com>"));
-    }
-
-    #[test]
-    fn uses_explicit_initial_description_metadata() {
-        let description = initial_description(InitialDescriptionOptions {
-            package_name: "custom.pkg",
-            title: "Custom Package",
-            description: "A custom package description.",
-            authors_at_r: r#"person(given = "Example Author", email = "author@example.com", role = c("aut", "cre"))"#,
-            author: "Example Author [aut, cre]",
-            maintainer: "Example Author <author@example.com>",
-            license: "Apache License (== 2.0)",
-        })
-        .expect("description should initialize");
-
-        assert_eq!(description.package().unwrap(), "custom.pkg");
-        assert_eq!(description.title().unwrap(), "Custom Package");
-        assert_eq!(
-            description.description().unwrap(),
-            "A custom package description."
-        );
-        assert_eq!(description.license().unwrap(), "Apache License (== 2.0)");
     }
 
     #[test]

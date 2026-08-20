@@ -28,26 +28,49 @@ pub(crate) struct Identity {
     pub(crate) email: Option<String>,
 }
 
-pub(crate) fn configured_identity(path: &Path) -> Identity {
-    let config = Repository::discover(path)
-        .and_then(|repository| repository.config())
-        .or_else(|_| Config::open_default());
-    let Ok(config) = config else {
-        return Identity::default();
+pub(crate) fn configured_identity(path: &Path) -> Result<Identity, GitError> {
+    let config = match Repository::discover(path) {
+        Ok(repository) => repository
+            .config()
+            .map_err(|source| operation("read Git repository configuration", source))?,
+        Err(source) if source.code() == ErrorCode::NotFound => Config::open_default()
+            .map_err(|source| operation("read default Git configuration", source))?,
+        Err(source) => return Err(operation("discover Git repository", source)),
     };
 
-    Identity {
-        name: config_value(&config, "user.name"),
-        email: config_value(&config, "user.email"),
-    }
+    Ok(Identity {
+        name: config_value(&config, "user.name")?,
+        email: config_value(&config, "user.email")?,
+    })
 }
 
-pub(crate) fn is_inside_worktree(path: &Path) -> bool {
-    let Some(existing_ancestor) = path.ancestors().find(|ancestor| ancestor.exists()) else {
-        return false;
+pub(crate) fn is_inside_worktree(path: &Path) -> Result<bool, GitError> {
+    let mut existing_ancestor = None;
+    for ancestor in path.ancestors() {
+        match ancestor.try_exists() {
+            Ok(true) => {
+                existing_ancestor = Some(ancestor);
+                break;
+            }
+            Ok(false) => {}
+            Err(source) => {
+                return Err(GitError::FileSystem {
+                    operation: "inspect Git discovery path",
+                    path: ancestor.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    let Some(existing_ancestor) = existing_ancestor else {
+        return Ok(false);
     };
 
-    Repository::discover(existing_ancestor).is_ok_and(|repository| repository.workdir().is_some())
+    match Repository::discover(existing_ancestor) {
+        Ok(repository) => Ok(repository.workdir().is_some()),
+        Err(source) if source.code() == ErrorCode::NotFound => Ok(false),
+        Err(source) => Err(operation("discover Git repository", source)),
+    }
 }
 
 pub(crate) fn initialize_repository(path: &Path) -> Result<(), GitError> {
@@ -56,12 +79,12 @@ pub(crate) fn initialize_repository(path: &Path) -> Result<(), GitError> {
         .map_err(|source| operation("initialize Git repository", source))
 }
 
-fn config_value(config: &Config, key: &str) -> Option<String> {
-    config
-        .get_string(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn config_value(config: &Config, key: &str) -> Result<Option<String>, GitError> {
+    match config.get_string(key) {
+        Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
+        Err(source) if source.code() == ErrorCode::NotFound => Ok(None),
+        Err(source) => Err(operation("read Git identity configuration", source)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -975,6 +998,23 @@ pub(crate) mod tests {
         let paths = GitCachePaths::new(remote, commit);
         let _ = fs::remove_dir_all(paths.database);
         let _ = fs::remove_dir_all(paths.checkout_parent);
+    }
+
+    #[test]
+    fn reads_optional_identity_config_values() {
+        let path = temporary_path("identity-config");
+        fs::write(&path, "").expect("configuration file should be created");
+        let mut config = Config::open(&path).expect("configuration should initialize");
+        assert_eq!(config_value(&config, "user.name").unwrap(), None);
+
+        config
+            .set_str("user.name", "  Package Author  ")
+            .expect("identity should be configured");
+        assert_eq!(
+            config_value(&config, "user.name").unwrap().as_deref(),
+            Some("Package Author")
+        );
+        fs::remove_file(path).expect("configuration file should be removed");
     }
 
     #[test]

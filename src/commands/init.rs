@@ -2,9 +2,8 @@ use crate::{
     LockError, SyncError,
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionParseError, DescriptionWriteError, InitialDescriptionError,
-        InitialDescriptionOptions, NamespaceWriteError, add_dependencies, initial_description,
-        project_dependencies, write_description, write_namespace_if_missing,
+        DependencyField, DescriptionParseError, DescriptionWriteError, NamespaceWriteError,
+        add_dependencies, project_dependencies, write_description, write_namespace_if_missing,
     },
     git,
     lockfile::write_lockfile,
@@ -12,10 +11,10 @@ use crate::{
     pin_dependency_to_resolved_major, resolve_lockfile_for_description, sync_project,
 };
 use miette::Diagnostic;
-use r_description::Relation;
+use r_description::{RDescription, Relation};
 use std::{
     collections::BTreeSet,
-    env, fs, io,
+    env, fmt, fs, io,
     io::IsTerminal,
     path::{Path, PathBuf},
 };
@@ -29,19 +28,25 @@ const DEFAULT_AUTHOR_EMAIL: &str = "author@example.com";
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::init::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: io::Error,
-    },
+    #[error("failed to determine the current working directory: {0}")]
+    #[diagnostic(
+        code(rpx::init::working_directory_unavailable),
+        help("Change to an existing, accessible directory and rerun `rpx init`.")
+    )]
+    WorkingDirectoryUnavailable(#[source] io::Error),
 
     #[error("init target is not a directory: {}", path.display())]
-    #[diagnostic(code(rpx::init::target_not_directory))]
+    #[diagnostic(
+        code(rpx::init::target_not_directory),
+        help("Choose a missing path or an empty directory.")
+    )]
     TargetNotDirectory { path: PathBuf },
 
     #[error("failed to read init target {}: {source}", path.display())]
-    #[diagnostic(code(rpx::init::target_read_failed))]
+    #[diagnostic(
+        code(rpx::init::target_read_failed),
+        help("Check read permissions for the target and its parent directories, then rerun.")
+    )]
     ReadTarget {
         path: PathBuf,
         #[source]
@@ -51,23 +56,21 @@ pub(crate) enum Error {
     #[error("init target is not empty: {}", path.display())]
     #[diagnostic(
         code(rpx::init::target_not_empty),
-        help("Choose an empty target directory.")
+        help("Choose a missing or empty directory, or move the existing contents first.")
     )]
     TargetNotEmpty { path: PathBuf },
 
-    #[error("invalid package name `{package_name}`: {reason}")]
-    #[diagnostic(code(rpx::init::invalid_package_name))]
-    InvalidPackageName {
-        package_name: String,
-        reason: &'static str,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidPackageName(#[from] PackageNameValidationError),
 
-    #[error("invalid author name `{author_name}`: {reason}")]
-    #[diagnostic(code(rpx::init::invalid_author_name))]
-    InvalidAuthorName {
-        author_name: String,
-        reason: &'static str,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidAuthorName(#[from] AuthorNameValidationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidText(#[from] TextValidationError),
 
     #[error("invalid author email `{author_email}`: {reason}")]
     #[diagnostic(code(rpx::init::invalid_author_email))]
@@ -84,27 +87,6 @@ pub(crate) enum Error {
     #[diagnostic(code(rpx::init::package_name_invalid_utf8))]
     InvalidDirectoryName { path: PathBuf },
 
-    #[error("directory name `{directory_name}` does not produce a valid package name")]
-    #[diagnostic(
-        code(rpx::init::package_name_empty),
-        help("Use at least one ASCII letter in the directory name.")
-    )]
-    EmptyPackageName { directory_name: String },
-
-    #[error("derived package name `{package_name}` must start with a letter")]
-    #[diagnostic(
-        code(rpx::init::package_name_invalid_start),
-        help("Choose a directory whose name starts with an ASCII letter.")
-    )]
-    DerivedPackageNameMustStartWithLetter { package_name: String },
-
-    #[error("derived package name `{package_name}` must contain at least two characters")]
-    #[diagnostic(
-        code(rpx::init::package_name_too_short),
-        help("Choose a directory name that produces at least two package-name characters.")
-    )]
-    DerivedPackageNameTooShort { package_name: String },
-
     #[error("failed to create init target {}: {source}", path.display())]
     #[diagnostic(code(rpx::init::target_creation_failed))]
     CreateTarget {
@@ -113,9 +95,9 @@ pub(crate) enum Error {
         source: io::Error,
     },
 
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    InitialDescription(#[from] InitialDescriptionError),
+    #[error("failed to initialize DESCRIPTION")]
+    #[diagnostic(code(rpx::description::initializing_description))]
+    InitialDescription(#[from] r_description::FieldMutationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -153,6 +135,17 @@ pub(crate) enum Error {
         source: git::GitError,
     },
 
+    #[error("failed to inspect Git repository for {}: {source}", path.display())]
+    #[diagnostic(
+        code(rpx::init::git_inspection_failed),
+        help("Check access to the target and its parent directories, then rerun `rpx init`.")
+    )]
+    InspectGit {
+        path: PathBuf,
+        #[source]
+        source: git::GitError,
+    },
+
     #[error("failed to write license file at {}: {source}", path.display())]
     #[diagnostic(code(rpx::init::license_write_failed))]
     WriteLicense {
@@ -161,12 +154,12 @@ pub(crate) enum Error {
         source: io::Error,
     },
 
-    #[error("interactive init failed: {source}")]
-    #[diagnostic(code(rpx::init::interactive_prompt_failed))]
-    InteractivePrompt {
-        #[source]
-        source: io::Error,
-    },
+    #[error("interactive init failed: {0}")]
+    #[diagnostic(
+        code(rpx::init::interactive_prompt_failed),
+        help("Rerun in an interactive terminal, or provide init options non-interactively.")
+    )]
+    InteractivePrompt(#[source] io::Error),
 
     #[error("failed to generate an available project directory name")]
     #[diagnostic(code(rpx::init::project_name_generation_failed))]
@@ -188,6 +181,142 @@ enum DevelopmentPackage {
     Devtools,
 }
 
+#[derive(Clone, Copy)]
+struct InitialDescriptionOptions<'a> {
+    package_name: &'a str,
+    title: &'a str,
+    description: &'a str,
+    authors_at_r: &'a str,
+    author: &'a str,
+    maintainer: &'a str,
+    license: &'a str,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid package name `{package_name}`")]
+#[diagnostic(
+    code(rpx::init::invalid_package_name),
+    help("Edit the package name, or pass `--name` when it is inferred from a directory.")
+)]
+pub(crate) struct PackageNameValidationError {
+    package_name: String,
+
+    #[related]
+    issues: Vec<PackageNameIssue>,
+}
+
+impl PackageNameValidationError {
+    fn inline_message(&self) -> String {
+        self.issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum PackageNameIssue {
+    #[error("must contain at least two characters")]
+    #[diagnostic(help("Enter at least two characters."))]
+    TooShort,
+
+    #[error("must start with an ASCII letter")]
+    #[diagnostic(help("Start the name with a letter from A to Z."))]
+    MustStartWithLetter,
+
+    #[error("must not end with a dot")]
+    #[diagnostic(help("Remove the final dot."))]
+    EndsWithDot,
+
+    #[error("may contain only ASCII letters, digits, and dots")]
+    #[diagnostic(help("Remove spaces, punctuation other than dots, and non-ASCII characters."))]
+    InvalidCharacters,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid author name `{author_name}`")]
+#[diagnostic(
+    code(rpx::init::invalid_author_name),
+    help("Enter a non-empty name on a single line.")
+)]
+pub(crate) struct AuthorNameValidationError {
+    author_name: String,
+
+    #[related]
+    issues: Vec<AuthorNameIssue>,
+}
+
+impl AuthorNameValidationError {
+    fn inline_message(&self) -> String {
+        self.issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum AuthorNameIssue {
+    #[error("must not be empty")]
+    #[diagnostic(help("Enter the author's name."))]
+    Empty,
+
+    #[error("must be a single line without control characters")]
+    #[diagnostic(help("Remove line breaks and other control characters."))]
+    ControlCharacters,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TextField {
+    Title,
+    Description,
+}
+
+impl fmt::Display for TextField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Title => "package title",
+            Self::Description => "package description",
+        })
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid {field}")]
+#[diagnostic(
+    code(rpx::init::invalid_text),
+    help("Enter non-empty text on a single line.")
+)]
+pub(crate) struct TextValidationError {
+    field: TextField,
+
+    #[related]
+    issues: Vec<TextIssue>,
+}
+
+impl TextValidationError {
+    fn inline_message(&self) -> String {
+        self.issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum TextIssue {
+    #[error("must not be empty")]
+    #[diagnostic(help("Enter a value."))]
+    Empty,
+
+    #[error("must be a single line without control characters")]
+    #[diagnostic(help("Remove line breaks and other control characters."))]
+    ControlCharacters,
+}
+
 impl DevelopmentPackage {
     fn name(self) -> &'static str {
         match self {
@@ -199,62 +328,27 @@ impl DevelopmentPackage {
 }
 
 pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
-    let InitArgs {
-        path,
-        name,
-        title,
-        description,
-        author_name,
-        author_email,
-        license,
-    } = args;
-    let current_dir =
-        env::current_dir().map_err(|source| Error::WorkingDirectoryUnavailable { source })?;
-    let git_identity = git::configured_identity(&current_dir);
+    let current_dir = env::current_dir().map_err(Error::WorkingDirectoryUnavailable)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let form_active = interactive;
-    if form_active {
-        cliclack::intro("Create an R package")
-            .map_err(|source| Error::InteractivePrompt { source })?;
+
+    if interactive {
+        cliclack::intro("Create an R package").map_err(Error::InteractivePrompt)?;
     }
 
-    let (target, prompted_directory) = match path {
-        Some(path) if path.is_absolute() => (path, None),
-        Some(path) => (current_dir.join(path), None),
-        None if interactive => {
-            let (target, input) = prompt_for_target(&current_dir)?;
-            (target, Some(input))
+    let target = match args.path {
+        Some(path) => {
+            let target = resolve_target(&current_dir, &path);
+            validate_target(&target)?;
+            target
         }
-        None => (current_dir, None),
+        None if interactive => prompt_for_target(&current_dir)?,
+        None => {
+            validate_target(&current_dir)?;
+            current_dir.clone()
+        }
     };
 
-    if target.try_exists().map_err(|source| Error::ReadTarget {
-        path: target.clone(),
-        source,
-    })? {
-        if !target.is_dir() {
-            return Err(Error::TargetNotDirectory { path: target });
-        }
-        let mut entries = fs::read_dir(&target).map_err(|source| Error::ReadTarget {
-            path: target.clone(),
-            source,
-        })?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(|source| Error::ReadTarget {
-                path: target.clone(),
-                source,
-            })?
-            .is_some()
-        {
-            return Err(Error::TargetNotEmpty { path: target });
-        }
-    }
-
-    let prompt_for_git = interactive && !git::is_inside_worktree(&target);
-
-    let package_name = match name {
+    let package_name = match args.name {
         Some(package_name) => {
             validate_package_name(&package_name)?;
             package_name
@@ -262,38 +356,34 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         None if interactive => prompt_for_package_name(&target)?,
         None => derive_package_name(&target)?,
     };
-    let title = match title {
-        Some(title) => title,
+    let title = match args.title {
+        Some(title) => validated_text(title, TextField::Title)?,
         None if interactive => prompt_for_title(&package_name)?,
         None => title_from_package_name(&package_name),
     };
-    let description = match description {
-        Some(description) => description,
+    let description = match args.description {
+        Some(description) => validated_text(description, TextField::Description)?,
         None if interactive => prompt_for_description()?,
         None => DEFAULT_DESCRIPTION.to_string(),
     };
-    let default_author_name = git_identity
-        .name
-        .filter(|name| author_name_validation_reason(name).is_none())
-        .unwrap_or_else(|| DEFAULT_AUTHOR_NAME.to_string());
-    let default_author_email = git_identity
-        .email
-        .filter(|email| author_email_validation_reason(email).is_none())
-        .unwrap_or_else(|| DEFAULT_AUTHOR_EMAIL.to_string());
-    let author_name = match author_name {
-        Some(author_name) => validate_author_name(author_name)?,
-        None if interactive => prompt_for_author_name(&default_author_name)?,
-        None => default_author_name,
-    };
-    let author_email = match author_email {
-        Some(author_email) => validate_author_email(author_email)?,
-        None if interactive => prompt_for_author_email(&default_author_email)?,
-        None => default_author_email,
+    let (author_name, author_email) = if interactive {
+        prompt_for_authors(&target, args.author_name, args.author_email)?
+    } else {
+        (
+            args.author_name
+                .map(validated_author_name)
+                .transpose()?
+                .unwrap_or_else(|| DEFAULT_AUTHOR_NAME.to_string()),
+            args.author_email
+                .map(validate_author_email)
+                .transpose()?
+                .unwrap_or_else(|| DEFAULT_AUTHOR_EMAIL.to_string()),
+        )
     };
     let authors_at_r = authors_at_r(&author_name, &author_email);
     let author = format!("{author_name} [aut, cre]");
     let maintainer = format!("{author_name} <{author_email}>");
-    let license = match license {
+    let license = match args.license {
         Some(license) => license,
         None if interactive => prompt_for_license()?,
         None => InitLicense::Mit,
@@ -303,7 +393,11 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     } else {
         Vec::new()
     };
-    let initialize_git = prompt_for_git && prompt_for_git_repository()?;
+    let initialize_git = if interactive {
+        prompt_for_git_repository(&target)?
+    } else {
+        false
+    };
     let mut description = initial_description(InitialDescriptionOptions {
         package_name: &package_name,
         title: &title,
@@ -364,7 +458,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         write_gitignore(&target)?;
     }
 
-    if form_active {
+    if interactive {
         let message = if initialize_git {
             format!(
                 "Initialized project and Git repository at {}",
@@ -373,12 +467,12 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         } else {
             format!("Initialized project at {}", target.display())
         };
-        cliclack::outro(message).map_err(|source| Error::InteractivePrompt { source })?;
+        cliclack::outro(message).map_err(Error::InteractivePrompt)?;
     } else {
         status(format_args!("Initialized project at {}", target.display()));
     }
-    if let Some(directory) = prompted_directory {
-        status(format_args!("Next: cd `{directory}`"));
+    if target != current_dir {
+        status(format_args!("Next: cd `{}`", target.display()));
         status("Then: run `rpx add <package>`");
     } else {
         status("Next: run `rpx add <package>`");
@@ -386,56 +480,137 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     Ok(())
 }
 
-fn prompt_for_target(current_dir: &Path) -> Result<(PathBuf, String), Error> {
+fn prompt_for_target(current_dir: &Path) -> Result<PathBuf, Error> {
     let suggestion = suggested_project_directory(current_dir)?;
+    let validation_dir = current_dir.to_path_buf();
     let input: String = cliclack::input("Project directory")
         .default_input(&suggestion)
+        .validate(move |input: &String| {
+            let target = resolve_target(&validation_dir, Path::new(input));
+            validate_target(&target).map_err(|error| error.to_string())
+        })
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })?;
-    let path = PathBuf::from(&input);
-    let target = if path.is_absolute() {
-        path
+        .map_err(Error::InteractivePrompt)?;
+
+    Ok(resolve_target(current_dir, Path::new(&input)))
+}
+
+fn resolve_target(current_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        current_dir.join(path.strip_prefix(".").unwrap_or(&path))
-    };
-    Ok((target, input))
+        current_dir.join(path)
+    }
+}
+
+fn validate_target(target: &Path) -> Result<(), Error> {
+    match fs::read_dir(target) {
+        Ok(mut entries) => {
+            if entries
+                .next()
+                .transpose()
+                .map_err(|source| Error::ReadTarget {
+                    path: target.to_path_buf(),
+                    source,
+                })?
+                .is_some()
+            {
+                return Err(Error::TargetNotEmpty {
+                    path: target.to_path_buf(),
+                });
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) if source.kind() == io::ErrorKind::NotADirectory => {
+            return Err(Error::TargetNotDirectory {
+                path: target.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(Error::ReadTarget {
+                path: target.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn prompt_for_package_name(target: &Path) -> Result<String, Error> {
     let default = derive_package_name(target).ok();
-    let mut prompt = cliclack::input("Package name")
-        .validate(|input: &String| package_name_validation_reason(input).map_or(Ok(()), Err));
+    let mut prompt = cliclack::input("Package name").validate(|input: &String| {
+        validate_package_name(input).map_err(|error| error.inline_message())
+    });
     if let Some(default) = &default {
         prompt = prompt.default_input(default);
     }
-    let package_name: String = prompt
-        .interact()
-        .map_err(|source| Error::InteractivePrompt { source })?;
-    validate_package_name(&package_name)?;
+    let package_name: String = prompt.interact().map_err(Error::InteractivePrompt)?;
     Ok(package_name)
 }
 
 fn prompt_for_title(package_name: &str) -> Result<String, Error> {
-    cliclack::input("Package title")
+    let title: String = cliclack::input("Package title")
         .default_input(&title_from_package_name(package_name))
+        .validate(|input: &String| {
+            validate_text(input, TextField::Title).map_err(|error| error.inline_message())
+        })
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })
+        .map_err(Error::InteractivePrompt)?;
+    Ok(title.trim().to_string())
 }
 
 fn prompt_for_description() -> Result<String, Error> {
-    cliclack::input("Package description")
+    let description: String = cliclack::input("Package description")
         .default_input(DEFAULT_DESCRIPTION)
+        .validate(|input: &String| {
+            validate_text(input, TextField::Description).map_err(|error| error.inline_message())
+        })
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })
+        .map_err(Error::InteractivePrompt)?;
+    Ok(description.trim().to_string())
+}
+
+fn prompt_for_authors(
+    target: &Path,
+    author_name: Option<String>,
+    author_email: Option<String>,
+) -> Result<(String, String), Error> {
+    let identity = if author_name.is_none() || author_email.is_none() {
+        git::configured_identity(target).unwrap_or_default()
+    } else {
+        git::Identity::default()
+    };
+    let default_author_name = identity
+        .name
+        .filter(|name| validate_author_name(name).is_ok())
+        .unwrap_or_else(|| DEFAULT_AUTHOR_NAME.to_string());
+    let default_author_email = identity
+        .email
+        .filter(|email| author_email_validation_reason(email).is_none())
+        .unwrap_or_else(|| DEFAULT_AUTHOR_EMAIL.to_string());
+
+    let author_name = match author_name {
+        Some(author_name) => validated_author_name(author_name)?,
+        None => prompt_for_author_name(&default_author_name)?,
+    };
+    let author_email = match author_email {
+        Some(author_email) => validate_author_email(author_email)?,
+        None => prompt_for_author_email(&default_author_email)?,
+    };
+
+    Ok((author_name, author_email))
 }
 
 fn prompt_for_author_name(default: &str) -> Result<String, Error> {
     let author_name: String = cliclack::input("Author name")
         .default_input(default)
-        .validate(|input: &String| author_name_validation_reason(input).map_or(Ok(()), Err))
+        .validate(|input: &String| {
+            validate_author_name(input).map_err(|error| error.inline_message())
+        })
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })?;
-    validate_author_name(author_name)
+        .map_err(Error::InteractivePrompt)?;
+    Ok(author_name.trim().to_string())
 }
 
 fn prompt_for_author_email(default: &str) -> Result<String, Error> {
@@ -443,12 +618,12 @@ fn prompt_for_author_email(default: &str) -> Result<String, Error> {
         .default_input(default)
         .validate(|input: &String| author_email_validation_reason(input).map_or(Ok(()), Err))
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })?;
+        .map_err(Error::InteractivePrompt)?;
     validate_author_email(author_email)
 }
 
 fn prompt_for_license() -> Result<InitLicense, Error> {
-    cliclack::select("License")
+    Ok(cliclack::select("License")
         .item(InitLicense::Mit, "MIT", "Simple and permissive")
         .item(
             InitLicense::Apache2,
@@ -474,11 +649,11 @@ fn prompt_for_license() -> Result<InitLicense, Error> {
         .initial_value(InitLicense::Mit)
         .max_rows(8)
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })
+        .map_err(Error::InteractivePrompt)?)
 }
 
 fn prompt_for_development_packages() -> Result<Vec<DevelopmentPackage>, Error> {
-    cliclack::multiselect("Development packages")
+    Ok(cliclack::multiselect("Development packages")
         .item(DevelopmentPackage::Testthat, "testthat", "Unit testing")
         .item(
             DevelopmentPackage::Roxygen2,
@@ -492,7 +667,7 @@ fn prompt_for_development_packages() -> Result<Vec<DevelopmentPackage>, Error> {
         )
         .required(false)
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })
+        .map_err(Error::InteractivePrompt)?)
 }
 
 fn development_relations(packages: &[DevelopmentPackage]) -> BTreeSet<Relation> {
@@ -504,11 +679,34 @@ fn development_relations(packages: &[DevelopmentPackage]) -> BTreeSet<Relation> 
         .collect()
 }
 
-fn prompt_for_git_repository() -> Result<bool, Error> {
-    cliclack::confirm("Initialize a Git repository?")
+fn initial_description(
+    options: InitialDescriptionOptions<'_>,
+) -> Result<RDescription, r_description::FieldMutationError> {
+    let mut description = RDescription::parse("");
+    description.set_package(options.package_name)?;
+    let version = "0.1.0".parse().expect("0.1.0 should parse");
+    description.set_version(&version);
+    description.set_title(options.title)?;
+    description.set_description(options.description)?;
+    description.set_license(options.license)?;
+    description.set_authors_at_r(options.authors_at_r)?;
+    description.set_author(options.author)?;
+    description.set_maintainer(options.maintainer)?;
+    Ok(description)
+}
+
+fn prompt_for_git_repository(target: &Path) -> Result<bool, Error> {
+    if git::is_inside_worktree(target).map_err(|source| Error::InspectGit {
+        path: target.to_path_buf(),
+        source,
+    })? {
+        return Ok(false);
+    }
+
+    Ok(cliclack::confirm("Initialize a Git repository?")
         .initial_value(true)
         .interact()
-        .map_err(|source| Error::InteractivePrompt { source })
+        .map_err(Error::InteractivePrompt)?)
 }
 
 fn suggested_project_directory(current_dir: &Path) -> Result<String, Error> {
@@ -627,66 +825,89 @@ fn derive_package_name(path: &Path) -> Result<String, Error> {
             path: path.to_path_buf(),
         })?;
 
-    let mut package_name = String::new();
-    for character in directory_name.chars() {
-        match character {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => package_name.push(character),
-            '-' | '_' | ' ' | '.' if !package_name.ends_with('.') => {
-                package_name.push('.');
+    let package_name = directory_name
+        .chars()
+        .filter_map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => Some(character),
+            '-' | '_' | ' ' | '.' => Some('.'),
+            _ => None,
+        })
+        .fold(String::new(), |mut package_name, character| {
+            if character != '.' || !package_name.ends_with('.') {
+                package_name.push(character);
             }
-            _ => {}
-        }
-    }
-
-    let package_name = package_name.trim_matches('.').to_string();
-    let Some(first) = package_name.chars().next() else {
-        return Err(Error::EmptyPackageName {
-            directory_name: directory_name.to_string(),
+            package_name
         });
-    };
-    if !first.is_ascii_alphabetic() {
-        return Err(Error::DerivedPackageNameMustStartWithLetter { package_name });
-    }
-    if package_name.len() < 2 {
-        return Err(Error::DerivedPackageNameTooShort { package_name });
-    }
+    let package_name = package_name.trim_matches('.').to_string();
+    validate_package_name(&package_name)?;
     Ok(package_name)
 }
 
 fn title_from_package_name(package_name: &str) -> String {
     package_name
         .split('.')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
+        .filter_map(|part| {
             let mut characters = part.chars();
-            let Some(first) = characters.next() else {
-                return String::new();
-            };
-            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
+            characters
+                .next()
+                .map(|first| format!("{}{}", first.to_ascii_uppercase(), characters.as_str()))
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn author_name_validation_reason(author_name: &str) -> Option<&'static str> {
-    if author_name.trim().is_empty() {
-        Some("must not be empty")
-    } else if author_name.chars().any(char::is_control) {
-        Some("must be a single line without control characters")
+fn validate_author_name(author_name: &str) -> Result<(), AuthorNameValidationError> {
+    let issues = [
+        author_name
+            .trim()
+            .is_empty()
+            .then_some(AuthorNameIssue::Empty),
+        author_name
+            .chars()
+            .any(char::is_control)
+            .then_some(AuthorNameIssue::ControlCharacters),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if issues.is_empty() {
+        Ok(())
     } else {
-        None
+        Err(AuthorNameValidationError {
+            author_name: author_name.to_string(),
+            issues,
+        })
     }
 }
 
-fn validate_author_name(author_name: String) -> Result<String, Error> {
-    let author_name = author_name.trim().to_string();
-    match author_name_validation_reason(&author_name) {
-        Some(reason) => Err(Error::InvalidAuthorName {
-            author_name,
-            reason,
-        }),
-        None => Ok(author_name),
+fn validated_author_name(author_name: String) -> Result<String, Error> {
+    validate_author_name(&author_name)?;
+    Ok(author_name.trim().to_string())
+}
+
+fn validate_text(value: &str, field: TextField) -> Result<(), TextValidationError> {
+    let issues = [
+        value.trim().is_empty().then_some(TextIssue::Empty),
+        value
+            .chars()
+            .any(char::is_control)
+            .then_some(TextIssue::ControlCharacters),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(TextValidationError { field, issues })
     }
+}
+
+fn validated_text(value: String, field: TextField) -> Result<String, Error> {
+    validate_text(&value, field)?;
+    Ok(value.trim().to_string())
 }
 
 fn author_email_validation_reason(author_email: &str) -> Option<&'static str> {
@@ -732,30 +953,30 @@ fn r_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn package_name_validation_reason(package_name: &str) -> Option<&'static str> {
-    if package_name.len() < 2 {
-        Some("must contain at least two characters")
-    } else if !package_name.starts_with(|character: char| character.is_ascii_alphabetic()) {
-        Some("must start with an ASCII letter")
-    } else if package_name.ends_with('.') {
-        Some("must not end with a dot")
-    } else if !package_name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '.')
-    {
-        Some("may contain only ASCII letters, digits, and dots")
-    } else {
-        None
-    }
-}
+fn validate_package_name(package_name: &str) -> Result<(), PackageNameValidationError> {
+    let issues = [
+        (package_name.chars().count() < 2).then_some(PackageNameIssue::TooShort),
+        (!package_name.starts_with(|character: char| character.is_ascii_alphabetic()))
+            .then_some(PackageNameIssue::MustStartWithLetter),
+        package_name
+            .ends_with('.')
+            .then_some(PackageNameIssue::EndsWithDot),
+        (!package_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '.'))
+        .then_some(PackageNameIssue::InvalidCharacters),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
 
-fn validate_package_name(package_name: &str) -> Result<(), Error> {
-    match package_name_validation_reason(package_name) {
-        Some(reason) => Err(Error::InvalidPackageName {
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(PackageNameValidationError {
             package_name: package_name.to_string(),
-            reason,
-        }),
-        None => Ok(()),
+            issues,
+        })
     }
 }
 
@@ -779,15 +1000,15 @@ mod tests {
         );
         assert!(matches!(
             derive_package_name(Path::new("/tmp/123-project")),
-            Err(Error::DerivedPackageNameMustStartWithLetter { .. })
+            Err(Error::InvalidPackageName(_))
         ));
         assert!(matches!(
             derive_package_name(Path::new("/tmp/---")),
-            Err(Error::EmptyPackageName { .. })
+            Err(Error::InvalidPackageName(_))
         ));
         assert!(matches!(
             derive_package_name(Path::new("/tmp/x")),
-            Err(Error::DerivedPackageNameTooShort { .. })
+            Err(Error::InvalidPackageName(_))
         ));
     }
 
@@ -801,11 +1022,36 @@ mod tests {
             assert!(
                 matches!(
                     validate_package_name(package_name),
-                    Err(Error::InvalidPackageName { .. })
+                    Err(PackageNameValidationError { .. })
                 ),
                 "package name should be invalid: {package_name}"
             );
         }
+    }
+
+    #[test]
+    fn validates_author_names_with_related_issues() {
+        validate_author_name("Package Author").expect("author name should be valid");
+
+        let error = validate_author_name("\n").expect_err("author name should be invalid");
+        assert_eq!(error.issues.len(), 2);
+        assert_eq!(
+            error.inline_message(),
+            "must not be empty; must be a single line without control characters"
+        );
+    }
+
+    #[test]
+    fn validates_required_description_text_with_related_issues() {
+        validate_text("A useful package.", TextField::Description)
+            .expect("description should be valid");
+
+        let error = validate_text("\n", TextField::Title).expect_err("title should be invalid");
+        assert_eq!(error.issues.len(), 2);
+        assert_eq!(
+            error.inline_message(),
+            "must not be empty; must be a single line without control characters"
+        );
     }
 
     #[test]
@@ -823,6 +1069,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["devtools", "roxygen2", "testthat"]
         );
+    }
+
+    #[test]
+    fn creates_initial_description() {
+        let description = initial_description(InitialDescriptionOptions {
+            package_name: "my.package",
+            title: "My Package",
+            description: "Describe what this package does.",
+            authors_at_r: r#"person(given = "Package Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            author: "Package Author [aut, cre]",
+            maintainer: "Package Author <author@example.com>",
+            license: "MIT + file LICENSE",
+        })
+        .expect("description should initialize");
+
+        assert_eq!(description.package().unwrap(), "my.package");
+        assert_eq!(description.version().unwrap().to_string(), "0.1.0");
+        assert_eq!(description.title().unwrap(), "My Package");
+        assert_eq!(
+            description.description().unwrap(),
+            "Describe what this package does."
+        );
+        assert_eq!(description.license().unwrap(), "MIT + file LICENSE");
+        let rendered = description.to_string();
+        assert!(rendered.contains(
+            "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))"
+        ));
+        assert!(rendered.contains("Author: Package Author [aut, cre]"));
+        assert!(rendered.contains("Maintainer: Package Author <author@example.com>"));
     }
 
     #[test]

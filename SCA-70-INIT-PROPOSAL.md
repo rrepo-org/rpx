@@ -334,11 +334,12 @@ Open questions include:
 The selected source metadata uses Authors@R with one valid `aut`/`cre` person.
 Init also emits matching Author and Maintainer fields because `R CMD check` does
 not derive them when checking a source directory directly. All three fields are
-rendered from the same resolved identity to avoid contradictory metadata. Init
-resolves the creator name and email from explicit options, effective Git
-identity, or stable placeholders, in that order. A complete Git display name is
-preserved as the person's `given` value rather than being split according to
-Western name conventions.
+rendered from the same resolved identity to avoid contradictory metadata.
+Interactive init resolves the creator name and email from explicit options,
+effective Git identity, or stable placeholders, in that order. Non-interactive
+init uses explicit options or stable placeholders. A complete Git display name
+is preserved as the person's `given` value rather than being split according
+to Western name conventions.
 
 ## Execution Model
 
@@ -828,12 +829,12 @@ from the network.
 
 MIT and proprietary files require a real legal copyright holder. Init now
 supports `--author-name` and `--author-email`, renders Authors@R from those
-values, and uses effective Git identity as the interactive and non-interactive
-fallback. When Git identity is unavailable or invalid, the stable placeholders
-are `Package Author` and `author@example.com`. These keep generated metadata
-valid and clearly editable but must not be treated as production-ready legal
-identity. License generation should use the resolved author name as its default
-copyright holder.
+values, and uses effective Git identity as the interactive fallback. When Git
+identity is unavailable or invalid, and for non-interactive defaults, the
+stable placeholders are `Package Author` and `author@example.com`. These keep
+generated metadata valid and clearly editable but must not be treated as
+production-ready legal identity. License generation should use the resolved
+author name as its default copyright holder.
 
 ## Interactive Initialization
 
@@ -867,6 +868,7 @@ and, when applicable, Git repository initialization.
   name, including an explicitly supplied or interactively edited name.
 - The package-description question defaults to `Describe what this package
   does.`.
+- Package titles and descriptions must contain non-empty, single-line text.
 - Author name and email default independently to effective Git `user.name` and
   `user.email` values, then to `Package Author` and `author@example.com`.
 - The license question is a constrained selection and defaults to MIT.
@@ -886,8 +888,8 @@ and, when applicable, Git repository initialization.
 - Explicit `--name`, `--title`, `--description`, `--author-name`, and
   `--author-email` values skip their respective questions; `--license` skips
   the license selection.
-- Non-interactive invocations use the same package, title, description, and
-  author fallbacks, default to MIT, and select no development packages.
+- Non-interactive invocations use package, title, and description fallbacks,
+  stable author placeholders, MIT, and no development packages.
 - Interactive completion suggests changing into the selected directory before
   running `rpx add`; init has already synchronized the project library.
 
