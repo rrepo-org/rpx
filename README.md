@@ -128,6 +128,10 @@ rpx add digest
 rpx run R
 ```
 
+Interactive initialization can add `testthat`, `roxygen2`, and `devtools` to
+`Suggests`. `rpx init` resolves the initial lockfile and syncs the project
+library before completing.
+
 `rpx add` updates `DESCRIPTION`, resolves a compatible package set, writes `rpx.lock`, and syncs the project library.
 
 ## Use an Existing Project

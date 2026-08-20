@@ -9,6 +9,7 @@ on:
     paths:
       - .github/workflows/docker.yml
       - docker/rpx.Dockerfile
+      - assets/**
       - Cargo.toml
       - Cargo.lock
       - src/**
