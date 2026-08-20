@@ -470,14 +470,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     } else {
         status(format_args!("Initialized project at {}", target.display()));
     }
-    if target != current_dir {
-        status(format_args!(
-            "Next: cd into `{}` and run `rpx add <package>`",
-            target.display()
-        ));
-    } else {
-        status("Next: run `rpx add <package>`");
-    }
+    status(next_step_message(&current_dir, &target));
     Ok(())
 }
 
@@ -503,6 +496,19 @@ fn resolve_target(current_dir: &Path, path: &Path) -> PathBuf {
         current_dir.join(path)
     };
     target.components().collect()
+}
+
+fn next_step_message(current_dir: &Path, target: &Path) -> String {
+    if target == current_dir {
+        return "Next: run `rpx add <package>`".to_string();
+    }
+
+    let relative_target =
+        pathdiff::diff_paths(target, current_dir).unwrap_or_else(|| target.into());
+    format!(
+        "Next: cd into `{}` and run `rpx add <package>`",
+        relative_target.display()
+    )
 }
 
 fn validate_target(target: &Path) -> Result<(), Error> {
@@ -999,6 +1005,21 @@ mod tests {
         assert_eq!(
             resolve_target(Path::new("/tmp/packages"), Path::new("./my-package")),
             Path::new("/tmp/packages/my-package")
+        );
+    }
+
+    #[test]
+    fn formats_next_step_relative_to_the_working_directory() {
+        assert_eq!(
+            next_step_message(
+                Path::new("/tmp/packages"),
+                Path::new("/tmp/packages/my-package")
+            ),
+            "Next: cd into `my-package` and run `rpx add <package>`"
+        );
+        assert_eq!(
+            next_step_message(Path::new("/tmp/packages"), Path::new("/tmp/packages")),
+            "Next: run `rpx add <package>`"
         );
     }
 
