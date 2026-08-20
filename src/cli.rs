@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use crate::description::DependencyField;
+
 #[derive(Parser, Debug)]
 #[command(name = "rpx")]
 #[command(
@@ -26,6 +28,9 @@ pub enum Commands {
         long_about = "Install one or more packages for this project. Each package is recorded in DESCRIPTION, then rpx regenerates rpx.lock and syncs the project library."
     )]
     Add {
+        #[command(flatten)]
+        dependency_type: AddDependencyTypeArgs,
+
         #[arg(
             help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
             value_name = "PACKAGE[@CONSTRAINTVERSION]",
@@ -159,6 +164,37 @@ pub enum InitLicense {
     Proprietary,
 }
 
+#[derive(Args, Debug)]
+#[group(multiple = false)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct AddDependencyTypeArgs {
+    #[arg(long, help = "Add packages to Depends")]
+    depends: bool,
+
+    #[arg(long, help = "Add packages to Imports (default)")]
+    imports: bool,
+
+    #[arg(long, help = "Add packages to LinkingTo")]
+    linking_to: bool,
+
+    #[arg(long, visible_alias = "dev", help = "Add packages to Suggests")]
+    suggests: bool,
+}
+
+impl From<AddDependencyTypeArgs> for DependencyField {
+    fn from(args: AddDependencyTypeArgs) -> Self {
+        [
+            (args.depends, Self::Depends),
+            (args.imports, Self::Imports),
+            (args.linking_to, Self::LinkingTo),
+            (args.suggests, Self::Suggests),
+        ]
+        .into_iter()
+        .find_map(|(selected, field)| selected.then_some(field))
+        .unwrap_or_default()
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum RepoCommands {
     #[command(about = "Add an additional repository (shortcut)")]
@@ -275,6 +311,7 @@ pub enum RepositoryType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn parse(arguments: &[&str]) -> Commands {
         Cli::try_parse_from(arguments)
@@ -334,6 +371,69 @@ mod tests {
                 && author_email == "author@example.com"
                 && license == InitLicense::Apache2
         ));
+    }
+
+    #[test]
+    fn parses_add_dependency_fields() {
+        for (flag, expected) in [
+            (None, DependencyField::Imports),
+            (Some("--depends"), DependencyField::Depends),
+            (Some("--imports"), DependencyField::Imports),
+            (Some("--linking-to"), DependencyField::LinkingTo),
+            (Some("--suggests"), DependencyField::Suggests),
+            (Some("--dev"), DependencyField::Suggests),
+        ] {
+            let mut arguments = vec!["rpx", "add"];
+            arguments.extend(flag);
+            arguments.push("digest@>=0.6.37");
+
+            let Commands::Add {
+                packages,
+                dependency_type,
+            } = parse(&arguments)
+            else {
+                panic!("add command should parse");
+            };
+
+            assert_eq!(packages, ["digest@>=0.6.37"]);
+            assert_eq!(DependencyField::from(dependency_type), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_add_dependency_fields() {
+        let flags = ["--depends", "--imports", "--linking-to", "--suggests"];
+
+        assert!(flags.iter().enumerate().all(|(index, first)| {
+            flags
+                .iter()
+                .skip(index + 1)
+                .all(|second| Cli::try_parse_from(["rpx", "add", first, second, "digest"]).is_err())
+        }));
+        assert!(Cli::try_parse_from(["rpx", "add", "--enhances", "digest"]).is_err());
+    }
+
+    #[test]
+    fn add_help_lists_supported_dependency_fields() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("add")
+            .expect("add command should exist")
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            [
+                "--depends",
+                "--imports",
+                "--linking-to",
+                "--suggests",
+                "--dev",
+            ]
+            .iter()
+            .all(|flag| help.contains(flag))
+        );
+        assert!(!help.contains("--enhances"));
     }
 
     #[test]

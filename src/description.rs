@@ -20,6 +20,15 @@ use crate::repository::{
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
 pub const BASE_REPOSITORY_FIELD: &str = "Config/rpx/base-repository";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DependencyField {
+    Depends,
+    #[default]
+    Imports,
+    LinkingTo,
+    Suggests,
+}
+
 #[derive(Debug, Error, Diagnostic)]
 #[error("failed to parse DESCRIPTION ({count} errors)")]
 #[diagnostic(code(rpx::description::parse_failed))]
@@ -462,6 +471,7 @@ pub fn add_dependencies(
     path: &Path,
     description: &mut RDescription,
     dependencies: &BTreeSet<Relation>,
+    field: DependencyField,
 ) -> Result<(), DescriptionParseError> {
     if dependencies.is_empty() {
         return Ok(());
@@ -571,9 +581,15 @@ pub fn add_dependencies(
 
     depends.retain(|dependency| !added_packages.contains(dependency.package()));
     imports.retain(|dependency| !added_packages.contains(dependency.package()));
-    imports.extend(dependencies.iter().cloned());
     linking_to.retain(|dependency| !added_packages.contains(dependency.package()));
     suggests.retain(|dependency| !added_packages.contains(dependency.package()));
+
+    match field {
+        DependencyField::Depends => depends.extend(dependencies.iter().cloned()),
+        DependencyField::Imports => imports.extend(dependencies.iter().cloned()),
+        DependencyField::LinkingTo => linking_to.extend(dependencies.iter().cloned()),
+        DependencyField::Suggests => suggests.extend(dependencies.iter().cloned()),
+    }
 
     description.set_depends(depends);
     description.set_imports(imports);
@@ -1283,29 +1299,44 @@ mod tests {
     }
 
     #[test]
-    fn add_moves_packages_to_imports_and_leaves_enhances_untouched() {
-        let mut description = RDescription::parse(
-            "Package: project\nVersion: 1.0.0\nDepends: dplyr (>= 1.0.0), keepDepends\nImports: dplyr (< 2.0.0), keepImports\nLinkingTo: dplyr, keepLinking\nSuggests: dplyr, keepSuggests\nEnhances: dplyr, keepEnhances\n",
-        );
+    fn add_moves_packages_to_selected_field_and_leaves_enhances_untouched() {
+        for (field, selected_index) in [
+            (DependencyField::Depends, 0),
+            (DependencyField::Imports, 1),
+            (DependencyField::LinkingTo, 2),
+            (DependencyField::Suggests, 3),
+        ] {
+            let mut description = RDescription::parse(
+                "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), dplyr (>= 1.0.0), keepDepends\nImports: dplyr (< 2.0.0), keepImports\nLinkingTo: dplyr, keepLinking\nSuggests: dplyr, keepSuggests\nEnhances: dplyr, keepEnhances\n",
+            );
 
-        add_dependencies(
-            Path::new("."),
-            &mut description,
-            &relation_set(&["dplyr (== 1.1.0)"]),
-        )
-        .expect("dependency should be added");
+            add_dependencies(
+                Path::new("."),
+                &mut description,
+                &relation_set(&["dplyr (== 1.1.0)"]),
+                field,
+            )
+            .expect("dependency should be added");
 
-        assert_eq!(relation_strings(description.depends()), ["keepDepends"]);
-        assert_eq!(
-            relation_strings(description.imports()),
-            ["dplyr (== 1.1.0)", "keepImports"]
-        );
-        assert_eq!(relation_strings(description.linking_to()), ["keepLinking"]);
-        assert_eq!(relation_strings(description.suggests()), ["keepSuggests"]);
-        assert_eq!(
-            relation_strings(description.enhances()),
-            ["dplyr", "keepEnhances"]
-        );
+            let managed_fields = [
+                relation_strings(description.depends()),
+                relation_strings(description.imports()),
+                relation_strings(description.linking_to()),
+                relation_strings(description.suggests()),
+            ];
+            assert!(managed_fields[selected_index].contains(&"dplyr (== 1.1.0)".to_string()));
+            assert!(managed_fields.iter().enumerate().all(|(index, relations)| {
+                index == selected_index
+                    || !relations
+                        .iter()
+                        .any(|relation| relation.starts_with("dplyr"))
+            }));
+            assert!(managed_fields[0].contains(&"R (>= 4.2)".to_string()));
+            assert_eq!(
+                relation_strings(description.enhances()),
+                ["dplyr", "keepEnhances"]
+            );
+        }
     }
 
     #[test]
@@ -1318,6 +1349,7 @@ mod tests {
             Path::new("."),
             &mut description,
             &relation_set(&["askpass", "cli"]),
+            DependencyField::Imports,
         )
         .expect("dependencies should be added");
 
@@ -1336,8 +1368,13 @@ mod tests {
             "Package: project\nVersion: 1.0.0\nImports: cli (>= 1.0.0), cli (< 2.0.0)\n",
         );
 
-        add_dependencies(Path::new("."), &mut description, &relation_set(&["digest"]))
-            .expect("dependency should be added");
+        add_dependencies(
+            Path::new("."),
+            &mut description,
+            &relation_set(&["digest"]),
+            DependencyField::Imports,
+        )
+        .expect("dependency should be added");
 
         assert_eq!(
             relation_strings(description.imports()),
@@ -1357,6 +1394,7 @@ mod tests {
                 Path::new("."),
                 &mut description,
                 &relation_set(&["jsonlite"]),
+                DependencyField::Imports,
             )
             .is_err()
         );
@@ -1369,8 +1407,13 @@ mod tests {
             RDescription::parse("Package: project\nVersion: 1.0.0\nImports: cli, cli\n");
         let original = description.to_string();
 
-        add_dependencies(Path::new("."), &mut description, &BTreeSet::new())
-            .expect("empty add should succeed");
+        add_dependencies(
+            Path::new("."),
+            &mut description,
+            &BTreeSet::new(),
+            DependencyField::Suggests,
+        )
+        .expect("empty add should succeed");
 
         assert_eq!(description.to_string(), original);
     }

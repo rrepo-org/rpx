@@ -398,7 +398,7 @@ Imports: digest",
 }
 
 #[test]
-fn moves_added_package_from_depends_to_imports() {
+fn adds_dependency_to_selected_description_field() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-depends";
     write_description(
@@ -411,25 +411,59 @@ Description: Test package for rpx integration tests.
 License: MIT
 Author: Test Author
 Maintainer: Test Author <test@example.com>
-Depends: R (>= 4.3), digest",
+Depends: R (>= 4.3), digest
+Enhances: digest",
     );
 
-    let command = format!("cd {project_path} && rpx add digest");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    for (flag, selected_index) in [
+        ("--depends", 0),
+        ("--imports", 1),
+        ("--linking-to", 2),
+        ("--suggests", 3),
+    ] {
+        let command = format!("cd {project_path} && rpx add {flag} digest");
+        let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+        assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    let description = read_project_file(&container, project_path, "DESCRIPTION");
-    let parsed = parsed_description(&description);
-    let depends = relation_names(parsed.depends().expect("Depends should parse"));
-    let imports = relation_names(parsed.imports().expect("Imports should parse"));
-    assert!(
-        !depends.contains(&"digest".to_string()) && depends.contains(&"R".to_string()),
-        "DESCRIPTION was: {description}"
-    );
-    assert!(
-        imports.contains(&"digest".to_string()),
-        "DESCRIPTION was: {description}"
-    );
+        let description = read_project_file(&container, project_path, "DESCRIPTION");
+        let parsed = parsed_description(&description);
+        let managed_fields = [
+            relation_names(parsed.depends().expect("Depends should parse")),
+            relation_names(parsed.imports().expect("Imports should parse")),
+            relation_names(parsed.linking_to().expect("LinkingTo should parse")),
+            relation_names(parsed.suggests().expect("Suggests should parse")),
+        ];
+        assert!(managed_fields.iter().enumerate().all(|(index, relations)| {
+            relations.contains(&"digest".to_string()) == (index == selected_index)
+        }));
+        assert!(managed_fields[0].contains(&"R".to_string()));
+        assert!(
+            relation_names(parsed.enhances().expect("Enhances should parse"))
+                .contains(&"digest".to_string())
+        );
+
+        let selected_relations = match selected_index {
+            0 => parsed.depends().expect("Depends should parse"),
+            1 => parsed.imports().expect("Imports should parse"),
+            2 => parsed.linking_to().expect("LinkingTo should parse"),
+            3 => parsed.suggests().expect("Suggests should parse"),
+            _ => unreachable!(),
+        }
+        .filter(|relation| relation.package() == "digest")
+        .map(|relation| relation.to_string())
+        .collect::<Vec<_>>();
+        assert_eq!(selected_relations.len(), 2);
+        assert!(
+            selected_relations
+                .iter()
+                .any(|relation| relation.contains(">="))
+        );
+        assert!(
+            selected_relations
+                .iter()
+                .any(|relation| relation.contains('<'))
+        );
+    }
 }
 
 #[test]
