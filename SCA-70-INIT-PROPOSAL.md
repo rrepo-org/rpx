@@ -86,6 +86,7 @@ At the time of writing:
 - `src/description.rs::initial_description` creates package metadata.
 - `rpx init` writes DESCRIPTION, NAMESPACE, a production `.Rbuildignore`, and
   an initial `rpx.lock` resolved for the active R version.
+- Init synchronizes the project library from that resolution before completing.
 - Interactive init can initialize a Git repository and write GitHub's R
   `.gitignore` template.
 - Init rejects any existing target that contains a file or directory, including
@@ -330,13 +331,14 @@ Open questions include:
 
 ### Authorship consistency
 
-The selected source metadata uses only Authors@R with one valid `aut`/`cre`
-person. Explicit Author and Maintainer fields are omitted because R derives
-them from Authors@R, avoiding stale or contradictory metadata. Init resolves
-the creator name and email from explicit options, effective Git identity, or
-stable placeholders, in that order. A complete Git display name is preserved
-as the person's `given` value rather than being split according to Western name
-conventions.
+The selected source metadata uses Authors@R with one valid `aut`/`cre` person.
+Init also emits matching Author and Maintainer fields because `R CMD check` does
+not derive them when checking a source directory directly. All three fields are
+rendered from the same resolved identity to avoid contradictory metadata. Init
+resolves the creator name and email from explicit options, effective Git
+identity, or stable placeholders, in that order. A complete Git display name is
+preserved as the person's `given` value rather than being split according to
+Western name conventions.
 
 ## Execution Model
 
@@ -839,8 +841,8 @@ copyright holder.
 
 The interactive initializer uses Cliclack. It currently asks for the project
 directory, package name, package title, package description, author name, and
-author email, followed by a license selection and, when applicable, Git
-repository initialization.
+author email, followed by a license selection, optional development packages,
+and, when applicable, Git repository initialization.
 
 - `rpx init PATH` uses the explicit path and skips only the directory question.
 - The remaining unresolved fields are still prompted when both stdin and stderr
@@ -868,6 +870,12 @@ repository initialization.
 - Author name and email default independently to effective Git `user.name` and
   `user.email` values, then to `Package Author` and `author@example.com`.
 - The license question is a constrained selection and defaults to MIT.
+- The optional development-package multiselect offers testthat, roxygen2, and
+  devtools with no initial selections.
+- Selected development packages are added to Suggests without generating tool
+  configuration or scaffolding.
+- Init resolves selected packages once, then records the same `>= resolved` and
+  `< next major` bounds used by unconstrained `rpx add`.
 - When the target is not already inside a Git worktree, interactive init asks
   whether to initialize one and defaults to yes.
 - Targets inside an existing worktree use that repository without prompting or
@@ -879,9 +887,9 @@ repository initialization.
   `--author-email` values skip their respective questions; `--license` skips
   the license selection.
 - Non-interactive invocations use the same package, title, description, and
-  author fallbacks and default to MIT.
+  author fallbacks, default to MIT, and select no development packages.
 - Interactive completion suggests changing into the selected directory before
-  running `rpx sync` or `rpx add`.
+  running `rpx add`; init has already synchronized the project library.
 
 Interactive and non-interactive override flags, partially supplied metadata
 testing, and broader prompt testing are deferred.
@@ -906,6 +914,7 @@ Description [Describe what this package does.]:
 Author name [Package Author]:
 Author email [author@example.com]:
 License [MIT]:
+Development packages [none]:
 Initialize a Git repository? [Y/n]:
 Generate executable example code? [Y/n]:
 ```

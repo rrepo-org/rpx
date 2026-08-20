@@ -90,6 +90,31 @@ fn runs_rpx_init_in_empty_directory() {
         "stdout was: {}\nstderr was: {}",
         lockfile.1, lockfile.2
     );
+
+    let (exit_code, stdout, stderr) =
+        run_shell_command(&container, &format!("cd {project_path} && rpx status"));
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Project is in sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn default_init_passes_r_cmd_check_from_source() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-init-check";
+    let init_command = format!("mkdir -p {project_path} && cd {project_path} && rpx init");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &init_command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let (exit_code, stdout, stderr) = run_shell_command(
+        &container,
+        &format!("cd /tmp && R CMD check --no-manual {project_path}"),
+    );
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 }
 
 #[test]
@@ -114,6 +139,8 @@ fn init_creates_package_that_sync_can_install() {
         "Description: A custom package.",
         "License: GPL-3",
         "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))",
+        "Author: Package Author [aut, cre]",
+        "Maintainer: Package Author <author@example.com>",
     ] {
         assert!(
             description.1.contains(field),
@@ -121,19 +148,6 @@ fn init_creates_package_that_sync_can_install() {
             description.1
         );
     }
-    assert!(
-        !description
-            .1
-            .lines()
-            .any(|line| line.starts_with("Author:"))
-    );
-    assert!(
-        !description
-            .1
-            .lines()
-            .any(|line| line.starts_with("Maintainer:"))
-    );
-
     let retry = run_shell_command(
         &container,
         &format!("cd /tmp && rpx init {project_path} --title Replaced"),

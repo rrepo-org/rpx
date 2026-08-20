@@ -1,17 +1,20 @@
 use crate::{
-    LockError,
+    LockError, SyncError,
     cli::{InitArgs, InitLicense},
     description::{
-        DescriptionWriteError, InitialDescriptionError, InitialDescriptionOptions,
-        NamespaceWriteError, initial_description, write_description, write_namespace_if_missing,
+        DependencyField, DescriptionParseError, DescriptionWriteError, InitialDescriptionError,
+        InitialDescriptionOptions, NamespaceWriteError, add_dependencies, initial_description,
+        project_dependencies, write_description, write_namespace_if_missing,
     },
     git,
     lockfile::write_lockfile,
     output::status,
-    resolve_lockfile_for_description,
+    pin_dependency_to_resolved_major, resolve_lockfile_for_description, sync_project,
 };
 use miette::Diagnostic;
+use r_description::Relation;
 use std::{
+    collections::BTreeSet,
     env, fs, io,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -116,6 +119,10 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     WriteDescription(#[from] DescriptionWriteError),
 
     #[error(transparent)]
@@ -168,6 +175,27 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     InitialLock(#[from] LockError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Sync(#[from] SyncError),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DevelopmentPackage {
+    Testthat,
+    Roxygen2,
+    Devtools,
+}
+
+impl DevelopmentPackage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Testthat => "testthat",
+            Self::Roxygen2 => "roxygen2",
+            Self::Devtools => "devtools",
+        }
+    }
 }
 
 pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
@@ -184,15 +212,8 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         env::current_dir().map_err(|source| Error::WorkingDirectoryUnavailable { source })?;
     let git_identity = git::configured_identity(&current_dir);
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let metadata_form_active = interactive
-        && (path.is_none()
-            || name.is_none()
-            || title.is_none()
-            || description.is_none()
-            || author_name.is_none()
-            || author_email.is_none()
-            || license.is_none());
-    if metadata_form_active {
+    let form_active = interactive;
+    if form_active {
         cliclack::intro("Create an R package")
             .map_err(|source| Error::InteractivePrompt { source })?;
     }
@@ -232,11 +253,6 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     }
 
     let prompt_for_git = interactive && !git::is_inside_worktree(&target);
-    if prompt_for_git && !metadata_form_active {
-        cliclack::intro("Create an R package")
-            .map_err(|source| Error::InteractivePrompt { source })?;
-    }
-    let form_active = metadata_form_active || prompt_for_git;
 
     let package_name = match name {
         Some(package_name) => {
@@ -275,31 +291,71 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         None => default_author_email,
     };
     let authors_at_r = authors_at_r(&author_name, &author_email);
+    let author = format!("{author_name} [aut, cre]");
+    let maintainer = format!("{author_name} <{author_email}>");
     let license = match license {
         Some(license) => license,
         None if interactive => prompt_for_license()?,
         None => InitLicense::Mit,
     };
+    let development_packages = if interactive {
+        prompt_for_development_packages()?
+    } else {
+        Vec::new()
+    };
     let initialize_git = prompt_for_git && prompt_for_git_repository()?;
-    let description = initial_description(InitialDescriptionOptions {
+    let mut description = initial_description(InitialDescriptionOptions {
         package_name: &package_name,
         title: &title,
         description: &description,
         authors_at_r: &authors_at_r,
+        author: &author,
+        maintainer: &maintainer,
         license: license.description_value(),
     })?;
+    let development_relations = development_relations(&development_packages);
+    add_dependencies(
+        &target,
+        &mut description,
+        &development_relations,
+        DependencyField::Suggests,
+    )?;
 
     fs::create_dir_all(&target).map_err(|source| Error::CreateTarget {
         path: target.clone(),
         source,
     })?;
-    let lockfile = resolve_lockfile_for_description(&target, &description, None).await?;
+    let mut lockfile = resolve_lockfile_for_description(&target, &description, None).await?;
+    let mut pinned_development_relations = development_relations.clone();
+    for package in development_packages {
+        let version = &lockfile
+            .packages
+            .get(package.name())
+            .expect("resolved lockfile should contain selected development packages")
+            .version;
+        pin_dependency_to_resolved_major(
+            &mut pinned_development_relations,
+            package.name(),
+            version,
+        );
+    }
+    if pinned_development_relations != development_relations {
+        add_dependencies(
+            &target,
+            &mut description,
+            &pinned_development_relations,
+            DependencyField::Suggests,
+        )?;
+        lockfile.requirements = project_dependencies(&target, &description)?;
+    }
 
     write_description(&target, &description)?;
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
     write_lockfile(&target, &lockfile).map_err(LockError::from)?;
+    let r_version = lockfile.r.clone();
+    sync_project(&target, description, &lockfile, &r_version, false, false).await?;
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),
@@ -323,9 +379,9 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     }
     if let Some(directory) = prompted_directory {
         status(format_args!("Next: cd `{directory}`"));
-        status("Then: run `rpx sync` or `rpx add <package>`");
+        status("Then: run `rpx add <package>`");
     } else {
-        status("Next: run `rpx sync` or `rpx add <package>`");
+        status("Next: run `rpx add <package>`");
     }
     Ok(())
 }
@@ -421,6 +477,33 @@ fn prompt_for_license() -> Result<InitLicense, Error> {
         .map_err(|source| Error::InteractivePrompt { source })
 }
 
+fn prompt_for_development_packages() -> Result<Vec<DevelopmentPackage>, Error> {
+    cliclack::multiselect("Development packages")
+        .item(DevelopmentPackage::Testthat, "testthat", "Unit testing")
+        .item(
+            DevelopmentPackage::Roxygen2,
+            "roxygen2",
+            "Documentation generation",
+        )
+        .item(
+            DevelopmentPackage::Devtools,
+            "devtools",
+            "Package development toolkit",
+        )
+        .required(false)
+        .interact()
+        .map_err(|source| Error::InteractivePrompt { source })
+}
+
+fn development_relations(packages: &[DevelopmentPackage]) -> BTreeSet<Relation> {
+    packages
+        .iter()
+        .map(|package| {
+            Relation::any(package.name()).expect("built-in package names should be valid")
+        })
+        .collect()
+}
+
 fn prompt_for_git_repository() -> Result<bool, Error> {
     cliclack::confirm("Initialize a Git repository?")
         .initial_value(true)
@@ -507,7 +590,7 @@ fn write_license_files(
         InitLicense::Mit => {
             write_license_file(
                 target.join("LICENSE"),
-                &format!("YEAR: {year}\n\nCOPYRIGHT HOLDER: {copyright_holder}\n"),
+                &format!("YEAR: {year}\nCOPYRIGHT HOLDER: {copyright_holder}\n"),
             )?;
             let full_text = license
                 .full_text()
@@ -723,6 +806,23 @@ mod tests {
                 "package name should be invalid: {package_name}"
             );
         }
+    }
+
+    #[test]
+    fn maps_selected_development_packages_to_unconstrained_relations() {
+        let relations = development_relations(&[
+            DevelopmentPackage::Testthat,
+            DevelopmentPackage::Roxygen2,
+            DevelopmentPackage::Devtools,
+        ]);
+
+        assert_eq!(
+            relations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["devtools", "roxygen2", "testthat"]
+        );
     }
 
     #[test]

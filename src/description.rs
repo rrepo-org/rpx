@@ -202,6 +202,8 @@ pub struct InitialDescriptionOptions<'a> {
     pub title: &'a str,
     pub description: &'a str,
     pub authors_at_r: &'a str,
+    pub author: &'a str,
+    pub maintainer: &'a str,
     pub license: &'a str,
 }
 
@@ -216,6 +218,8 @@ pub fn initial_description(
     description.set_description(options.description)?;
     description.set_license(options.license)?;
     description.set_authors_at_r(options.authors_at_r)?;
+    description.set_author(options.author)?;
+    description.set_maintainer(options.maintainer)?;
     Ok(description)
 }
 
@@ -1157,6 +1161,8 @@ mod tests {
             title: "My Package",
             description: "Describe what this package does.",
             authors_at_r: r#"person(given = "Package Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            author: "Package Author [aut, cre]",
+            maintainer: "Package Author <author@example.com>",
             license: "MIT + file LICENSE",
         })
         .expect("description should initialize");
@@ -1173,8 +1179,8 @@ mod tests {
         assert!(rendered.contains(
             "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))"
         ));
-        assert!(!rendered.lines().any(|line| line.starts_with("Author:")));
-        assert!(!rendered.lines().any(|line| line.starts_with("Maintainer:")));
+        assert!(rendered.contains("Author: Package Author [aut, cre]"));
+        assert!(rendered.contains("Maintainer: Package Author <author@example.com>"));
     }
 
     #[test]
@@ -1184,6 +1190,8 @@ mod tests {
             title: "Custom Package",
             description: "A custom package description.",
             authors_at_r: r#"person(given = "Example Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            author: "Example Author [aut, cre]",
+            maintainer: "Example Author <author@example.com>",
             license: "Apache License (== 2.0)",
         })
         .expect("description should initialize");

@@ -451,26 +451,7 @@ async fn cmd_add(packages: &[String], dependency_field: DependencyField) -> Resu
             let (selected, _) = resolved
                 .get(package)
                 .expect("resolved package map should contain every added package");
-            let version = selected.version();
-            let next_major = format!("{}.0.0", version.major() + 1)
-                .parse::<Version>()
-                .expect("next major version should be valid");
-
-            relations.retain(|relation| {
-                relation.package() != package
-                    || !matches!(relation.requirement(), VersionRequirement::Any)
-            });
-            relations.insert(
-                Relation::new(
-                    package,
-                    VersionRequirement::GreaterThanEqual(version.clone()),
-                )
-                .expect("previously parsed package name should remain valid"),
-            );
-            relations.insert(
-                Relation::new(package, VersionRequirement::LessThan(next_major))
-                    .expect("previously parsed package name should remain valid"),
-            );
+            pin_dependency_to_resolved_major(&mut relations, package, selected.version());
 
             relations
         });
@@ -512,6 +493,31 @@ async fn cmd_add(packages: &[String], dependency_field: DependencyField) -> Resu
             .join(", ")
     ));
     Ok(())
+}
+
+pub(crate) fn pin_dependency_to_resolved_major(
+    relations: &mut BTreeSet<Relation>,
+    package: &str,
+    version: &Version,
+) {
+    let next_major = format!("{}.0.0", version.major() + 1)
+        .parse::<Version>()
+        .expect("next major version should be valid");
+
+    relations.retain(|relation| {
+        relation.package() != package || !matches!(relation.requirement(), VersionRequirement::Any)
+    });
+    relations.insert(
+        Relation::new(
+            package,
+            VersionRequirement::GreaterThanEqual(version.clone()),
+        )
+        .expect("previously parsed package name should remain valid"),
+    );
+    relations.insert(
+        Relation::new(package, VersionRequirement::LessThan(next_major))
+            .expect("previously parsed package name should remain valid"),
+    );
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -931,7 +937,7 @@ async fn cmd_lock() -> Result<(), LockError> {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-enum SyncError {
+pub(crate) enum SyncError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     ProjectDiscovery(#[from] ProjectDiscoveryError),
@@ -1009,12 +1015,31 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
     let r_version = r_version_async().await?;
     validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
 
-    sync_system_dependencies(&lockfile, install_system, install_only_system)?;
+    sync_project(
+        &current_dir,
+        description,
+        &lockfile,
+        &r_version,
+        install_system,
+        install_only_system,
+    )
+    .await
+}
+
+pub(crate) async fn sync_project(
+    current_dir: &PathBuf,
+    description: RDescription,
+    lockfile: &Lockfile,
+    r_version: &semver::Version,
+    install_system: bool,
+    install_only_system: bool,
+) -> Result<(), SyncError> {
+    sync_system_dependencies(lockfile, install_system, install_only_system)?;
     if install_only_system {
         return Ok(());
     }
 
-    let mut required = required_packages_from_lockfile(&lockfile)?;
+    let mut required = required_packages_from_lockfile(lockfile)?;
     let (root_name, root_version) = root_package(&current_dir, &description)?;
     let root =
         Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
@@ -1028,7 +1053,7 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
 
     let project_library = project_library_path(&current_dir);
     let installed = installed_packages(&project_library).await?;
-    sync_packages(&project_library, required, installed, &r_version).await?;
+    sync_packages(&project_library, required, installed, r_version).await?;
     status("Synchronized project library");
     Ok(())
 }
@@ -2541,7 +2566,8 @@ mod tests {
     use super::{
         LockError, RequiredPackages, lock_error_from_repository, lock_error_from_resolution,
         lockfile_from_resolution, package_dependency_names, package_requires_install,
-        package_rules_from_lockfile, parse_add_package, required_package_install_order,
+        package_rules_from_lockfile, parse_add_package, pin_dependency_to_resolved_major,
+        required_package_install_order,
     };
     use crate::{
         git::GitError,
@@ -2632,6 +2658,21 @@ mod tests {
         ] {
             assert!(parse_add_package(input).is_err(), "{input:?} should fail");
         }
+    }
+
+    #[test]
+    fn pins_unconstrained_dependency_to_resolved_major_range() {
+        let mut relations = BTreeSet::from([relation("digest"), relation("cli (>= 3.0.0)")]);
+
+        pin_dependency_to_resolved_major(&mut relations, "digest", &version("0.6.39"));
+
+        assert_eq!(
+            relations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["cli (>= 3.0.0)", "digest (< 1.0.0)", "digest (>= 0.6.39)"]
+        );
     }
 
     #[test]
