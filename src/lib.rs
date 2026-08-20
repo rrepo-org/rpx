@@ -206,15 +206,20 @@ pub async fn run() -> miette::Result<()> {
         Commands::Add {
             packages,
             dependency_type,
-        } => cmd_add(&packages, dependency_type.into()).await?,
-        Commands::Remove { packages } => cmd_remove(&packages).await?,
+            no_install_project,
+        } => cmd_add(&packages, dependency_type.into(), no_install_project).await?,
+        Commands::Remove {
+            packages,
+            no_install_project,
+        } => cmd_remove(&packages, no_install_project).await?,
         Commands::Run { command } => cmd_run(&command).await?,
         Commands::Lock {} => cmd_lock().await?,
         Commands::Status => cmd_status().await?,
         Commands::Sync {
+            no_install_project,
             install_system,
             install_only_system,
-        } => cmd_sync(install_system, install_only_system).await?,
+        } => cmd_sync(no_install_project, install_system, install_only_system).await?,
         Commands::Clean => cmd_clean()?,
         Commands::Repo { command } => repo::run(command).await?,
     }
@@ -323,7 +328,11 @@ enum AddError {
     Install(#[from] SyncError),
 }
 
-async fn cmd_add(packages: &[String], dependency_field: DependencyField) -> Result<(), AddError> {
+async fn cmd_add(
+    packages: &[String],
+    dependency_field: DependencyField,
+    no_install_project: bool,
+) -> Result<(), AddError> {
     let current_dir = find_project_root()?;
     let added_relations = packages
         .iter()
@@ -466,17 +475,15 @@ async fn cmd_add(packages: &[String], dependency_field: DependencyField) -> Resu
         lockfile.requirements = project_dependencies(&current_dir, &description)?;
     }
 
-    // The lockfile contains only external packages, but sync also needs the local
-    // root. Reinsert it with the in-memory DESCRIPTION used during resolution.
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-    resolved.insert(
+    configure_project_installation(
+        &current_dir,
+        &description,
+        &mut resolved,
         root_name,
-        (
-            PackageVersion::new(root_version, root),
-            Arc::new(description.clone()),
-        ),
-    );
+        root_version,
+        no_install_project,
+        &base_packages,
+    )?;
 
     write_description(&current_dir, &description)?;
     write_lockfile(&current_dir, &lockfile)?;
@@ -582,7 +589,7 @@ enum RemoveError {
     Install(#[from] SyncError),
 }
 
-async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
+async fn cmd_remove(packages: &[String], no_install_project: bool) -> Result<(), RemoveError> {
     let current_dir = find_project_root()?;
     let mut description = read_description(&current_dir)?;
     let old_lockfile = match read_lockfile(&current_dir) {
@@ -687,15 +694,20 @@ async fn cmd_remove(packages: &[String]) -> Result<(), RemoveError> {
         }
     };
 
-    // The lockfile contains only external packages, but sync also needs the local
-    // root. Reinsert it with the in-memory DESCRIPTION used during resolution.
-    resolved.insert(
+    let base_packages = if no_install_project {
+        base_packages().await.map_err(LockError::BasePackages)?
+    } else {
+        BTreeSet::new()
+    };
+    configure_project_installation(
+        &current_dir,
+        &description,
+        &mut resolved,
         root_name,
-        (
-            PackageVersion::new(root_version, root),
-            Arc::new(description.clone()),
-        ),
-    );
+        root_version,
+        no_install_project,
+        &base_packages,
+    )?;
 
     write_description(&current_dir, &description)?;
     write_lockfile(&current_dir, &lockfile)?;
@@ -956,6 +968,10 @@ pub(crate) enum SyncError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
 
     #[error(transparent)]
@@ -992,6 +1008,13 @@ pub(crate) enum SyncError {
     #[diagnostic(code(rpx::sync::download_failed))]
     DownloadArtifactsFailed { details: String },
 
+    #[error("cannot omit project package {project} because it is required by: {dependents}")]
+    #[diagnostic(
+        code(rpx::sync::circular_project_dependency),
+        help("Run without `--no-install-project` to install the circular project dependency.")
+    )]
+    CircularProjectDependency { project: String, dependents: String },
+
     #[error("failed to install project package: {source}")]
     #[diagnostic(code(rpx::sync::project_install_failed))]
     ProjectPackageInstall {
@@ -1008,7 +1031,11 @@ pub(crate) enum SyncError {
     },
 }
 
-async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(), SyncError> {
+async fn cmd_sync(
+    no_install_project: bool,
+    install_system: bool,
+    install_only_system: bool,
+) -> Result<(), SyncError> {
     let current_dir = find_project_root()?;
     let description = read_description(&current_dir)?;
     let lockfile = read_lockfile(&current_dir)?;
@@ -1020,6 +1047,7 @@ async fn cmd_sync(install_system: bool, install_only_system: bool) -> Result<(),
         description,
         &lockfile,
         &r_version,
+        no_install_project,
         install_system,
         install_only_system,
     )
@@ -1033,6 +1061,7 @@ pub(crate) async fn sync_project(
     description: RDescription,
     lockfile: &Lockfile,
     r_version: &semver::Version,
+    no_install_project: bool,
     install_system: bool,
     install_only_system: bool,
 ) -> Result<(), SyncError> {
@@ -1043,19 +1072,72 @@ pub(crate) async fn sync_project(
 
     let mut required = required_packages_from_lockfile(lockfile)?;
     let (root_name, root_version) = root_package(&current_dir, &description)?;
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-    required.insert(
+    let base_packages = if no_install_project {
+        base_packages().await?
+    } else {
+        BTreeSet::new()
+    };
+    configure_project_installation(
+        current_dir,
+        &description,
+        &mut required,
         root_name,
-        (
-            PackageVersion::new(root_version, root),
-            Arc::new(description),
-        ),
-    );
+        root_version,
+        no_install_project,
+        &base_packages,
+    )?;
 
     let project_library = project_library_path(&current_dir);
     let installed = installed_packages(&project_library).await?;
     sync_packages(&project_library, required, installed, r_version).await?;
+    Ok(())
+}
+
+fn configure_project_installation(
+    current_dir: &Path,
+    description: &RDescription,
+    required: &mut RequiredPackages,
+    root_name: String,
+    root_version: Version,
+    no_install_project: bool,
+    base_packages: &BTreeSet<String>,
+) -> Result<(), SyncError> {
+    // Resolution includes the local root in some paths, while lockfiles never do.
+    required.remove(&root_name);
+
+    if no_install_project {
+        if !base_packages.contains(&root_name) {
+            let dependents = required
+                .iter()
+                .filter_map(|(name, (_, description))| {
+                    package_dependency_names(description)
+                        .map(|dependencies| dependencies.contains(&root_name).then(|| name.clone()))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+
+            if !dependents.is_empty() {
+                return Err(SyncError::CircularProjectDependency {
+                    project: root_name,
+                    dependents: dependents.join(", "),
+                });
+            }
+        }
+
+        return Ok(());
+    }
+
+    let root = Arc::new(
+        LocalRepository::new(current_dir.to_path_buf()).with_description(description.clone()),
+    );
+    required.insert(
+        root_name,
+        (
+            PackageVersion::new(root_version, root),
+            Arc::new(description.clone()),
+        ),
+    );
     Ok(())
 }
 
@@ -2565,10 +2647,10 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        LockError, RequiredPackages, lock_error_from_repository, lock_error_from_resolution,
-        lockfile_from_resolution, package_dependency_names, package_requires_install,
-        package_rules_from_lockfile, parse_add_package, pin_dependency_to_resolved_major,
-        required_package_install_order,
+        LockError, RequiredPackages, SyncError, configure_project_installation,
+        lock_error_from_repository, lock_error_from_resolution, lockfile_from_resolution,
+        package_dependency_names, package_requires_install, package_rules_from_lockfile,
+        parse_add_package, pin_dependency_to_resolved_major, required_package_install_order,
     };
     use crate::{
         git::GitError,
@@ -2584,7 +2666,7 @@ mod tests {
     use r_description::{RDescription, Relation, Remote, Version};
     use std::{
         collections::{BTreeMap, BTreeSet},
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::Arc,
     };
 
@@ -2611,6 +2693,50 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn rejects_omitting_project_required_by_locked_package() {
+        let project = RDescription::parse("Package: project\nVersion: 1.0.0\nSuggests: helper\n");
+        let mut packages = required_packages(&[("helper", "Imports: project\n")]);
+
+        let error = configure_project_installation(
+            &PathBuf::from("."),
+            &project,
+            &mut packages,
+            "project".to_string(),
+            version("1.0.0"),
+            true,
+            &BTreeSet::new(),
+        )
+        .expect_err("reverse project dependency should fail");
+
+        assert!(matches!(
+            error,
+            SyncError::CircularProjectDependency {
+                project,
+                dependents
+            } if project == "project" && dependents == "helper"
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_base_package_as_omitted_project_dependency() {
+        let project = RDescription::parse("Package: stats\nVersion: 1.0.0\n");
+        let mut packages = required_packages(&[("helper", "Imports: stats\n")]);
+
+        configure_project_installation(
+            Path::new("."),
+            &project,
+            &mut packages,
+            "stats".to_string(),
+            version("1.0.0"),
+            true,
+            &BTreeSet::from(["stats".to_string()]),
+        )
+        .expect("base package dependency should not reference the project");
+
+        assert_eq!(packages.keys().collect::<Vec<_>>(), ["helper"]);
     }
 
     fn git_access_error(remote: &str) -> RepositoryError {

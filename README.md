@@ -144,6 +144,19 @@ rpx sync
 rpx run R
 ```
 
+By default, `rpx add`, `rpx remove`, and `rpx sync` also install the current
+project package. Use `--no-install-project` to synchronize its dependencies
+without installing the project itself:
+
+```bash
+rpx sync --no-install-project
+```
+
+Like `uv sync`, synchronization is exact: this flag removes an already
+installed copy of the project while retaining its dependencies. It fails when
+a locked package depends on the omitted project, since that creates a circular
+project dependency.
+
 Commit both `DESCRIPTION` and `rpx.lock`. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
 
 ## Daily Workflow
@@ -239,7 +252,8 @@ The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overvie
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
 - `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
 - `rpx` prefers existing locked versions when they are still available from enabled repositories.
-- `rpx sync` installs exactly what `rpx.lock` records into the project library.
+- `rpx sync` installs the packages in `rpx.lock` and the current project into the project library by default.
+- `--no-install-project` is available on `rpx add`, `rpx remove`, and `rpx sync` for dependency-only synchronization.
 - `rpx sync` tries Windows and macOS binary artifacts from enabled repositories when available, then falls back to the locked source artifact.
 - `rpx run` sets the R library path for the command it runs.
 

@@ -453,7 +453,16 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     write_license_files(&target, license, &author_name)?;
     write_lockfile(&target, &lockfile).map_err(LockError::from)?;
     let r_version = lockfile.r.clone();
-    sync_project(&target, description, &lockfile, &r_version, false, false).await?;
+    sync_project(
+        &target,
+        description,
+        &lockfile,
+        &r_version,
+        false,
+        false,
+        false,
+    )
+    .await?;
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),

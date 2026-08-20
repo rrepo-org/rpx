@@ -31,6 +31,9 @@ pub enum Commands {
         #[command(flatten)]
         dependency_type: AddDependencyTypeArgs,
 
+        #[arg(long, help = "Do not install the current project")]
+        no_install_project: bool,
+
         #[arg(
             help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
             value_name = "PACKAGE[@CONSTRAINTVERSION]",
@@ -44,6 +47,9 @@ pub enum Commands {
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
     Remove {
+        #[arg(long, help = "Do not install the current project")]
+        no_install_project: bool,
+
         #[arg(
             help = "Package names to remove from the project's dependencies",
             value_name = "PACKAGE",
@@ -84,6 +90,9 @@ pub enum Commands {
         long_about = "Install the exact package set recorded in rpx.lock into the project library."
     )]
     Sync {
+        #[arg(long, help = "Do not install the current project")]
+        no_install_project: bool,
+
         #[arg(
             long,
             conflicts_with = "install_only_system",
@@ -390,6 +399,7 @@ mod tests {
             let Commands::Add {
                 packages,
                 dependency_type,
+                no_install_project,
             } = parse(&arguments)
             else {
                 panic!("add command should parse");
@@ -397,6 +407,48 @@ mod tests {
 
             assert_eq!(packages, ["digest@>=0.6.37"]);
             assert_eq!(DependencyField::from(dependency_type), expected);
+            assert!(!no_install_project);
+        }
+    }
+
+    #[test]
+    fn parses_project_installation_opt_out() {
+        assert!(matches!(
+            parse(&["rpx", "add", "--no-install-project", "digest"]),
+            Commands::Add {
+                no_install_project: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["rpx", "remove", "--no-install-project", "digest"]),
+            Commands::Remove {
+                no_install_project: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["rpx", "sync", "--no-install-project"]),
+            Commands::Sync {
+                no_install_project: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn package_sync_help_lists_project_installation_opt_out() {
+        let mut command = Cli::command();
+
+        for subcommand in ["add", "remove", "sync"] {
+            let help = command
+                .find_subcommand_mut(subcommand)
+                .expect("command should exist")
+                .render_long_help()
+                .to_string();
+
+            assert!(help.contains("--no-install-project"));
+            assert!(help.contains("Do not install the current project"));
         }
     }
 
