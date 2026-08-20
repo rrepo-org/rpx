@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "rpx")]
@@ -16,9 +17,9 @@ pub struct Cli {
 pub enum Commands {
     #[command(
         about = "Initialize an R project",
-        long_about = "Initialize an R project in the current directory by creating a DESCRIPTION file."
+        long_about = "Initialize an R package project in a new or empty target directory."
     )]
-    Init,
+    Init(InitArgs),
 
     #[command(
         about = "Install one or more packages",
@@ -104,6 +105,58 @@ pub enum Commands {
         #[command(subcommand)]
         command: RepoCommands,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    #[arg(
+        help = "Directory to initialize",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::DirPath
+    )]
+    pub path: Option<PathBuf>,
+
+    #[arg(long, help = "Package name; defaults to the target directory name")]
+    pub name: Option<String>,
+
+    #[arg(long, help = "Package title")]
+    pub title: Option<String>,
+
+    #[arg(long, help = "Package description")]
+    pub description: Option<String>,
+
+    #[arg(long, help = "Package author name")]
+    pub author_name: Option<String>,
+
+    #[arg(long, help = "Package author email")]
+    pub author_email: Option<String>,
+
+    #[arg(long, value_enum, help = "Package license")]
+    pub license: Option<InitLicense>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InitLicense {
+    #[value(name = "mit")]
+    Mit,
+    #[value(name = "apache-2.0")]
+    Apache2,
+    #[value(name = "gpl-2")]
+    Gpl2,
+    #[value(name = "gpl-3")]
+    Gpl3,
+    #[value(name = "agpl-3")]
+    Agpl3,
+    #[value(name = "lgpl-2.1")]
+    Lgpl21,
+    #[value(name = "lgpl-3")]
+    Lgpl3,
+    #[value(name = "cc0")]
+    Cc0,
+    #[value(name = "cc-by-4.0")]
+    CcBy4,
+    #[value(name = "proprietary")]
+    Proprietary,
 }
 
 #[derive(Subcommand, Debug)]
@@ -227,6 +280,60 @@ mod tests {
         Cli::try_parse_from(arguments)
             .expect("command should parse")
             .command
+    }
+
+    #[test]
+    fn parses_init_defaults() {
+        assert!(matches!(
+            parse(&["rpx", "init"]),
+            Commands::Init(InitArgs {
+                path: None,
+                name: None,
+                title: None,
+                description: None,
+                author_name: None,
+                author_email: None,
+                license: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_init_target_and_metadata() {
+        assert!(matches!(
+            parse(&[
+                "rpx",
+                "init",
+                "projects/example",
+                "--name",
+                "example.pkg",
+                "--title",
+                "Example Package",
+                "--description",
+                "An example package.",
+                "--author-name",
+                "Example Author",
+                "--author-email",
+                "author@example.com",
+                "--license",
+                "apache-2.0",
+            ]),
+            Commands::Init(InitArgs {
+                path: Some(path),
+                name: Some(name),
+                title: Some(title),
+                description: Some(description),
+                author_name: Some(author_name),
+                author_email: Some(author_email),
+                license: Some(license),
+            }) if path == PathBuf::from("projects/example")
+                && name == "example.pkg"
+                && title == "Example Package"
+                && description == "An example package."
+                && author_name == "Example Author"
+                && author_email == "author@example.com"
+                && license == InitLicense::Apache2
+        ));
     }
 
     #[test]

@@ -22,6 +22,48 @@ const FETCHED_COMMIT_REF: &str = "refs/rpx/commit";
 
 static GIT_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
+#[derive(Debug, Default)]
+pub(crate) struct Identity {
+    pub(crate) name: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+pub(crate) fn configured_identity(path: &Path) -> Identity {
+    let config = Repository::discover(path)
+        .and_then(|repository| repository.config())
+        .or_else(|_| Config::open_default());
+    let Ok(config) = config else {
+        return Identity::default();
+    };
+
+    Identity {
+        name: config_value(&config, "user.name"),
+        email: config_value(&config, "user.email"),
+    }
+}
+
+pub(crate) fn is_inside_worktree(path: &Path) -> bool {
+    let Some(existing_ancestor) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+        return false;
+    };
+
+    Repository::discover(existing_ancestor).is_ok_and(|repository| repository.workdir().is_some())
+}
+
+pub(crate) fn initialize_repository(path: &Path) -> Result<(), GitError> {
+    Repository::init(path)
+        .map(|_| ())
+        .map_err(|source| operation("initialize Git repository", source))
+}
+
+fn config_value(config: &Config, key: &str) -> Option<String> {
+    config
+        .get_string(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GitUrl(String);
 

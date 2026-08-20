@@ -83,6 +83,105 @@ fn runs_rpx_init_in_empty_directory() {
         "DESCRIPTION was: {}",
         description.1
     );
+
+    let lockfile = run_shell_command(&container, &format!("cat {project_path}/rpx.lock"));
+    assert_eq!(
+        lockfile.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        lockfile.1, lockfile.2
+    );
+}
+
+#[test]
+fn init_creates_package_that_sync_can_install() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-init-target/projects/example";
+    let command = format!(
+        "cd /tmp && rpx init {project_path} --name custom.pkg --title 'Custom Package' --description 'A custom package.' --license gpl-3 && cd {project_path} && rpx sync"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let description = run_shell_command(&container, &format!("cat {project_path}/DESCRIPTION"));
+    assert_eq!(
+        description.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        description.1, description.2
+    );
+    for field in [
+        "Package: custom.pkg",
+        "Title: Custom Package",
+        "Description: A custom package.",
+        "License: GPL-3",
+        "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))",
+    ] {
+        assert!(
+            description.1.contains(field),
+            "DESCRIPTION was: {}",
+            description.1
+        );
+    }
+    assert!(
+        !description
+            .1
+            .lines()
+            .any(|line| line.starts_with("Author:"))
+    );
+    assert!(
+        !description
+            .1
+            .lines()
+            .any(|line| line.starts_with("Maintainer:"))
+    );
+
+    let retry = run_shell_command(
+        &container,
+        &format!("cd /tmp && rpx init {project_path} --title Replaced"),
+    );
+    assert_ne!(
+        retry.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        retry.1, retry.2
+    );
+    assert!(retry.2.contains("not empty"), "stderr was: {}", retry.2);
+
+    let unchanged = run_shell_command(&container, &format!("cat {project_path}/DESCRIPTION"));
+    assert_eq!(
+        unchanged.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        unchanged.1, unchanged.2
+    );
+    assert!(
+        unchanged.1.contains("Title: Custom Package"),
+        "DESCRIPTION was: {}",
+        unchanged.1
+    );
+
+    let buildignore = run_shell_command(&container, &format!("cat {project_path}/.Rbuildignore"));
+    assert_eq!(
+        buildignore.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        buildignore.1, buildignore.2
+    );
+    for pattern in ["^rpx\\.lock$", "^docs$", "^\\.github$", "^[.]?air[.]toml$"] {
+        assert!(
+            buildignore.1.lines().any(|line| line == pattern),
+            ".Rbuildignore was: {}",
+            buildignore.1
+        );
+    }
+
+    let hidden_target = "/tmp/rpx-init-target/nonempty-hidden";
+    let hidden = run_shell_command(
+        &container,
+        &format!("mkdir -p {hidden_target}/.git && rpx init {hidden_target}"),
+    );
+    assert_ne!(
+        hidden.0, 0,
+        "stdout was: {}\nstderr was: {}",
+        hidden.1, hidden.2
+    );
+    assert!(hidden.2.contains("not empty"), "stderr was: {}", hidden.2);
 }
 
 #[test]

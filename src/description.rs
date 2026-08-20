@@ -187,98 +187,27 @@ pub enum InitialDescriptionError {
     FieldMutation(#[from] r_description::FieldMutationError),
 }
 
-pub fn initial_description(package_name: &str) -> Result<RDescription, InitialDescriptionError> {
+#[derive(Clone, Copy)]
+pub struct InitialDescriptionOptions<'a> {
+    pub package_name: &'a str,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub authors_at_r: &'a str,
+    pub license: &'a str,
+}
+
+pub fn initial_description(
+    options: InitialDescriptionOptions<'_>,
+) -> Result<RDescription, InitialDescriptionError> {
     let mut description = RDescription::parse("");
-    description.set_package(package_name)?;
+    description.set_package(options.package_name)?;
     let version = "0.1.0".parse().expect("0.1.0 should parse");
     description.set_version(&version);
-    description.set_title(&title_from_package_name(package_name))?;
-    description.set_description("Add a package description.")?;
-    description.set_license("MIT")?;
-    description.set_authors_at_r(
-        r#"person("First", "Last", email = "you@example.com", role = c("aut", "cre"))"#,
-    )?;
-    description.set_maintainer("Your Name <you@example.com>")?;
+    description.set_title(options.title)?;
+    description.set_description(options.description)?;
+    description.set_license(options.license)?;
+    description.set_authors_at_r(options.authors_at_r)?;
     Ok(description)
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum PackageNameDerivationError {
-    #[error("failed to derive a package name from {}", path.display())]
-    #[diagnostic(code(rpx::description::package_name_missing))]
-    MissingDirectoryName { path: PathBuf },
-
-    #[error("project directory name is not valid UTF-8: {}", path.display())]
-    #[diagnostic(code(rpx::description::package_name_invalid_utf8))]
-    InvalidUtf8 { path: PathBuf },
-
-    #[error("directory name `{directory_name}` does not produce a valid package name")]
-    #[diagnostic(
-        code(rpx::description::package_name_empty),
-        help("Use at least one ASCII letter in the directory name.")
-    )]
-    Empty { directory_name: String },
-
-    #[error("derived package name `{package_name}` must start with a letter")]
-    #[diagnostic(
-        code(rpx::description::package_name_invalid_start),
-        help("Rename the directory so its name starts with an ASCII letter.")
-    )]
-    MustStartWithLetter { package_name: String },
-}
-
-pub fn derive_package_name(path: &Path) -> Result<String, PackageNameDerivationError> {
-    let directory_name = path
-        .file_name()
-        .ok_or_else(|| PackageNameDerivationError::MissingDirectoryName {
-            path: path.to_path_buf(),
-        })?
-        .to_str()
-        .ok_or_else(|| PackageNameDerivationError::InvalidUtf8 {
-            path: path.to_path_buf(),
-        })?;
-
-    let mut package_name = String::new();
-
-    for character in directory_name.chars() {
-        match character {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => package_name.push(character),
-            '-' | '_' | ' ' | '.' if !package_name.ends_with('.') => {
-                package_name.push('.');
-            }
-            _ => {}
-        }
-    }
-
-    let package_name = package_name.trim_matches('.').to_string();
-
-    let Some(first) = package_name.chars().next() else {
-        return Err(PackageNameDerivationError::Empty {
-            directory_name: directory_name.to_string(),
-        });
-    };
-
-    if !first.is_ascii_alphabetic() {
-        return Err(PackageNameDerivationError::MustStartWithLetter { package_name });
-    }
-
-    Ok(package_name)
-}
-
-fn title_from_package_name(package_name: &str) -> String {
-    package_name
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut characters = part.chars();
-            let Some(first) = characters.next() else {
-                return String::new();
-            };
-
-            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 pub fn root_package(
@@ -1206,37 +1135,50 @@ mod tests {
     }
 
     #[test]
-    fn derives_title_from_package_name() {
-        assert_eq!(
-            title_from_package_name("my.package.name"),
-            "My Package Name"
-        );
-    }
-
-    #[test]
     fn derives_initial_description_from_package_name() {
-        let description = initial_description("my.package").expect("description should initialize");
+        let description = initial_description(InitialDescriptionOptions {
+            package_name: "my.package",
+            title: "My Package",
+            description: "Describe what this package does.",
+            authors_at_r: r#"person(given = "Package Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            license: "MIT + file LICENSE",
+        })
+        .expect("description should initialize");
 
         assert_eq!(description.package().unwrap(), "my.package");
         assert_eq!(description.version().unwrap().to_string(), "0.1.0");
         assert_eq!(description.title().unwrap(), "My Package");
-        assert_eq!(description.license().unwrap(), "MIT");
+        assert_eq!(
+            description.description().unwrap(),
+            "Describe what this package does."
+        );
+        assert_eq!(description.license().unwrap(), "MIT + file LICENSE");
+        let rendered = description.to_string();
+        assert!(rendered.contains(
+            "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))"
+        ));
+        assert!(!rendered.lines().any(|line| line.starts_with("Author:")));
+        assert!(!rendered.lines().any(|line| line.starts_with("Maintainer:")));
     }
 
     #[test]
-    fn derives_and_validates_package_names_from_directory_names() {
+    fn uses_explicit_initial_description_metadata() {
+        let description = initial_description(InitialDescriptionOptions {
+            package_name: "custom.pkg",
+            title: "Custom Package",
+            description: "A custom package description.",
+            authors_at_r: r#"person(given = "Example Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            license: "Apache License (== 2.0)",
+        })
+        .expect("description should initialize");
+
+        assert_eq!(description.package().unwrap(), "custom.pkg");
+        assert_eq!(description.title().unwrap(), "Custom Package");
         assert_eq!(
-            derive_package_name(Path::new("/tmp/my-project_name")).unwrap(),
-            "my.project.name"
+            description.description().unwrap(),
+            "A custom package description."
         );
-        assert!(matches!(
-            derive_package_name(Path::new("/tmp/123-project")),
-            Err(PackageNameDerivationError::MustStartWithLetter { .. })
-        ));
-        assert!(matches!(
-            derive_package_name(Path::new("/tmp/---")),
-            Err(PackageNameDerivationError::Empty { .. })
-        ));
+        assert_eq!(description.license().unwrap(), "Apache License (== 2.0)");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
 use r_description::{RDescription, Relation, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
@@ -46,7 +46,7 @@ mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands};
-use commands::repo;
+use commands::{init, repo};
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
     LockedResolutionError, LockedResolutionFailure, RequiredPackages, artifact_cache_path,
@@ -69,10 +69,8 @@ use crate::{
     cache::CompiledPackageCacheKey,
     description::{
         DescriptionParseError, DescriptionReadError, DescriptionWriteError,
-        InitialDescriptionError, NamespaceWriteError, PackageNameDerivationError,
-        RepositoriesFromDescriptionError, add_dependencies, derive_package_name,
-        initial_description, project_dependencies, read_description, remove_dependencies,
-        repositories_from_description, root_package, write_description, write_namespace_if_missing,
+        RepositoriesFromDescriptionError, add_dependencies, project_dependencies, read_description,
+        remove_dependencies, repositories_from_description, root_package, write_description,
     },
     lockfile::{Lockfile, LockfileReadError, LockfileWriteError, read_lockfile, write_lockfile},
     project::{
@@ -204,7 +202,7 @@ pub async fn run() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init => cmd_init()?,
+        Commands::Init(args) => init::run(args).await?,
         Commands::Add { packages } => cmd_add(&packages).await?,
         Commands::Remove { packages } => cmd_remove(&packages).await?,
         Commands::Run { command } => cmd_run(&command).await?,
@@ -254,50 +252,6 @@ fn progress_bar_style() -> ProgressStyle {
         "{span_child_prefix}{spinner} {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes}",
     )
     .expect("progress bar style should be valid")
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum InitError {
-    #[error("failed to determine the current working directory: {source}")]
-    #[diagnostic(code(rpx::init::working_directory_unavailable))]
-    WorkingDirectoryUnavailable {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    PackageName(#[from] PackageNameDerivationError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    InitialDescription(#[from] InitialDescriptionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    WriteDescription(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    WriteNamespace(#[from] NamespaceWriteError),
-}
-
-fn cmd_init() -> Result<(), InitError> {
-    let current_dir =
-        env::current_dir().map_err(|source| InitError::WorkingDirectoryUnavailable { source })?;
-
-    let package_name = derive_package_name(&current_dir)?;
-    let description = initial_description(&package_name)?;
-
-    write_description(&current_dir, &description)?;
-    write_namespace_if_missing(&current_dir)?;
-
-    status(format_args!(
-        "Initialized project at {}",
-        current_dir.display()
-    ));
-    status("Next: run `rpx add <package>` or `rpx lock`");
-    Ok(())
 }
 
 #[derive(Debug, Error, Diagnostic)]
