@@ -104,14 +104,6 @@ pub(crate) struct Project {
     pub(crate) description: RDescription,
 }
 
-#[derive(Debug)]
-pub(crate) enum LockfileAssessment {
-    Valid,
-    Stale {
-        failures: Vec<LockedResolutionFailure>,
-    },
-}
-
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum ProjectLoadError {
     #[error(transparent)]
@@ -302,22 +294,6 @@ pub fn validate_locked_resolution(
     }
 }
 
-impl Project {
-    pub(crate) fn assess_lockfile(
-        &self,
-        r_version: &semver::Version,
-        lockfile: &Lockfile,
-    ) -> Result<LockfileAssessment, LockedResolutionError> {
-        match validate_locked_resolution(&self.root, &self.description, r_version, lockfile) {
-            Ok(()) => Ok(LockfileAssessment::Valid),
-            Err(LockedResolutionError::Validation { failures }) => {
-                Ok(LockfileAssessment::Stale { failures })
-            }
-            Err(source) => Err(source),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResolutionPolicy {
     AlwaysResolve,
@@ -364,10 +340,6 @@ pub(crate) enum ResolveProjectError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -665,13 +637,15 @@ pub(crate) async fn resolve_project(
     let r_version = r_version_async().await?;
     let requirements = project_dependencies(&project.root, &project.description)?;
 
-    let repositories = match policy {
-        ResolutionPolicy::AlwaysResolve => {
-            repositories_from_description(&project.root, &project.description).await?
-        }
-        ResolutionPolicy::ReuseIfValid => match previous.as_ref() {
-            Some(lockfile) => match project.assess_lockfile(&r_version, lockfile)? {
-                LockfileAssessment::Valid => {
+    let repositories = match (policy, previous.as_ref()) {
+        (ResolutionPolicy::ReuseIfValid, Some(lockfile)) => {
+            match validate_locked_resolution(
+                &project.root,
+                &project.description,
+                &r_version,
+                lockfile,
+            ) {
+                Ok(()) => {
                     return Ok(ProjectResolution {
                         lockfile: lockfile.clone(),
                         lockfile_changed: false,
@@ -679,7 +653,7 @@ pub(crate) async fn resolve_project(
                         r_version,
                     });
                 }
-                LockfileAssessment::Stale { failures }
+                Err(LockedResolutionError::Validation { failures })
                     if failures.iter().all(|failure| {
                         matches!(
                             failure,
@@ -695,12 +669,15 @@ pub(crate) async fn resolve_project(
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|source| ResolveProjectError::LockedRepository { source })?
                 }
-                LockfileAssessment::Stale { .. } => {
+                Err(LockedResolutionError::Validation { .. }) => {
                     repositories_from_description(&project.root, &project.description).await?
                 }
-            },
-            None => repositories_from_description(&project.root, &project.description).await?,
-        },
+                Err(LockedResolutionError::Parse(source)) => return Err(source.into()),
+            }
+        }
+        (ResolutionPolicy::AlwaysResolve, _) | (ResolutionPolicy::ReuseIfValid, None) => {
+            repositories_from_description(&project.root, &project.description).await?
+        }
     };
     let preferred_versions = previous
         .as_ref()
@@ -1445,44 +1422,6 @@ mod tests {
             Err(LoadProjectResolutionError::LockfileRead(
                 LockfileReadError::OutdatedLockfile { .. }
             ))
-        ));
-    }
-
-    #[test]
-    fn assesses_matching_lockfile_as_valid() {
-        let (root, description, r_version, lockfile) = validation_fixture();
-        let project = Project { root, description };
-
-        let assessment = project
-            .assess_lockfile(&r_version, &lockfile)
-            .expect("matching lockfile should be assessed");
-
-        assert!(matches!(assessment, LockfileAssessment::Valid));
-    }
-
-    #[test]
-    fn assesses_stale_lockfile_with_validation_failures() {
-        let (root, description, r_version, mut lockfile) = validation_fixture();
-        lockfile.requirements = BTreeSet::from([relation("different")]);
-        lockfile.r = semver::Version::new(4, 4, 0);
-        let project = Project { root, description };
-
-        let assessment = project
-            .assess_lockfile(&r_version, &lockfile)
-            .expect("stale lockfile should be assessed");
-
-        let LockfileAssessment::Stale { failures } = assessment else {
-            panic!("lockfile should be stale");
-        };
-        assert_eq!(failures.len(), 2);
-        assert!(matches!(
-            failures[0],
-            LockedResolutionFailure::PackageRequirementsChanged
-        ));
-        assert!(matches!(
-            &failures[1],
-            LockedResolutionFailure::RVersionChanged { locked, current }
-                if locked == &semver::Version::new(4, 4, 0) && current == &r_version
         ));
     }
 
