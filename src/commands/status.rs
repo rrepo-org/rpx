@@ -1,9 +1,11 @@
 use crate::{
-    LockError,
     description::{DescriptionParseError, root_package},
     host_supports_system_sync,
     output::status,
-    project::{ProjectLoadError, load_project, load_project_resolution, project_library_path},
+    project::{
+        LoadProjectResolutionError, ProjectLoadError, load_project, load_project_resolution,
+        project_library_path,
+    },
     r::{BasePackagesError, base_packages, installed_packages},
     system_plan_from_lockfile,
 };
@@ -102,7 +104,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lock(#[from] LockError),
+    LoadResolution(#[from] LoadProjectResolutionError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

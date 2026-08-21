@@ -1,5 +1,4 @@
 use crate::{
-    LockError,
     cli::{
         RepoAdditionalAddArgs, RepoAdditionalCommands, RepoAdditionalRemoveArgs, RepoBaseCommands,
         RepoBaseResetArgs, RepoBaseSetArgs, RepoCommands, RepoListArgs, RepoRemoteArgs,
@@ -15,8 +14,8 @@ use crate::{
     http,
     output::status,
     project::{
-        Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy, find_project_root,
-        resolve_project, write_project_metadata,
+        Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
+        find_project_root, resolve_project, write_project_metadata,
     },
     repository::{RepositoryError, built_in_repository_url, parse_repository_url},
 };
@@ -64,7 +63,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lock(Box<LockError>),
+    Resolve(Box<ResolveProjectError>),
 
     #[error("invalid {action} repository URL {url}: {source}")]
     #[diagnostic(code(rpx::repo::invalid_url))]
@@ -80,9 +79,9 @@ pub(crate) enum Error {
     CredentialRemove { details: String },
 }
 
-impl From<LockError> for Error {
-    fn from(error: LockError) -> Self {
-        Self::Lock(Box::new(error))
+impl From<ResolveProjectError> for Error {
+    fn from(error: ResolveProjectError) -> Self {
+        Self::Resolve(Box::new(error))
     }
 }
 

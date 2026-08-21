@@ -16,18 +16,19 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    LockError, RpxWarning,
+    RpxWarning,
     description::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
-        DescriptionReadError, add_dependencies, configured_repositories, project_dependencies,
-        read_description, repositories_from_description,
+        DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
+        configured_repositories, project_dependencies, read_description,
+        repositories_from_description,
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
     output::warning,
-    r::r_version_async,
+    r::{BasePackagesError, RVersionError, r_version_async},
     repository::{GitRepository, LocalRepository, PackageRepository, RepositoryError},
-    resolver::{PackageVersion, ResolutionError, resolve_from_registry},
+    resolver::{PackageVersion, ProviderError, ResolutionError, resolve_from_registry},
     sysreqs::{
         self, cached_latest_snapshot, empty_snapshot as empty_sysreq_snapshot,
         latest_snapshot as latest_sysreq_snapshot,
@@ -332,6 +333,199 @@ pub(crate) struct ProjectResolution {
 }
 
 #[derive(Debug, Error, Diagnostic)]
+pub(crate) enum LoadProjectResolutionError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum ResolveProjectError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    PreviousLockfile(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error("failed to reconstruct repository from rpx.lock: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    LockedRepository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::project::package_metadata_failed))]
+    PackageMetadata {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("package requirements are incompatible\n\n{explanation}")]
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Adjust package constraints in DESCRIPTION and try again.")
+    )]
+    NoSolution { explanation: String },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable {
+        repository: String,
+        #[source]
+        source: Box<ResolutionError>,
+    },
+
+    #[error("failed to resolve package set")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    Resolution {
+        #[source]
+        source: Box<ResolutionError>,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BuildLockfile(#[from] LockfileBuildError),
+}
+
+impl From<ResolutionError> for ResolveProjectError {
+    fn from(error: ResolutionError) -> Self {
+        match error {
+            ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
+                derivation_tree.collapse_no_versions();
+                Self::NoSolution {
+                    explanation: DefaultStringReporter::report(&derivation_tree),
+                }
+            }
+            ResolutionError::BasePackages(source) => Self::BasePackages(source),
+            ResolutionError::Provider(provider) => {
+                let repository = match &provider {
+                    ProviderError::Repository(source)
+                    | ProviderError::DependencyMetadata { source, .. } => {
+                        inaccessible_git_repository(source).map(str::to_owned)
+                    }
+                };
+                let source = ResolutionError::Provider(provider);
+                if let Some(repository) = repository {
+                    Self::GitRepositoryUnavailable {
+                        repository,
+                        source: Box::new(source),
+                    }
+                } else {
+                    Self::Resolution {
+                        source: Box::new(source),
+                    }
+                }
+            }
+            source => Self::Resolution {
+                source: Box::new(source),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum LockfileBuildError {
+    #[error("repository operation failed: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    Repository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable {
+        repository: String,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("repository {repository} cannot be written to the lockfile")]
+    #[diagnostic(code(rpx::lock::unsupported_repository))]
+    UnsupportedRepository { repository: String },
+
+    #[error("failed to read package requirements for {package}: {details}")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in the package DESCRIPTION.")
+    )]
+    InvalidPackageRequirements { package: String, details: String },
+
+    #[error("failed to read system requirements for {package}: {details}")]
+    #[diagnostic(code(rpx::lock::resolve_failed))]
+    InvalidSystemRequirements { package: String, details: String },
+
+    #[error("invalid system requirements database commit {commit}: {source}")]
+    #[diagnostic(code(rpx::lock::invalid_sysreq_commit))]
+    InvalidSystemRequirementsCommit {
+        commit: String,
+        #[source]
+        source: git2::Error,
+    },
+}
+
+impl From<RepositoryError> for LockfileBuildError {
+    fn from(source: RepositoryError) -> Self {
+        if let Some(repository) = inaccessible_git_repository(&source) {
+            Self::GitRepositoryUnavailable {
+                repository: repository.to_string(),
+                source,
+            }
+        } else {
+            Self::Repository { source }
+        }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
 pub(crate) enum ProjectWriteError {
     #[error("failed to serialize rpx.lock: {source}")]
     #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
@@ -466,7 +660,7 @@ fn serialize_lockfile(lockfile: &Lockfile) -> Result<Vec<u8>, ProjectWriteError>
 pub(crate) async fn resolve_project(
     project: &Project,
     policy: ResolutionPolicy,
-) -> Result<ProjectResolution, LockError> {
+) -> Result<ProjectResolution, ResolveProjectError> {
     let previous = read_previous_lockfile(&project.root)?;
     let r_version = r_version_async().await?;
     let requirements = project_dependencies(&project.root, &project.description)?;
@@ -499,7 +693,7 @@ pub(crate) async fn resolve_project(
                         .iter()
                         .map(<dyn PackageRepository>::from_lockfile)
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(lock_error_from_repository)?
+                        .map_err(|source| ResolveProjectError::LockedRepository { source })?
                 }
                 LockfileAssessment::Stale { .. } => {
                     repositories_from_description(&project.root, &project.description).await?
@@ -527,9 +721,10 @@ pub(crate) async fn resolve_project(
         requirements.clone(),
         preferred_versions,
     )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let mut packages = hydrate_resolved_packages(selected).await?;
+    .await?;
+    let mut packages = hydrate_resolved_packages(selected)
+        .await
+        .map_err(|source| ResolveProjectError::PackageMetadata { source })?;
     packages.retain(|_, (version, _)| !version.repository().equals(root.as_ref()));
     let sysreq_db = load_sysreq_snapshot_for_lock(previous.as_ref()).await;
     let lockfile = lockfile_from_resolution(
@@ -552,7 +747,7 @@ pub(crate) async fn resolve_project(
 
 pub(crate) async fn load_project_resolution(
     project: &Project,
-) -> Result<ProjectResolution, LockError> {
+) -> Result<ProjectResolution, LoadProjectResolutionError> {
     let lockfile = read_lockfile(&project.root)?;
     let r_version = r_version_async().await?;
     validate_locked_resolution(&project.root, &project.description, &r_version, &lockfile)?;
@@ -639,41 +834,6 @@ fn pin_dependency_to_resolved_major(
     );
 }
 
-pub(crate) fn lock_error_from_resolution(error: ResolutionError) -> LockError {
-    if let ResolutionError::Provider(provider) = &error {
-        let source = match provider {
-            crate::resolver::ProviderError::Repository(source)
-            | crate::resolver::ProviderError::DependencyMetadata { source, .. } => source,
-        };
-        if let Some(repository) = inaccessible_git_repository(source) {
-            return LockError::GitRepositoryUnavailable {
-                repository: repository.to_string(),
-            };
-        }
-    }
-
-    match error {
-        ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
-            derivation_tree.collapse_no_versions();
-            LockError::NoSolution {
-                explanation: DefaultStringReporter::report(&derivation_tree),
-            }
-        }
-        ResolutionError::BasePackages(source) => LockError::BasePackages(source),
-        source => LockError::Resolution { source },
-    }
-}
-
-pub(crate) fn lock_error_from_repository(source: RepositoryError) -> LockError {
-    if let Some(repository) = inaccessible_git_repository(&source) {
-        LockError::GitRepositoryUnavailable {
-            repository: repository.to_string(),
-        }
-    } else {
-        LockError::Repository { source }
-    }
-}
-
 fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
     let RepositoryError::Git { source, .. } = error else {
         return None;
@@ -742,7 +902,7 @@ pub(crate) async fn lockfile_from_resolution(
     sysreq_snapshot: &sysreqs::SysreqDbSnapshot,
     repositories: &[Arc<dyn PackageRepository>],
     r_version: &semver::Version,
-) -> Result<Lockfile, LockError> {
+) -> Result<Lockfile, LockfileBuildError> {
     let repos = futures_util::future::join_all(
         repositories
             .iter()
@@ -750,8 +910,8 @@ pub(crate) async fn lockfile_from_resolution(
     )
     .await
     .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(lock_error_from_repository)?;
+    .collect::<Result<Vec<_>, RepositoryError>>()
+    .map_err(LockfileBuildError::from)?;
 
     let packages = resolved_packages
         .iter()
@@ -761,26 +921,28 @@ pub(crate) async fn lockfile_from_resolution(
                 .zip(&repos)
                 .find(|(runtime, _)| version.repository().equals(runtime.as_ref()))
                 .map(|(_, locked)| locked.url().clone())
-                .ok_or_else(|| LockError::UnsupportedRepository {
+                .ok_or_else(|| LockfileBuildError::UnsupportedRepository {
                     repository: version.repository().to_string(),
                 })?;
 
-            let depends = description
-                .depends()
-                .map_err(|source| LockError::ResolveFailed {
+            let depends = description.depends().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
                     details: source.to_string(),
-                })?;
-            let imports = description
-                .imports()
-                .map_err(|source| LockError::ResolveFailed {
+                }
+            })?;
+            let imports = description.imports().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
                     details: source.to_string(),
-                })?;
-            let linking_to =
-                description
-                    .linking_to()
-                    .map_err(|source| LockError::ResolveFailed {
-                        details: source.to_string(),
-                    })?;
+                }
+            })?;
+            let linking_to = description.linking_to().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
+                    details: source.to_string(),
+                }
+            })?;
             let dependencies = depends.chain(imports).chain(linking_to).collect();
 
             Ok((
@@ -792,13 +954,14 @@ pub(crate) async fn lockfile_from_resolution(
                 },
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, LockError>>()?;
+        .collect::<Result<BTreeMap<_, _>, LockfileBuildError>>()?;
 
     let mut rules = BTreeMap::<String, BTreeSet<String>>::new();
     for (package, (_, description)) in resolved_packages {
         let package_rules =
             sysreqs::match_rules(description, sysreq_snapshot).map_err(|source| {
-                LockError::ResolveFailed {
+                LockfileBuildError::InvalidSystemRequirements {
+                    package: package.clone(),
                     details: source.to_string(),
                 }
             })?;
@@ -810,10 +973,12 @@ pub(crate) async fn lockfile_from_resolution(
     let db_commit = (!sysreq_snapshot.commit.is_empty())
         .then(|| sysreq_snapshot.commit.parse())
         .transpose()
-        .map_err(|source| LockError::InvalidSystemRequirementsCommit {
-            commit: sysreq_snapshot.commit.clone(),
-            source,
-        })?;
+        .map_err(
+            |source| LockfileBuildError::InvalidSystemRequirementsCommit {
+                commit: sysreq_snapshot.commit.clone(),
+                source,
+            },
+        )?;
 
     Ok(Lockfile {
         version: lockfile::LOCKFILE_VERSION,
@@ -1267,7 +1432,9 @@ mod tests {
 
         assert!(matches!(
             load_project_resolution(&project).await,
-            Err(LockError::LockfileRead(LockfileReadError::Read { source, .. }))
+            Err(LoadProjectResolutionError::LockfileRead(
+                LockfileReadError::Read { source, .. }
+            ))
                 if source.kind() == std::io::ErrorKind::NotFound
         ));
 
@@ -1275,7 +1442,7 @@ mod tests {
             .expect("outdated lockfile should be written");
         assert!(matches!(
             load_project_resolution(&project).await,
-            Err(LockError::LockfileRead(
+            Err(LoadProjectResolutionError::LockfileRead(
                 LockfileReadError::OutdatedLockfile { .. }
             ))
         ));

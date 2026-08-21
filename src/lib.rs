@@ -53,7 +53,6 @@ use project::{
     LockedResolutionError, RequiredPackages, artifact_cache_path, build_temp_library_path,
 };
 use r::{install_local_package, install_package_directory};
-use resolver::ResolutionError;
 use sysreqs::{
     SystemDependencyPlan, current_host_platform, install as install_system_dependencies,
     preview_commands as sysreq_preview_commands,
@@ -66,13 +65,11 @@ use ui::SystemDepsUi;
 
 use crate::{
     cache::CompiledPackageCacheKey,
-    description::{DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError},
-    lockfile::{Lockfile, LockfileReadError, LockfileWriteError},
+    description::{DescriptionParseError, DescriptionReadError},
+    lockfile::{Lockfile, LockfileReadError},
     project::{LockedPackagesError, ProjectDiscoveryError},
     r::{BasePackagesError, RVersionError},
-    repository::{
-        CranRepository, GitRepository, LocalRepository, RepositoryError, RrepoRepository,
-    },
+    repository::{CranRepository, GitRepository, LocalRepository, RrepoRepository},
     resolver::PackageVersion,
 };
 
@@ -197,108 +194,6 @@ fn progress_bar_style() -> ProgressStyle {
         "{span_child_prefix}{spinner} {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes}",
     )
     .expect("progress bar style should be valid")
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub(crate) enum LockError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    ProjectDiscovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    BasePackages(#[from] BasePackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedPackages(#[from] LockedPackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Repositories(#[from] RepositoriesFromDescriptionError),
-
-    #[error("failed to load resolved package metadata: {source}")]
-    #[diagnostic(code(rpx::lock::package_metadata_failed))]
-    PackageMetadata {
-        #[from]
-        source: RepositoryError,
-    },
-
-    #[error("failed to prepare package requirements: {details}")]
-    #[diagnostic(
-        code(rpx::lock::resolve_failed),
-        help("Check package names and version constraints in DESCRIPTION.")
-    )]
-    ResolveFailed { details: String },
-
-    #[error("package requirements are incompatible\n\n{explanation}")]
-    #[diagnostic(
-        code(rpx::lock::no_solution),
-        help("Adjust package constraints in DESCRIPTION and try again.")
-    )]
-    NoSolution { explanation: String },
-
-    #[error("repository operation failed: {source}")]
-    #[diagnostic(code(rpx::lock::repository_failed))]
-    Repository {
-        #[source]
-        source: RepositoryError,
-    },
-
-    #[error("could not access Git repository {repository}")]
-    #[diagnostic(
-        code(rpx::lock::git_repository_unavailable),
-        help(
-            "Check that the repository exists. For private repositories, configure Git credentials."
-        )
-    )]
-    GitRepositoryUnavailable { repository: String },
-
-    #[error("failed to resolve package set")]
-    #[diagnostic(
-        code(rpx::lock::resolve_failed),
-        help("Check package names and version constraints in DESCRIPTION.")
-    )]
-    Resolution {
-        #[source]
-        source: ResolutionError,
-    },
-
-    #[error("repository {repository} cannot be written to the lockfile")]
-    #[diagnostic(code(rpx::lock::unsupported_repository))]
-    UnsupportedRepository { repository: String },
-
-    #[error("invalid system requirements database commit {commit}: {source}")]
-    #[diagnostic(code(rpx::lock::invalid_sysreq_commit))]
-    InvalidSystemRequirementsCommit {
-        commit: String,
-        #[source]
-        source: git2::Error,
-    },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -1403,14 +1298,12 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        LockError, RequiredPackages, package_dependency_names, package_rules_from_lockfile,
+        RequiredPackages, package_dependency_names, package_rules_from_lockfile,
         required_package_install_order,
     };
     use crate::{
         git::GitError,
-        project::{
-            lock_error_from_repository, lock_error_from_resolution, lockfile_from_resolution,
-        },
+        project::{LockfileBuildError, ResolveProjectError, lockfile_from_resolution},
         r::BasePackagesError,
         repository::{
             GitRepository, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
@@ -1471,14 +1364,14 @@ mod tests {
     }
 
     #[test]
-    fn lock_error_from_resolution_maps_current_categories() {
+    fn resolve_project_error_maps_resolution_categories() {
         let source: PubGrubError<RDependencyProvider> = PubGrubError::NoSolution(
             DerivationTree::External(External::NoVersions("missing".into(), Ranges::empty())),
         );
-        let error = lock_error_from_resolution(ResolutionError::PubGrub(source));
+        let error = ResolveProjectError::from(ResolutionError::PubGrub(source));
         assert!(matches!(
             &error,
-            LockError::NoSolution { explanation } if explanation.contains("missing")
+            ResolveProjectError::NoSolution { explanation } if explanation.contains("missing")
         ));
         assert_eq!(
             error.code().map(|code| code.to_string()).as_deref(),
@@ -1493,36 +1386,40 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                lock_error_from_resolution(ResolutionError::Provider(provider)),
-                LockError::GitRepositoryUnavailable { repository }
+                ResolveProjectError::from(ResolutionError::Provider(provider)),
+                ResolveProjectError::GitRepositoryUnavailable {
+                    repository,
+                    source,
+                }
                     if repository.contains("example.test/repo.git")
+                        && matches!(source.as_ref(), ResolutionError::Provider(_))
             ));
         }
         let base = BasePackagesError::InvalidUtf8 {
             source: String::from_utf8(vec![0xff]).expect_err("invalid UTF-8 fixture"),
         };
         assert!(matches!(
-            lock_error_from_resolution(ResolutionError::BasePackages(base)),
-            LockError::BasePackages(_)
+            ResolveProjectError::from(ResolutionError::BasePackages(base)),
+            ResolveProjectError::BasePackages(_)
         ));
         assert!(matches!(
-            lock_error_from_resolution(ResolutionError::Provider(ProviderError::Repository(
+            ResolveProjectError::from(ResolutionError::Provider(ProviderError::Repository(
                 ordinary_repository_error()
             ))),
-            LockError::Resolution { .. }
+            ResolveProjectError::Resolution { .. }
         ));
     }
 
     #[test]
-    fn lock_error_from_repository_maps_current_categories() {
+    fn lockfile_build_error_maps_repository_categories() {
         assert!(matches!(
-            lock_error_from_repository(git_access_error("https://example.test/private.git")),
-            LockError::GitRepositoryUnavailable { repository }
+            LockfileBuildError::from(git_access_error("https://example.test/private.git")),
+            LockfileBuildError::GitRepositoryUnavailable { repository, .. }
                 if repository == "https://example.test/private.git"
         ));
         assert!(matches!(
-            lock_error_from_repository(ordinary_repository_error()),
-            LockError::Repository { .. }
+            LockfileBuildError::from(ordinary_repository_error()),
+            LockfileBuildError::Repository { .. }
         ));
     }
 
@@ -1590,7 +1487,7 @@ mod tests {
                 BTreeSet::new(), &resolved, &crate::sysreqs::empty_snapshot(),
                 &[built_in_repository()], &semver::Version::new(4, 5, 0),
             ).await,
-            Err(LockError::UnsupportedRepository { repository })
+            Err(LockfileBuildError::UnsupportedRepository { repository })
                 if repository == "vendor/selected"
         ));
     }
@@ -1609,7 +1506,7 @@ mod tests {
                     &semver::Version::new(4, 5, 0),
                 )
                 .await,
-                Err(LockError::ResolveFailed { .. })
+                Err(LockfileBuildError::InvalidPackageRequirements { .. })
             ));
         }
         let snapshot = SysreqDbSnapshot {
@@ -1622,7 +1519,7 @@ mod tests {
                 BTreeSet::new(), &RequiredPackages::new(), &snapshot,
                 &[built_in_repository()], &semver::Version::new(4, 5, 0),
             ).await,
-            Err(LockError::InvalidSystemRequirementsCommit { commit, .. })
+            Err(LockfileBuildError::InvalidSystemRequirementsCommit { commit, .. })
                 if commit == "not-an-oid"
         ));
     }

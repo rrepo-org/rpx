@@ -262,32 +262,6 @@ pub fn read_lockfile(path: &PathBuf) -> Result<Lockfile, LockfileReadError> {
     Ok(lockfile)
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum LockfileWriteError {
-    #[error("failed to serialize rpx.lock: {source}")]
-    #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
-    Serialize {
-        #[source]
-        source: serde_json::Error,
-    },
-
-    #[error("failed to write rpx.lock at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::lockfile_write_failed))]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-pub fn write_lockfile(path: &PathBuf, lockfile: &Lockfile) -> Result<(), LockfileWriteError> {
-    let path = path.join(LOCKFILE_NAME);
-    let contents = serde_json::to_string_pretty(lockfile)
-        .map_err(|source| LockfileWriteError::Serialize { source })?;
-    fs::write(&path, format!("{contents}\n"))
-        .map_err(|source| LockfileWriteError::Write { path: path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,29 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn writes_pretty_current_lockfile_and_reads_it_back() {
-        let directory = TestDirectory::new("round-trip");
-        let mut lockfile = sample_lockfile();
-        lockfile.revision = 17;
-
-        write_lockfile(&directory.0, &lockfile).expect("lockfile should be written");
-
-        let expected = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize")
-        );
-        assert_eq!(
-            fs::read_to_string(directory.0.join(LOCKFILE_NAME))
-                .expect("lockfile should be readable"),
-            expected
-        );
-        assert_eq!(
-            read_lockfile(&directory.0).expect("lockfile should parse"),
-            lockfile
-        );
-    }
-
-    #[test]
     fn read_lockfile_reports_header_parse_error() {
         let directory = TestDirectory::new("invalid-header");
         fs::write(directory.0.join(LOCKFILE_NAME), r#"{"revision":0}"#)
@@ -819,26 +770,6 @@ mod tests {
         assert_eq!(
             error.code().map(|code| code.to_string()).as_deref(),
             Some("rpx::project::lockfile_parse_failed")
-        );
-    }
-
-    #[test]
-    fn write_lockfile_reports_missing_parent_directory() {
-        let directory = TestDirectory::new("write-error");
-        let missing = directory.0.join("missing");
-
-        let error = write_lockfile(&missing, &minimal_lockfile())
-            .expect_err("missing parent should prevent writing");
-
-        assert!(matches!(
-            &error,
-            LockfileWriteError::Write { path, source }
-                if path == &missing.join(LOCKFILE_NAME)
-                    && source.kind() == std::io::ErrorKind::NotFound
-        ));
-        assert_eq!(
-            error.code().map(|code| code.to_string()).as_deref(),
-            Some("rpx::project::lockfile_write_failed")
         );
     }
 

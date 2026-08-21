@@ -1,5 +1,5 @@
 use crate::{
-    LockError, SyncError,
+    SyncError,
     cli::{InitArgs, InitLicense},
     description::{
         DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
@@ -8,8 +8,8 @@ use crate::{
     git,
     output::status,
     project::{
-        Project, ProjectWriteError, ResolutionPolicy, pin_unconstrained_dependencies,
-        resolve_project, write_project_metadata,
+        Project, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
+        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -166,7 +166,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    InitialLock(#[from] LockError),
+    Resolve(#[from] ResolveProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

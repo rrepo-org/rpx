@@ -1,7 +1,9 @@
 use crate::{
-    LockError, SyncError,
+    SyncError,
     output::status,
-    project::{ProjectLoadError, load_project, load_project_resolution},
+    project::{
+        LoadProjectResolutionError, ProjectLoadError, load_project, load_project_resolution,
+    },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
 use miette::Diagnostic;
@@ -15,7 +17,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lock(#[from] LockError),
+    LoadResolution(#[from] LoadProjectResolutionError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

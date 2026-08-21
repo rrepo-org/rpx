@@ -1,12 +1,11 @@
 use crate::{
-    LockError, SyncError,
+    SyncError,
     description::{DescriptionParseError, remove_dependencies},
     output::status,
     project::{
-        ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project, resolve_project,
-        write_project_metadata,
+        ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
+        resolve_project, write_project_metadata,
     },
-    repository::RepositoryError,
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
 use miette::Diagnostic;
@@ -25,14 +24,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lock(#[from] LockError),
-
-    #[error("failed to load resolved package metadata: {source}")]
-    #[diagnostic(code(rpx::remove::package_metadata_failed))]
-    PackageMetadata {
-        #[source]
-        source: RepositoryError,
-    },
+    Resolve(#[from] ResolveProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -47,9 +39,7 @@ pub(crate) async fn run(packages: &[String], no_install_project: bool) -> Result
     let mut project = load_project()?;
     let removed_packages = packages.iter().cloned().collect::<BTreeSet<_>>();
     remove_dependencies(&project.root, &mut project.description, &removed_packages)?;
-    let resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid)
-        .await
-        .map_err(map_resolution_error)?;
+    let resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
     write_project_metadata(&project, &resolution)?;
     let report = sync_resolved_project(
         &project,
@@ -93,11 +83,4 @@ pub(crate) async fn run(packages: &[String], no_install_project: bool) -> Result
     }
 
     Ok(())
-}
-
-fn map_resolution_error(error: LockError) -> Error {
-    match error {
-        LockError::PackageMetadata { source } => Error::PackageMetadata { source },
-        source => Error::Lock(source),
-    }
 }

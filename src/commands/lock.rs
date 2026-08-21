@@ -1,9 +1,8 @@
 use crate::{
-    LockError,
     output::status,
     project::{
-        ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project, resolve_project,
-        write_project_lockfile,
+        ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
+        resolve_project, write_project_lockfile,
     },
 };
 use miette::Diagnostic;
@@ -17,7 +16,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lock(#[from] LockError),
+    Resolve(#[from] ResolveProjectError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
