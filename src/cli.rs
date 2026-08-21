@@ -35,7 +35,7 @@ pub enum Commands {
         no_install_project: bool,
 
         #[arg(
-            help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
+            help = "Packages to add; quote constraints containing shell operators, for example 'digest@>=0.6.37'",
             value_name = "PACKAGE[@CONSTRAINTVERSION]",
             required = true
         )]
