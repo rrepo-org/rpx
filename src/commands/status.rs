@@ -1,33 +1,29 @@
 use crate::{
     description::{DescriptionParseError, root_package},
-    host_supports_system_sync,
     output::status,
     project::{
         LoadProjectResolutionError, ProjectLoadError, load_project, load_project_resolution,
         project_library_path,
     },
     r::{BasePackagesError, base_packages, installed_packages},
-    system_plan_from_lockfile,
 };
 use miette::Diagnostic;
 use r_description::Version;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PackageVersionMismatch {
     package: String,
     installed: Version,
     expected: Version,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StatusMismatches {
     missing_packages: Vec<String>,
     extra_packages: Vec<String>,
     version_mismatches: Vec<PackageVersionMismatch>,
-    missing_system_packages: Vec<String>,
-    unsupported_system_rules: Vec<String>,
 }
 
 impl StatusMismatches {
@@ -35,8 +31,6 @@ impl StatusMismatches {
         self.missing_packages.is_empty()
             && self.extra_packages.is_empty()
             && self.version_mismatches.is_empty()
-            && self.missing_system_packages.is_empty()
-            && self.unsupported_system_rules.is_empty()
     }
 }
 
@@ -71,19 +65,6 @@ impl std::fmt::Display for StatusMismatches {
                 "Installed versions that differ from expected versions:\n- {mismatches}"
             ));
         }
-        if !self.missing_system_packages.is_empty() {
-            groups.push(format!(
-                "Missing system packages for this host:\n- {}",
-                self.missing_system_packages.join("\n- ")
-            ));
-        }
-        if !self.unsupported_system_rules.is_empty() {
-            groups.push(format!(
-                "System requirement rules without a host mapping:\n- {}",
-                self.unsupported_system_rules.join("\n- ")
-            ));
-        }
-
         formatter.write_str(&groups.join("\n\n"))
     }
 }
@@ -124,17 +105,31 @@ pub(crate) async fn run() -> Result<(), Error> {
     let lockfile = &resolution.lockfile;
     let base_packages = base_packages().await?;
 
-    let mut expected_packages = lockfile
+    let expected_packages = lockfile
         .packages
         .iter()
         .filter(|(name, _)| !base_packages.contains(*name))
         .map(|(name, package)| (name.clone(), package.version.clone()))
         .collect::<BTreeMap<_, _>>();
-    let (root_name, root_version) = root_package(&project.root, &project.description)?;
-    expected_packages.insert(root_name, root_version);
+    let (root_name, _) = root_package(&project.root, &project.description)?;
 
     let project_library = project_library_path(&project.root);
     let installed = installed_packages(&project_library).await?;
+    let mismatches = status_mismatches(&expected_packages, &installed, &root_name);
+
+    if !mismatches.is_empty() {
+        return Err(Error::OutOfSync { mismatches });
+    }
+
+    status("Project is in sync");
+    Ok(())
+}
+
+fn status_mismatches(
+    expected_packages: &BTreeMap<String, Version>,
+    installed: &BTreeMap<String, crate::resolver::PackageVersion>,
+    root_name: &str,
+) -> StatusMismatches {
     let missing_packages = expected_packages
         .keys()
         .filter(|package| !installed.contains_key(*package))
@@ -155,30 +150,49 @@ pub(crate) async fn run() -> Result<(), Error> {
         .collect();
     let extra_packages = installed
         .keys()
-        .filter(|package| !expected_packages.contains_key(*package))
+        .filter(|package| {
+            package.as_str() != root_name && !expected_packages.contains_key(*package)
+        })
         .cloned()
         .collect();
-    let mut mismatches = StatusMismatches {
+    StatusMismatches {
         missing_packages,
         extra_packages,
         version_mismatches,
-        ..StatusMismatches::default()
-    };
+    }
+}
 
-    let system_plan = if host_supports_system_sync() {
-        system_plan_from_lockfile(lockfile).ok()
-    } else {
-        None
-    };
-    if let Some(plan) = system_plan {
-        mismatches.missing_system_packages = plan.missing_packages;
-        mismatches.unsupported_system_rules = plan.unsupported_rules;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{repository::built_in_repository, resolver::PackageVersion};
+
+    fn version(value: &str) -> Version {
+        value.parse().expect("version should parse")
     }
 
-    if !mismatches.is_empty() {
-        return Err(Error::OutOfSync { mismatches });
+    fn installed_version(value: &str) -> PackageVersion {
+        PackageVersion::new(version(value), built_in_repository())
     }
 
-    status("Project is in sync");
-    Ok(())
+    #[test]
+    fn root_package_is_optional_for_status() {
+        let expected = BTreeMap::new();
+        let omitted = BTreeMap::new();
+        let installed = BTreeMap::from([("project".to_string(), installed_version("1.0.0"))]);
+
+        assert!(status_mismatches(&expected, &omitted, "project").is_empty());
+        assert!(status_mismatches(&expected, &installed, "project").is_empty());
+    }
+
+    #[test]
+    fn missing_locked_dependencies_are_still_reported() {
+        let expected = BTreeMap::from([("digest".to_string(), version("0.6.39"))]);
+
+        let mismatches = status_mismatches(&expected, &BTreeMap::new(), "project");
+
+        assert_eq!(mismatches.missing_packages, ["digest"]);
+        assert!(mismatches.extra_packages.is_empty());
+        assert!(mismatches.version_mismatches.is_empty());
+    }
 }

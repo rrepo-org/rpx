@@ -1,12 +1,12 @@
 use crate::{
-    SyncError,
+    cli::RemoveArgs,
     description::{DescriptionParseError, remove_dependencies},
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
         resolve_project, write_project_files,
     },
-    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
+    sync::{SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
 use std::collections::BTreeSet;
@@ -35,9 +35,9 @@ pub(crate) enum Error {
     Install(#[from] SyncError),
 }
 
-pub(crate) async fn run(packages: &[String], no_install_project: bool) -> Result<(), Error> {
+pub(crate) async fn run(args: RemoveArgs) -> Result<(), Error> {
     let mut project = load_project()?;
-    let removed_packages = packages.iter().cloned().collect::<BTreeSet<_>>();
+    let removed_packages = args.packages.iter().cloned().collect::<BTreeSet<_>>();
     remove_dependencies(&project.root, &mut project.description, &removed_packages)?;
     let resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
     write_project_files(
@@ -45,25 +45,16 @@ pub(crate) async fn run(packages: &[String], no_install_project: bool) -> Result
         Some(&project.description),
         &resolution.lockfile,
     )?;
-    let report = sync_resolved_project(
-        &project,
-        resolution,
-        SyncProjectOptions {
-            project_package: if no_install_project {
-                ProjectPackageMode::Omit
-            } else {
-                ProjectPackageMode::Install
-            },
-            system: SystemSyncMode::Check,
-        },
-    )
-    .await?;
-    let removed = packages
+    let report =
+        sync_resolved_project(&project, resolution, args.no_install_project.into()).await?;
+    let removed = args
+        .packages
         .iter()
         .filter(|package| report.installed_before.contains(package.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let missing = packages
+    let missing = args
+        .packages
         .iter()
         .filter(|package| !report.installed_before.contains(package.as_str()))
         .cloned()

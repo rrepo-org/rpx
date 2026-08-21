@@ -1,5 +1,4 @@
 use crate::{
-    SyncError,
     cli::{InitArgs, InitLicense},
     description::{
         DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
@@ -11,7 +10,7 @@ use crate::{
         Project, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
         pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
-    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
+    sync::{ProjectPackageMode, SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
 use r_description::{RDescription, Relation};
@@ -446,15 +445,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
-    sync_resolved_project(
-        &project,
-        resolution,
-        SyncProjectOptions {
-            project_package: ProjectPackageMode::Install,
-            system: SystemSyncMode::Check,
-        },
-    )
-    .await?;
+    sync_resolved_project(&project, resolution, ProjectPackageMode::Install).await?;
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),

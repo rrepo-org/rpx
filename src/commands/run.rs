@@ -1,5 +1,8 @@
 use crate::{
-    project::{ProjectDiscoveryError, find_project_root, project_library_path},
+    cli::RunArgs,
+    project::{
+        ProjectDiscoveryError, ProjectLibraryError, ensure_project_library, find_project_root,
+    },
     r::RVirtualEnv,
 };
 use miette::Diagnostic;
@@ -12,6 +15,10 @@ pub(crate) enum Error {
     #[diagnostic(transparent)]
     ProjectDiscovery(#[from] ProjectDiscoveryError),
 
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectLibrary(#[from] ProjectLibraryError),
+
     #[error("failed to run {program}")]
     #[diagnostic(code(rpx::run::command_failed))]
     CommandFailed {
@@ -21,15 +28,16 @@ pub(crate) enum Error {
     },
 }
 
-pub(crate) async fn run(command: &[String]) -> Result<(), Error> {
+pub(crate) async fn run(args: RunArgs) -> Result<(), Error> {
     let project_path = find_project_root()?;
-    let (program, args) = command
+    let (program, command_args) = args
+        .command
         .split_first()
         .expect("run command requires at least one argument");
-    let project_library = project_library_path(&project_path);
+    let project_library = ensure_project_library(&project_path)?;
 
     let status = Command::with_venv(program, &project_library)
-        .args(args)
+        .args(command_args)
         .status()
         .await
         .map_err(|source| Error::CommandFailed {

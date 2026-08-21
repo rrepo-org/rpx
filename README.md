@@ -153,9 +153,8 @@ rpx sync --no-install-project
 ```
 
 Like `uv sync`, synchronization is exact: this flag removes an already
-installed copy of the project while retaining its dependencies. It fails when
-a locked package depends on the omitted project, since that creates a circular
-project dependency.
+installed copy of the project while retaining its dependencies. The resulting
+package set must still contain every non-base dependency required for installation.
 
 Commit both `DESCRIPTION` and `rpx.lock`. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
 

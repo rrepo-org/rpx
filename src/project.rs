@@ -16,7 +16,6 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    RpxWarning,
     description::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
         DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
@@ -25,19 +24,25 @@ use crate::{
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
-    output::warning,
     r::{BasePackagesError, RVersionError, r_version_async},
     repository::{GitRepository, LocalRepository, PackageRepository, RepositoryError},
     resolver::{PackageVersion, ProviderError, ResolutionError, resolve_from_registry},
-    sysreqs::{
-        self, cached_latest_snapshot, empty_snapshot as empty_sysreq_snapshot,
-        latest_snapshot as latest_sysreq_snapshot,
-    },
 };
 
 pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
 
 static NEXT_STAGED_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum ProjectLibraryError {
+    #[error("failed to create project library at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::library_create_failed))]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum ProjectDiscoveryError {
@@ -470,18 +475,6 @@ pub(crate) enum LockfileBuildError {
         help("Check package names and version constraints in the package DESCRIPTION.")
     )]
     InvalidPackageRequirements { package: String, details: String },
-
-    #[error("failed to read system requirements for {package}: {details}")]
-    #[diagnostic(code(rpx::lock::resolve_failed))]
-    InvalidSystemRequirements { package: String, details: String },
-
-    #[error("invalid system requirements database commit {commit}: {source}")]
-    #[diagnostic(code(rpx::lock::invalid_sysreq_commit))]
-    InvalidSystemRequirementsCommit {
-        commit: String,
-        #[source]
-        source: git2::Error,
-    },
 }
 
 impl From<RepositoryError> for LockfileBuildError {
@@ -735,15 +728,8 @@ pub(crate) async fn resolve_project(
         .await
         .map_err(|source| ResolveProjectError::PackageMetadata { source })?;
     packages.retain(|_, (version, _)| !version.repository().equals(root.as_ref()));
-    let sysreq_db = load_sysreq_snapshot_for_lock(previous.as_ref()).await;
-    let lockfile = lockfile_from_resolution(
-        requirements,
-        &packages,
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await?;
+    let lockfile =
+        lockfile_from_resolution(requirements, &packages, &repositories, &r_version).await?;
     let lockfile_changed = previous.as_ref() != Some(&lockfile);
 
     Ok(ProjectResolution {
@@ -853,41 +839,6 @@ fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
     Some(remote)
 }
 
-pub(crate) async fn load_sysreq_snapshot_for_lock(
-    existing_lockfile: Option<&Lockfile>,
-) -> sysreqs::SysreqDbSnapshot {
-    let existing_commit = existing_lockfile
-        .and_then(|lockfile| lockfile.sysreqs.db_commit)
-        .map(|commit| commit.to_string());
-
-    tokio::task::spawn_blocking(move || load_sysreq_snapshot_for_lock_blocking(existing_commit))
-        .await
-        .unwrap_or_else(|_| empty_sysreq_snapshot())
-}
-
-fn load_sysreq_snapshot_for_lock_blocking(
-    existing_commit: Option<String>,
-) -> sysreqs::SysreqDbSnapshot {
-    if let Ok(snapshot) = latest_sysreq_snapshot() {
-        return snapshot;
-    }
-
-    if let Ok(Some(snapshot)) = cached_latest_snapshot() {
-        warning(RpxWarning::CachedSysreqSnapshot);
-        return snapshot;
-    }
-
-    if let Some(commit) = existing_commit
-        && let Ok(snapshot) = sysreqs::snapshot_for_commit(&commit)
-    {
-        warning(RpxWarning::PinnedSysreqSnapshot { commit });
-        return snapshot;
-    }
-
-    warning(RpxWarning::SysreqUnavailable);
-    empty_sysreq_snapshot()
-}
-
 pub(crate) async fn hydrate_resolved_packages(
     selected: BTreeMap<String, PackageVersion>,
 ) -> Result<RequiredPackages, RepositoryError> {
@@ -908,7 +859,6 @@ pub(crate) async fn hydrate_resolved_packages(
 pub(crate) async fn lockfile_from_resolution(
     requirements: BTreeSet<r_description::Relation>,
     resolved_packages: &RequiredPackages,
-    sysreq_snapshot: &sysreqs::SysreqDbSnapshot,
     repositories: &[Arc<dyn PackageRepository>],
     r_version: &semver::Version,
 ) -> Result<Lockfile, LockfileBuildError> {
@@ -965,35 +915,10 @@ pub(crate) async fn lockfile_from_resolution(
         })
         .collect::<Result<BTreeMap<_, _>, LockfileBuildError>>()?;
 
-    let mut rules = BTreeMap::<String, BTreeSet<String>>::new();
-    for (package, (_, description)) in resolved_packages {
-        let package_rules =
-            sysreqs::match_rules(description, sysreq_snapshot).map_err(|source| {
-                LockfileBuildError::InvalidSystemRequirements {
-                    package: package.clone(),
-                    details: source.to_string(),
-                }
-            })?;
-        for rule in package_rules {
-            rules.entry(rule).or_default().insert(package.clone());
-        }
-    }
-
-    let db_commit = (!sysreq_snapshot.commit.is_empty())
-        .then(|| sysreq_snapshot.commit.parse())
-        .transpose()
-        .map_err(
-            |source| LockfileBuildError::InvalidSystemRequirementsCommit {
-                commit: sysreq_snapshot.commit.clone(),
-                source,
-            },
-        )?;
-
     Ok(Lockfile {
         version: lockfile::LOCKFILE_VERSION,
         revision: lockfile::LOCKFILE_REVISION,
         r: r_version.clone(),
-        sysreqs: lockfile::SystemRequirements { db_commit, rules },
         repos,
         requirements,
         packages,
@@ -1016,28 +941,20 @@ fn locked_package_description(
     Ok(description)
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum ProjectPathError {
-    #[error("failed to get current directory: {source}")]
-    #[diagnostic(code(rpx::project::current_dir_failed))]
-    CurrentDirFailed {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("{DESCRIPTION_NAME} not found in current directory or any parent directory")]
-    #[diagnostic(code(rpx::project::description_not_found))]
-    DescriptionNotFound,
+pub fn project_library_path(path: &Path) -> PathBuf {
+    project_library_root_path(path).join("library")
 }
 
-pub fn project_library_path(path: &PathBuf) -> PathBuf {
-    let library_path = project_library_root_path(path).join("library");
-
-    fs::create_dir_all(&library_path).expect("failed to create project library");
-    library_path
+pub(crate) fn ensure_project_library(path: &Path) -> Result<PathBuf, ProjectLibraryError> {
+    let library_path = project_library_path(path);
+    fs::create_dir_all(&library_path).map_err(|source| ProjectLibraryError::Create {
+        path: library_path.clone(),
+        source,
+    })?;
+    Ok(library_path)
 }
 
-pub fn project_library_root_path(path: &PathBuf) -> PathBuf {
+pub fn project_library_root_path(path: &Path) -> PathBuf {
     let project_key = hash_path(path);
     project_dirs()
         .data_dir()
@@ -1049,35 +966,8 @@ pub fn cache_dir_path() -> PathBuf {
     project_dirs().cache_dir().to_path_buf()
 }
 
-pub fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {
-    let path = project_dirs()
-        .cache_dir()
-        .join("artifacts")
-        .join(package)
-        .join(version)
-        .join(file_name);
-    ensure_parent_dir(&path);
-    path
-}
-
-pub fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
-    let path = project_dirs()
-        .cache_dir()
-        .join("build-temp")
-        .join(format!("{package}-{unique}"))
-        .join("library");
-    fs::create_dir_all(&path).expect("failed to create temporary build library");
-    path
-}
-
 fn project_dirs() -> ProjectDirs {
     ProjectDirs::from("de", "scalerail", "rpx").expect("failed to resolve rpx data directory")
-}
-
-fn ensure_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).expect("failed to create cache directory");
-    }
 }
 
 fn hash_path(path: &Path) -> String {
@@ -1092,7 +982,7 @@ mod tests {
     use crate::{
         lockfile::{
             ArchiveSupport as LockedArchiveSupport, GitReference, LOCKFILE_REVISION,
-            LOCKFILE_VERSION, Package, Repository, SystemRequirements,
+            LOCKFILE_VERSION, Package, Repository,
         },
         repository::{ArchiveSupport, CranRepository, RrepoRepository, built_in_repository},
     };
@@ -1210,10 +1100,6 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             r: semver::Version::new(4, 5, 0),
-            sysreqs: SystemRequirements {
-                db_commit: None,
-                rules: BTreeMap::new(),
-            },
             repos: Vec::new(),
             requirements: BTreeSet::new(),
             packages: BTreeMap::new(),
@@ -1729,45 +1615,47 @@ mod tests {
     }
 
     #[test]
-    fn project_library_path_creates_root_and_library() {
+    fn project_library_path_does_not_create_root_or_library() {
         let project = synthetic_path("library-path");
         let root = project_library_root_path(&project);
         remove_dir_if_present(&root);
         let library = project_library_path(&project);
         assert_eq!(library, root.join("library"));
+        assert!(!root.exists());
+        assert!(!library.exists());
+    }
+
+    #[test]
+    fn ensure_project_library_creates_root_and_library() {
+        let project = synthetic_path("ensure-library");
+        let root = project_library_root_path(&project);
+        remove_dir_if_present(&root);
+        let library = ensure_project_library(&project).expect("project library should be created");
         assert!(root.is_dir());
         assert!(library.is_dir());
         remove_dir_if_present(&root);
     }
 
     #[test]
+    fn ensure_project_library_reports_creation_failure() {
+        let project = synthetic_path("ensure-library-error");
+        let root = project_library_root_path(&project);
+        remove_dir_if_present(&root);
+        fs::create_dir_all(root.parent().expect("library root should have a parent"))
+            .expect("library parent should be created");
+        fs::write(&root, "not a directory").expect("blocking file should be written");
+
+        let error = ensure_project_library(&project).expect_err("library creation should fail");
+
+        assert!(matches!(
+            error,
+            ProjectLibraryError::Create { path, .. } if path == root.join("library")
+        ));
+        fs::remove_file(root).expect("blocking file should be removed");
+    }
+
+    #[test]
     fn cache_dir_matches_project_directories() {
         assert_eq!(cache_dir_path(), project_dirs().cache_dir());
-    }
-
-    #[test]
-    fn artifact_cache_path_has_exact_layout_and_creates_only_parent() {
-        let package = unique("artifact");
-        let root = project_dirs().cache_dir().join("artifacts").join(&package);
-        remove_dir_if_present(&root);
-        let path = artifact_cache_path(&package, "1.2.3", "package.tar.gz");
-        assert_eq!(path, root.join("1.2.3").join("package.tar.gz"));
-        assert!(path.parent().expect("artifact should have parent").is_dir());
-        assert!(!path.exists());
-        remove_dir_if_present(&root);
-    }
-
-    #[test]
-    fn build_temp_library_path_has_exact_layout_and_creates_directory() {
-        let package = unique("build");
-        let root = project_dirs()
-            .cache_dir()
-            .join("build-temp")
-            .join(format!("{package}-unique"));
-        remove_dir_if_present(&root);
-        let path = build_temp_library_path(&package, "unique");
-        assert_eq!(path, root.join("library"));
-        assert!(path.is_dir());
-        remove_dir_if_present(&root);
     }
 }

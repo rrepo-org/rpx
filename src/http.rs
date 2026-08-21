@@ -339,7 +339,6 @@ pub struct CranPackageIndexEntry {
     pub imports: Vec<Relation>,
     pub suggests: Vec<Relation>,
     pub linking_to: Vec<Relation>,
-    pub system_requirements: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -481,11 +480,6 @@ fn cran_package_index_entry_from_paragraph(
         imports: parse_packages_relations_field(paragraph, "Imports")?,
         suggests: parse_packages_relations_field(paragraph, "Suggests")?,
         linking_to: parse_packages_relations_field(paragraph, "LinkingTo")?,
-        system_requirements: paragraph
-            .get("SystemRequirements")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
     })
 }
 

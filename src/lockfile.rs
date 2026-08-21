@@ -22,22 +22,10 @@ pub struct Lockfile {
     pub version: u32,
     pub revision: u32,
     pub r: semver::Version,
-    pub sysreqs: SystemRequirements,
     pub repos: Vec<Repository>,
     #[serde(with = "relation_set")]
     pub requirements: BTreeSet<r_description::Relation>,
     pub packages: BTreeMap<String, Package>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SystemRequirements {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "optional_git_oid"
-    )]
-    pub db_commit: Option<git2::Oid>,
-    pub rules: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,29 +148,6 @@ mod git_oid {
     }
 }
 
-mod optional_git_oid {
-    use git2::Oid;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S>(oid: &Option<Oid>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match oid {
-            Some(oid) => serializer.collect_str(oid),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Oid>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map(Some).map_err(D::Error::custom)
-    }
-}
-
 mod package_version {
     use r_description::Version;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
@@ -270,7 +235,6 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const SYSREQ_COMMIT: &str = "1111111111111111111111111111111111111111";
     const GIT_COMMIT: &str = "2222222222222222222222222222222222222222";
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -322,13 +286,6 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             r: semver::Version::new(4, 4, 1),
-            sysreqs: SystemRequirements {
-                db_commit: Some(oid(SYSREQ_COMMIT)),
-                rules: BTreeMap::from([(
-                    "libcurl".to_string(),
-                    BTreeSet::from(["curl".to_string()]),
-                )]),
-            },
             repos: vec![
                 Repository::Rrepo {
                     url: url("https://api.rrepo.org/cran"),
@@ -367,10 +324,6 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             r: semver::Version::new(4, 4, 1),
-            sysreqs: SystemRequirements {
-                db_commit: Some(oid(SYSREQ_COMMIT)),
-                rules: BTreeMap::new(),
-            },
             repos: vec![],
             requirements: BTreeSet::new(),
             packages: BTreeMap::new(),
@@ -387,12 +340,6 @@ mod tests {
                 "version": LOCKFILE_VERSION,
                 "revision": LOCKFILE_REVISION,
                 "r": "4.4.1",
-                "sysreqs": {
-                    "db_commit": SYSREQ_COMMIT,
-                    "rules": {
-                        "libcurl": ["curl"]
-                    }
-                },
                 "repos": [
                     {
                         "kind": "rrepo",
@@ -446,7 +393,6 @@ mod tests {
         assert_eq!(actual["repos"], json!([]));
         assert_eq!(actual["requirements"], json!([]));
         assert_eq!(actual["packages"], json!({}));
-        assert_eq!(actual["sysreqs"]["rules"], json!({}));
     }
 
     #[test]
@@ -457,7 +403,6 @@ mod tests {
             "version",
             "revision",
             "r",
-            "sysreqs",
             "repos",
             "requirements",
             "packages",
@@ -578,27 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn serializes_system_requirement_rule_package_map() {
-        let requirements = SystemRequirements {
-            db_commit: Some(oid(SYSREQ_COMMIT)),
-            rules: BTreeMap::from([(
-                "libcurl".to_string(),
-                BTreeSet::from(["httr".to_string(), "curl".to_string()]),
-            )]),
-        };
-
-        assert_eq!(
-            serde_json::to_value(requirements).expect("system requirements should serialize"),
-            json!({
-                "db_commit": SYSREQ_COMMIT,
-                "rules": {
-                    "libcurl": ["curl", "httr"]
-                }
-            })
-        );
-    }
-
-    #[test]
     fn round_trips_package_version_semantics() {
         for version in ["1.2", "2.5-1", "1.2.3.9000"] {
             let package = Package {
@@ -658,12 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_present_oid_fields() {
+    fn round_trips_git_commit() {
         let lockfile = sample_lockfile();
         let json = serde_json::to_value(&lockfile).expect("lockfile should serialize");
         let parsed = serde_json::from_value::<Lockfile>(json).expect("lockfile should parse");
 
-        assert_eq!(parsed.sysreqs.db_commit, Some(oid(SYSREQ_COMMIT)));
         assert!(matches!(
             &parsed.repos[2],
             Repository::Git { commit, .. } if *commit == oid(GIT_COMMIT)
@@ -774,34 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn omits_and_defaults_absent_system_requirements_commit() {
-        let requirements = SystemRequirements {
-            db_commit: None,
-            rules: BTreeMap::new(),
-        };
-
-        let json =
-            serde_json::to_value(&requirements).expect("system requirements should serialize");
-        let parsed = serde_json::from_value::<SystemRequirements>(json!({ "rules": {} }))
-            .expect("missing commit should default");
-
-        assert!(json.get("db_commit").is_none());
-        assert_eq!(parsed.db_commit, None);
-    }
-
-    #[test]
-    fn rejects_null_and_malformed_system_requirements_commit() {
-        assert_rejected::<SystemRequirements>(
-            json!({ "db_commit": null, "rules": {} }),
-            "null db_commit",
-        );
-        assert_rejected::<SystemRequirements>(
-            json!({ "db_commit": "not-an-oid", "rules": {} }),
-            "malformed db_commit",
-        );
-    }
-
-    #[test]
     fn rejects_malformed_custom_lockfile_scalars() {
         let lockfile = serde_json::to_value(sample_lockfile()).expect("lockfile should serialize");
         let cases = [
@@ -813,11 +708,6 @@ mod tests {
             ("Git commit", {
                 let mut value = lockfile.clone();
                 value["repos"][2]["commit"] = json!("not-an-oid");
-                value
-            }),
-            ("system requirements commit", {
-                let mut value = lockfile.clone();
-                value["sysreqs"]["db_commit"] = json!("not-an-oid");
                 value
             }),
             ("package version", {
@@ -839,7 +729,6 @@ mod tests {
 
     #[test]
     fn requires_nested_lockfile_fields() {
-        assert_rejected::<SystemRequirements>(json!({}), "sysreqs.rules");
         assert_rejected::<Repository>(json!({ "kind": "rrepo" }), "rrepo.url");
         assert_rejected::<Repository>(
             json!({ "kind": "cran-like", "archive_support": "available" }),

@@ -1,12 +1,12 @@
 use crate::{
-    SyncError,
-    description::{DependencyField, DescriptionParseError, add_dependencies},
+    cli::AddArgs,
+    description::{DescriptionParseError, add_dependencies},
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
         pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
-    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
+    sync::{SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
 use r_description::{Relation, Version, VersionRequirement};
@@ -40,13 +40,10 @@ pub(crate) enum Error {
     Install(#[from] SyncError),
 }
 
-pub(crate) async fn run(
-    packages: &[String],
-    dependency_field: DependencyField,
-    no_install_project: bool,
-) -> Result<(), Error> {
+pub(crate) async fn run(args: AddArgs) -> Result<(), Error> {
+    let dependency_field = args.dependency_type.into();
     let mut project = load_project()?;
-    let added_relations = parse_add_packages(packages)?;
+    let added_relations = parse_add_packages(&args.packages)?;
 
     add_dependencies(
         &project.root,
@@ -69,19 +66,7 @@ pub(crate) async fn run(
         Some(&project.description),
         &resolution.lockfile,
     )?;
-    sync_resolved_project(
-        &project,
-        resolution,
-        SyncProjectOptions {
-            project_package: if no_install_project {
-                ProjectPackageMode::Omit
-            } else {
-                ProjectPackageMode::Install
-            },
-            system: SystemSyncMode::Check,
-        },
-    )
-    .await?;
+    sync_resolved_project(&project, resolution, args.no_install_project.into()).await?;
     status(format_args!(
         "Added {}",
         added_relations

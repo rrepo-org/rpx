@@ -28,7 +28,6 @@ moka = { version = "0.12", features = ["future"] }
 pathdiff = "0.2"
 petname = { version = "3.2.0", default-features = false, features = ["default-rng", "default-words"] }
 pubgrub = "0.3.0"
-regex = "1.12.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
 reqwest-middleware = "0.5"
 reqwest-tracing = "0.7"
