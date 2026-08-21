@@ -1,59 +1,24 @@
 use crate::{
-    LockError, SyncError, configure_project_installation,
-    description::{
-        DependencyField, DescriptionParseError, DescriptionReadError, DescriptionWriteError,
-        RepositoriesFromDescriptionError, add_dependencies, project_dependencies, read_description,
-        repositories_from_description, root_package, write_description,
-    },
-    hydrate_resolved_packages, load_sysreq_snapshot_for_lock, lock_error_from_repository,
-    lock_error_from_resolution,
-    lockfile::{LockfileReadError, LockfileWriteError, read_lockfile, write_lockfile},
-    lockfile_from_resolution,
+    LockError, SyncError,
+    description::{DependencyField, DescriptionParseError, add_dependencies, project_dependencies},
     output::status,
-    pin_dependency_to_resolved_major,
     project::{
-        LockedPackagesError, LockedResolutionError, LockedResolutionFailure, ProjectDiscoveryError,
-        RequiredPackages, find_project_root, project_library_path, required_packages_from_lockfile,
-        validate_locked_resolution,
+        ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project,
+        pin_unconstrained_relations, resolve_project, write_project_metadata,
     },
-    r::{RVersionError, base_packages, installed_packages, r_version_async},
-    repository::{LocalRepository, PackageRepository, RepositoryError},
-    resolver::resolve_from_registry,
-    sync_packages, sync_system_dependencies,
+    repository::RepositoryError,
+    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
 use miette::Diagnostic;
 use r_description::{Relation, Version, VersionRequirement};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    ProjectDiscovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionWrite(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
+    ProjectLoad(#[from] ProjectLoadError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -65,30 +30,18 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Repositories(#[from] RepositoriesFromDescriptionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedPackages(#[from] LockedPackagesError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
     Lock(#[from] LockError),
 
     #[error("failed to load resolved package metadata: {source}")]
     #[diagnostic(code(rpx::add::package_metadata_failed))]
     PackageMetadata {
-        #[from]
+        #[source]
         source: RepositoryError,
     },
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    InstalledPackages(#[from] crate::r::InstalledPackagesError),
+    ProjectWrite(#[from] ProjectWriteError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -100,7 +53,7 @@ pub(crate) async fn run(
     dependency_field: DependencyField,
     no_install_project: bool,
 ) -> Result<(), Error> {
-    let current_dir = find_project_root()?;
+    let mut project = load_project()?;
     let added_relations = packages
         .iter()
         .map(|package| parse_add_package(package))
@@ -111,153 +64,45 @@ pub(crate) async fn run(
         .map(|relation| relation.package().to_string())
         .collect::<BTreeSet<_>>();
 
-    let mut description = read_description(&current_dir)?;
-    let old_lockfile = match read_lockfile(&current_dir) {
-        Ok(lockfile) => Some(lockfile),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(source.into()),
-    };
-    let r_version = r_version_async().await?;
-
     add_dependencies(
-        &current_dir,
-        &mut description,
+        &project.root,
+        &mut project.description,
         &added_relations,
         dependency_field,
     )?;
-
-    let desired_roots = project_dependencies(&current_dir, &description)?;
-    let (root_name, root_version) = root_package(&current_dir, &description)?;
-    let root =
-        Arc::new(LocalRepository::new(current_dir.clone()).with_description(description.clone()));
-
-    let (mut lockfile, mut resolved) = match old_lockfile.as_ref().map(|lockfile| {
-        (
-            lockfile,
-            validate_locked_resolution(&current_dir, &description, &r_version, lockfile),
-        )
-    }) {
-        Some((lockfile, Ok(()))) => (lockfile.clone(), required_packages_from_lockfile(lockfile)?),
-        Some((lockfile, Err(LockedResolutionError::Validation { failures }))) => {
-            let repositories = if failures.iter().all(|failure| {
-                matches!(
-                    failure,
-                    LockedResolutionFailure::PackageRequirementsChanged
-                        | LockedResolutionFailure::RVersionChanged { .. }
-                )
-            }) {
-                lockfile
-                    .repos
-                    .iter()
-                    .map(<dyn PackageRepository>::from_lockfile)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(lock_error_from_repository)?
-            } else {
-                repositories_from_description(&current_dir, &description).await?
-            };
-            let preferred_versions = lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect();
-            let selected = resolve_from_registry(
-                repositories.clone(),
-                Arc::clone(&root),
-                desired_roots.clone(),
-                preferred_versions,
-            )
+    let mut resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid)
+        .await
+        .map_err(map_resolution_error)?;
+    let final_added_relations =
+        pin_unconstrained_relations(&added_relations, &unconstrained_packages, &resolution)
             .await
-            .map_err(lock_error_from_resolution)?;
-            let resolved = hydrate_resolved_packages(selected).await?;
-            let sysreq_db = load_sysreq_snapshot_for_lock(Some(lockfile)).await;
-            let lockfile = lockfile_from_resolution(
-                desired_roots.clone(),
-                &resolved
-                    .iter()
-                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-                    .map(|(name, package)| (name.clone(), package.clone()))
-                    .collect::<RequiredPackages>(),
-                &sysreq_db,
-                &repositories,
-                &r_version,
-            )
-            .await?;
-            (lockfile, resolved)
-        }
-        Some((_, Err(source))) => return Err(source.into()),
-        None => {
-            let repositories = repositories_from_description(&current_dir, &description).await?;
-            let selected = resolve_from_registry(
-                repositories.clone(),
-                Arc::clone(&root),
-                desired_roots.clone(),
-                BTreeMap::new(),
-            )
-            .await
-            .map_err(lock_error_from_resolution)?;
-            let resolved = hydrate_resolved_packages(selected).await?;
-            let sysreq_db = load_sysreq_snapshot_for_lock(None).await;
-            let lockfile = lockfile_from_resolution(
-                desired_roots,
-                &resolved
-                    .iter()
-                    .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-                    .map(|(name, package)| (name.clone(), package.clone()))
-                    .collect::<RequiredPackages>(),
-                &sysreq_db,
-                &repositories,
-                &r_version,
-            )
-            .await?;
-            (lockfile, resolved)
-        }
-    };
-
-    let base_packages = base_packages().await.map_err(LockError::BasePackages)?;
-    let final_added_relations = unconstrained_packages
-        .iter()
-        // Base packages are supplied by R and intentionally absent from the resolved map.
-        .filter(|package| !base_packages.contains(package.as_str()))
-        .fold(added_relations.clone(), |mut relations, package| {
-            let (selected, _) = resolved
-                .get(package)
-                .expect("resolved package map should contain every added package");
-            pin_dependency_to_resolved_major(&mut relations, package, selected.version());
-
-            relations
-        });
+            .map_err(LockError::BasePackages)?;
 
     if final_added_relations != added_relations {
         add_dependencies(
-            &current_dir,
-            &mut description,
+            &project.root,
+            &mut project.description,
             &final_added_relations,
             dependency_field,
         )?;
-        lockfile.requirements = project_dependencies(&current_dir, &description)?;
+        resolution.lockfile.requirements =
+            project_dependencies(&project.root, &project.description)?;
     }
 
-    configure_project_installation(
-        &current_dir,
-        &description,
-        &mut resolved,
-        root_name,
-        root_version,
-        no_install_project,
-        &base_packages,
-    )?;
-
-    write_description(&current_dir, &description)?;
-    write_lockfile(&current_dir, &lockfile)?;
-    sync_system_dependencies(&lockfile, false, false)?;
-    let project_library = project_library_path(&current_dir);
-    let installed = installed_packages(&project_library).await?;
-    sync_packages(&project_library, resolved, installed, &r_version).await?;
+    write_project_metadata(&project, &resolution)?;
+    sync_resolved_project(
+        &project,
+        resolution,
+        SyncProjectOptions {
+            project_package: if no_install_project {
+                ProjectPackageMode::Omit
+            } else {
+                ProjectPackageMode::Install
+            },
+            system: SystemSyncMode::Check,
+        },
+    )
+    .await?;
     status(format_args!(
         "Added {}",
         added_relations
@@ -267,6 +112,13 @@ pub(crate) async fn run(
             .join(", ")
     ));
     Ok(())
+}
+
+fn map_resolution_error(error: LockError) -> Error {
+    match error {
+        LockError::PackageMetadata { source } => Error::PackageMetadata { source },
+        source => Error::Lock(source),
+    }
 }
 
 #[derive(Debug, Error, Diagnostic)]

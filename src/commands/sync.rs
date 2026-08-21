@@ -1,32 +1,51 @@
 use crate::{
-    SyncError,
-    description::read_description,
-    lockfile::read_lockfile,
+    LockError, SyncError,
     output::status,
-    project::{find_project_root, validate_locked_resolution},
-    r::r_version_async,
-    sync_project,
+    project::{ProjectLoadError, ResolutionPolicy, load_project, resolve_project},
+    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
+use miette::Diagnostic;
+use thiserror::Error;
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum Error {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectLoad(#[from] ProjectLoadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Sync(#[from] SyncError),
+}
 
 pub(crate) async fn run(
     no_install_project: bool,
     install_system: bool,
     install_only_system: bool,
-) -> Result<(), SyncError> {
-    let current_dir = find_project_root()?;
-    let description = read_description(&current_dir)?;
-    let lockfile = read_lockfile(&current_dir)?;
-    let r_version = r_version_async().await?;
-    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
-
-    sync_project(
-        &current_dir,
-        description,
-        &lockfile,
-        &r_version,
-        no_install_project,
-        install_system,
-        install_only_system,
+) -> Result<(), Error> {
+    let project = load_project()?;
+    let resolution = resolve_project(&project, ResolutionPolicy::RequireValid).await?;
+    sync_resolved_project(
+        &project,
+        resolution,
+        SyncProjectOptions {
+            project_package: if no_install_project {
+                ProjectPackageMode::Omit
+            } else {
+                ProjectPackageMode::Install
+            },
+            system: if install_only_system {
+                SystemSyncMode::InstallOnly
+            } else if install_system {
+                SystemSyncMode::Install
+            } else {
+                SystemSyncMode::Check
+            },
+        },
     )
     .await?;
     status("Synchronized project library");

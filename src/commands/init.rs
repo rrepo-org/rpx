@@ -2,13 +2,16 @@ use crate::{
     LockError, SyncError,
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionParseError, DescriptionWriteError, NamespaceWriteError,
-        add_dependencies, project_dependencies, write_description, write_namespace_if_missing,
+        DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
+        project_dependencies, write_namespace_if_missing,
     },
     git,
-    lockfile::write_lockfile,
     output::status,
-    pin_dependency_to_resolved_major, resolve_lockfile_for_description, sync_project,
+    project::{
+        LockfileState, Project, ProjectWriteError, ResolutionPolicy, pin_unconstrained_relations,
+        resolve_project, write_project_metadata,
+    },
+    sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
 use miette::Diagnostic;
 use r_description::{RDescription, Relation};
@@ -105,10 +108,6 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    WriteDescription(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
     WriteNamespace(#[from] NamespaceWriteError),
 
     #[error("failed to write .Rbuildignore at {}: {source}", path.display())]
@@ -168,6 +167,10 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     InitialLock(#[from] LockError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectWrite(#[from] ProjectWriteError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -423,44 +426,44 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         path: target.clone(),
         source,
     })?;
-    let mut lockfile = resolve_lockfile_for_description(&target, &description, None).await?;
-    let mut pinned_development_relations = development_relations.clone();
-    for package in development_packages {
-        let version = &lockfile
-            .packages
-            .get(package.name())
-            .expect("resolved lockfile should contain selected development packages")
-            .version;
-        pin_dependency_to_resolved_major(
-            &mut pinned_development_relations,
-            package.name(),
-            version,
-        );
-    }
+    let mut project = Project {
+        root: target.clone(),
+        description,
+        lockfile: LockfileState::Missing,
+    };
+    let mut resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
+    let development_package_names = development_packages
+        .iter()
+        .map(|package| package.name().to_string())
+        .collect();
+    let pinned_development_relations = pin_unconstrained_relations(
+        &development_relations,
+        &development_package_names,
+        &resolution,
+    )
+    .await
+    .map_err(LockError::BasePackages)?;
     if pinned_development_relations != development_relations {
         add_dependencies(
             &target,
-            &mut description,
+            &mut project.description,
             &pinned_development_relations,
             DependencyField::Suggests,
         )?;
-        lockfile.requirements = project_dependencies(&target, &description)?;
+        resolution.lockfile.requirements = project_dependencies(&target, &project.description)?;
     }
 
-    write_description(&target, &description)?;
+    write_project_metadata(&project, &resolution)?;
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
-    write_lockfile(&target, &lockfile).map_err(LockError::from)?;
-    let r_version = lockfile.r.clone();
-    sync_project(
-        &target,
-        description,
-        &lockfile,
-        &r_version,
-        false,
-        false,
-        false,
+    sync_resolved_project(
+        &project,
+        resolution,
+        SyncProjectOptions {
+            project_package: ProjectPackageMode::Install,
+            system: SystemSyncMode::Check,
+        },
     )
     .await?;
     if initialize_git {

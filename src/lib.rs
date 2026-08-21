@@ -1,8 +1,7 @@
 use clap::Parser;
 use futures_util::StreamExt;
 use miette::Diagnostic;
-use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
-use r_description::{RDescription, Relation, Version, VersionRequirement};
+use r_description::RDescription;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::IsTerminal,
@@ -40,24 +39,24 @@ mod project;
 mod r;
 mod repository;
 mod resolver;
+mod sync;
 mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands};
 use commands::{
-    add, clean, init, lock, remove, repo, run as run_command, status as status_command, sync,
+    add, clean, init, lock, remove, repo, run as run_command, status as status_command,
+    sync as sync_command,
 };
 use output::{blank_note_line, note, prompt, status, warning};
 use project::{
     LockedResolutionError, RequiredPackages, artifact_cache_path, build_temp_library_path,
-    project_library_path,
 };
-use r::{base_packages, install_local_package, install_package_directory, installed_packages};
-use resolver::{ResolutionError, resolve_from_registry};
+use r::{install_local_package, install_package_directory};
+use resolver::ResolutionError;
 use sysreqs::{
-    SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
-    empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
-    latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
+    SystemDependencyPlan, current_host_platform, install as install_system_dependencies,
+    preview_commands as sysreq_preview_commands,
     recheck_missing_packages as recheck_system_missing_packages,
     refresh_metadata as refresh_system_metadata,
     refresh_preview_command as system_metadata_refresh_preview,
@@ -67,67 +66,18 @@ use ui::SystemDepsUi;
 
 use crate::{
     cache::CompiledPackageCacheKey,
-    description::{
-        DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError,
-        project_dependencies, repositories_from_description, root_package,
-    },
+    description::{DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError},
     lockfile::{Lockfile, LockfileReadError, LockfileWriteError},
-    project::{LockedPackagesError, ProjectDiscoveryError, required_packages_from_lockfile},
-    r::{BasePackagesError, RVersionError, r_version_async, remove_packages_from_venv},
+    project::{LockedPackagesError, ProjectDiscoveryError},
+    r::{BasePackagesError, RVersionError},
     repository::{
-        CranRepository, GitRepository, LocalRepository, PackageRepository, RepositoryError,
-        RrepoRepository,
+        CranRepository, GitRepository, LocalRepository, RepositoryError, RrepoRepository,
     },
     resolver::PackageVersion,
 };
 
 const SYNC_SHARED_WORKERS: usize = 50;
 const SYNC_INSTALL_WORKERS: usize = 8;
-
-fn lock_error_from_resolution(error: ResolutionError) -> LockError {
-    if let ResolutionError::Provider(provider) = &error {
-        let source = match provider {
-            resolver::ProviderError::Repository(source)
-            | resolver::ProviderError::DependencyMetadata { source, .. } => source,
-        };
-        if let Some(repository) = inaccessible_git_repository(source) {
-            return LockError::GitRepositoryUnavailable {
-                repository: repository.to_string(),
-            };
-        }
-    }
-
-    match error {
-        ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
-            derivation_tree.collapse_no_versions();
-            LockError::NoSolution {
-                explanation: DefaultStringReporter::report(&derivation_tree),
-            }
-        }
-        ResolutionError::BasePackages(source) => LockError::BasePackages(source),
-        source => LockError::Resolution { source },
-    }
-}
-
-fn lock_error_from_repository(source: RepositoryError) -> LockError {
-    if let Some(repository) = inaccessible_git_repository(&source) {
-        LockError::GitRepositoryUnavailable {
-            repository: repository.to_string(),
-        }
-    } else {
-        LockError::Repository { source }
-    }
-}
-
-fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
-    let RepositoryError::Git { source, .. } = error else {
-        return None;
-    };
-    let git::GitError::Access { remote, .. } = source.as_ref() else {
-        return None;
-    };
-    Some(remote)
-}
 
 #[derive(Debug, Error, Diagnostic)]
 enum RpxWarning {
@@ -206,7 +156,7 @@ pub async fn run() -> miette::Result<()> {
             no_install_project,
             install_system,
             install_only_system,
-        } => sync::run(no_install_project, install_system, install_only_system).await?,
+        } => sync_command::run(no_install_project, install_system, install_only_system).await?,
         Commands::Clean => clean::run()?,
         Commands::Repo { command } => repo::run(command).await?,
     }
@@ -249,33 +199,8 @@ fn progress_bar_style() -> ProgressStyle {
     .expect("progress bar style should be valid")
 }
 
-pub(crate) fn pin_dependency_to_resolved_major(
-    relations: &mut BTreeSet<Relation>,
-    package: &str,
-    version: &Version,
-) {
-    let next_major = format!("{}.0.0", version.major() + 1)
-        .parse::<Version>()
-        .expect("next major version should be valid");
-
-    relations.retain(|relation| {
-        relation.package() != package || !matches!(relation.requirement(), VersionRequirement::Any)
-    });
-    relations.insert(
-        Relation::new(
-            package,
-            VersionRequirement::GreaterThanEqual(version.clone()),
-        )
-        .expect("previously parsed package name should remain valid"),
-    );
-    relations.insert(
-        Relation::new(package, VersionRequirement::LessThan(next_major))
-            .expect("previously parsed package name should remain valid"),
-    );
-}
-
 #[derive(Debug, Error, Diagnostic)]
-enum LockError {
+pub(crate) enum LockError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     ProjectDiscovery(#[from] ProjectDiscoveryError),
@@ -303,6 +228,14 @@ enum LockError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -366,51 +299,6 @@ enum LockError {
         #[source]
         source: git2::Error,
     },
-}
-
-async fn resolve_lockfile_for_description(
-    current_dir: &Path,
-    description: &RDescription,
-    old_lockfile: Option<&Lockfile>,
-) -> Result<Lockfile, LockError> {
-    let r_version = r_version_async().await?;
-    let roots = project_dependencies(current_dir, description)?;
-    let repositories = repositories_from_description(current_dir, description).await?;
-    let preferred_versions = old_lockfile
-        .map(|lockfile| {
-            lockfile
-                .packages
-                .iter()
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let root = Arc::new(
-        LocalRepository::new(current_dir.to_path_buf()).with_description(description.clone()),
-    );
-    let selected = resolve_from_registry(
-        repositories.clone(),
-        Arc::clone(&root),
-        roots.clone(),
-        preferred_versions,
-    )
-    .await
-    .map_err(lock_error_from_resolution)?;
-    let resolved = hydrate_resolved_packages(selected).await?;
-    let sysreq_db = load_sysreq_snapshot_for_lock(old_lockfile).await;
-    lockfile_from_resolution(
-        roots,
-        &resolved
-            .iter()
-            .filter(|(_, (version, _))| !version.repository().equals(root.as_ref()))
-            .map(|(name, package)| (name.clone(), package.clone()))
-            .collect::<RequiredPackages>(),
-        &sysreq_db,
-        &repositories,
-        &r_version,
-    )
-    .await
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -494,279 +382,6 @@ pub(crate) enum SyncError {
         #[source]
         source: r::PackageInstallError,
     },
-}
-
-pub(crate) async fn sync_project(
-    current_dir: &PathBuf,
-    description: RDescription,
-    lockfile: &Lockfile,
-    r_version: &semver::Version,
-    no_install_project: bool,
-    install_system: bool,
-    install_only_system: bool,
-) -> Result<(), SyncError> {
-    sync_system_dependencies(lockfile, install_system, install_only_system)?;
-    if install_only_system {
-        return Ok(());
-    }
-
-    let mut required = required_packages_from_lockfile(lockfile)?;
-    let (root_name, root_version) = root_package(&current_dir, &description)?;
-    let base_packages = if no_install_project {
-        base_packages().await?
-    } else {
-        BTreeSet::new()
-    };
-    configure_project_installation(
-        current_dir,
-        &description,
-        &mut required,
-        root_name,
-        root_version,
-        no_install_project,
-        &base_packages,
-    )?;
-
-    let project_library = project_library_path(&current_dir);
-    let installed = installed_packages(&project_library).await?;
-    sync_packages(&project_library, required, installed, r_version).await?;
-    Ok(())
-}
-
-fn configure_project_installation(
-    current_dir: &Path,
-    description: &RDescription,
-    required: &mut RequiredPackages,
-    root_name: String,
-    root_version: Version,
-    no_install_project: bool,
-    base_packages: &BTreeSet<String>,
-) -> Result<(), SyncError> {
-    // Resolution includes the local root in some paths, while lockfiles never do.
-    required.remove(&root_name);
-
-    if no_install_project {
-        if !base_packages.contains(&root_name) {
-            let dependents = required
-                .iter()
-                .filter_map(|(name, (_, description))| {
-                    package_dependency_names(description)
-                        .map(|dependencies| dependencies.contains(&root_name).then(|| name.clone()))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-
-            if !dependents.is_empty() {
-                return Err(SyncError::CircularProjectDependency {
-                    project: root_name,
-                    dependents: dependents.join(", "),
-                });
-            }
-        }
-
-        return Ok(());
-    }
-
-    let root = Arc::new(
-        LocalRepository::new(current_dir.to_path_buf()).with_description(description.clone()),
-    );
-    required.insert(
-        root_name,
-        (
-            PackageVersion::new(root_version, root),
-            Arc::new(description.clone()),
-        ),
-    );
-    Ok(())
-}
-
-async fn load_sysreq_snapshot_for_lock(
-    existing_lockfile: Option<&Lockfile>,
-) -> sysreqs::SysreqDbSnapshot {
-    let existing_commit = existing_lockfile
-        .and_then(|lockfile| lockfile.sysreqs.db_commit)
-        .map(|commit| commit.to_string());
-
-    tokio::task::spawn_blocking(move || load_sysreq_snapshot_for_lock_blocking(existing_commit))
-        .await
-        .unwrap_or_else(|_| empty_sysreq_snapshot())
-}
-
-fn load_sysreq_snapshot_for_lock_blocking(
-    existing_commit: Option<String>,
-) -> sysreqs::SysreqDbSnapshot {
-    if let Ok(snapshot) = latest_sysreq_snapshot() {
-        return snapshot;
-    }
-
-    if let Ok(Some(snapshot)) = cached_latest_snapshot() {
-        warning(RpxWarning::CachedSysreqSnapshot);
-        return snapshot;
-    }
-
-    if let Some(commit) = existing_commit
-        && let Ok(snapshot) = sysreqs::snapshot_for_commit(&commit)
-    {
-        warning(RpxWarning::PinnedSysreqSnapshot { commit });
-        return snapshot;
-    }
-
-    warning(RpxWarning::SysreqUnavailable);
-    empty_sysreq_snapshot()
-}
-
-async fn sync_packages(
-    project_library: &Path,
-    required: RequiredPackages,
-    installed: BTreeMap<String, PackageVersion>,
-    r_version: &semver::Version,
-) -> Result<(), SyncError> {
-    let packages_to_remove = installed
-        .iter()
-        .filter(|(name, installed_version)| {
-            required.get(*name).is_none_or(|(required_version, _)| {
-                package_requires_install(required_version, Some(installed_version))
-            })
-        })
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
-    let retained = installed
-        .iter()
-        .filter(|(name, installed_version)| {
-            required.get(*name).is_some_and(|(required_version, _)| {
-                !package_requires_install(required_version, Some(installed_version))
-            })
-        })
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
-    let packages_to_install = required
-        .into_iter()
-        .filter(|(name, (required_version, _))| {
-            package_requires_install(required_version, installed.get(name))
-        })
-        .collect();
-
-    remove_packages_from_venv(project_library, &packages_to_remove)?;
-    install_required_packages(project_library, packages_to_install, retained, r_version).await?;
-
-    Ok(())
-}
-
-fn package_requires_install(required: &PackageVersion, installed: Option<&PackageVersion>) -> bool {
-    let repository = required.repository().as_ref();
-
-    // Git and local sources can change without changing their package version.
-    repository.downcast_ref::<GitRepository>().is_some()
-        || repository.downcast_ref::<LocalRepository>().is_some()
-        || installed != Some(required)
-}
-
-async fn hydrate_resolved_packages(
-    selected: BTreeMap<String, PackageVersion>,
-) -> Result<RequiredPackages, RepositoryError> {
-    // TODO: make sure the web requests are under a central semaphore in the repos not here
-    futures_util::future::join_all(selected.into_iter().map(|(name, version)| async move {
-        let description = version
-            .repository()
-            .description(&name, version.version())
-            .await?;
-
-        Ok::<_, RepositoryError>((name, (version, description)))
-    }))
-    .await
-    .into_iter()
-    .collect()
-}
-
-async fn lockfile_from_resolution(
-    requirements: BTreeSet<Relation>,
-    resolved_packages: &RequiredPackages,
-    sysreq_snapshot: &sysreqs::SysreqDbSnapshot,
-    repositories: &[Arc<dyn PackageRepository>],
-    r_version: &semver::Version,
-) -> Result<Lockfile, LockError> {
-    let repos = futures_util::future::join_all(
-        repositories
-            .iter()
-            .map(|repository| repository.to_lockfile()),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(lock_error_from_repository)?;
-
-    let packages = resolved_packages
-        .iter()
-        .map(|(name, (version, description))| {
-            let repository = repositories
-                .iter()
-                .zip(&repos)
-                .find(|(runtime, _)| version.repository().equals(runtime.as_ref()))
-                .map(|(_, locked)| locked.url().clone())
-                .ok_or_else(|| LockError::UnsupportedRepository {
-                    repository: version.repository().to_string(),
-                })?;
-
-            let depends = description
-                .depends()
-                .map_err(|source| LockError::ResolveFailed {
-                    details: source.to_string(),
-                })?;
-            let imports = description
-                .imports()
-                .map_err(|source| LockError::ResolveFailed {
-                    details: source.to_string(),
-                })?;
-            let linking_to =
-                description
-                    .linking_to()
-                    .map_err(|source| LockError::ResolveFailed {
-                        details: source.to_string(),
-                    })?;
-            let dependencies = depends.chain(imports).chain(linking_to).collect();
-
-            Ok((
-                name.clone(),
-                lockfile::Package {
-                    version: version.version().clone(),
-                    repository,
-                    dependencies,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, LockError>>()?;
-
-    let mut rules = BTreeMap::<String, BTreeSet<String>>::new();
-    for (package, (_, description)) in resolved_packages {
-        let package_rules =
-            sysreqs::match_rules(description, sysreq_snapshot).map_err(|source| {
-                LockError::ResolveFailed {
-                    details: source.to_string(),
-                }
-            })?;
-        for rule in package_rules {
-            rules.entry(rule).or_default().insert(package.clone());
-        }
-    }
-
-    let db_commit = (!sysreq_snapshot.commit.is_empty())
-        .then(|| sysreq_snapshot.commit.parse())
-        .transpose()
-        .map_err(|source| LockError::InvalidSystemRequirementsCommit {
-            commit: sysreq_snapshot.commit.clone(),
-            source,
-        })?;
-
-    Ok(Lockfile {
-        version: lockfile::LOCKFILE_VERSION,
-        revision: lockfile::LOCKFILE_REVISION,
-        r: r_version.clone(),
-        sysreqs: lockfile::SystemRequirements { db_commit, rules },
-        repos,
-        requirements,
-        packages,
-    })
 }
 
 fn package_dependency_names(description: &RDescription) -> Result<BTreeSet<String>, String> {
@@ -1788,18 +1403,20 @@ fn required_package_install_order(packages: &RequiredPackages) -> Result<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        LockError, RequiredPackages, SyncError, configure_project_installation,
-        lock_error_from_repository, lock_error_from_resolution, lockfile_from_resolution,
-        package_dependency_names, package_requires_install, package_rules_from_lockfile,
-        pin_dependency_to_resolved_major, required_package_install_order,
+        LockError, RequiredPackages, package_dependency_names, package_rules_from_lockfile,
+        required_package_install_order,
     };
     use crate::{
         git::GitError,
+        project::{
+            lock_error_from_repository, lock_error_from_resolution, lockfile_from_resolution,
+        },
         r::BasePackagesError,
         repository::{
             GitRepository, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
         },
         resolver::{PackageVersion, ProviderError, RDependencyProvider, ResolutionError},
+        sync::package_requires_install,
         sysreqs::{SysreqDbSnapshot, SysreqRule},
     };
     use miette::Diagnostic;
@@ -1807,7 +1424,7 @@ mod tests {
     use r_description::{RDescription, Relation, Remote, Version};
     use std::{
         collections::{BTreeMap, BTreeSet},
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::Arc,
     };
 
@@ -1836,50 +1453,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn rejects_omitting_project_required_by_locked_package() {
-        let project = RDescription::parse("Package: project\nVersion: 1.0.0\nSuggests: helper\n");
-        let mut packages = required_packages(&[("helper", "Imports: project\n")]);
-
-        let error = configure_project_installation(
-            &PathBuf::from("."),
-            &project,
-            &mut packages,
-            "project".to_string(),
-            version("1.0.0"),
-            true,
-            &BTreeSet::new(),
-        )
-        .expect_err("reverse project dependency should fail");
-
-        assert!(matches!(
-            error,
-            SyncError::CircularProjectDependency {
-                project,
-                dependents
-            } if project == "project" && dependents == "helper"
-        ));
-    }
-
-    #[test]
-    fn does_not_treat_base_package_as_omitted_project_dependency() {
-        let project = RDescription::parse("Package: stats\nVersion: 1.0.0\n");
-        let mut packages = required_packages(&[("helper", "Imports: stats\n")]);
-
-        configure_project_installation(
-            Path::new("."),
-            &project,
-            &mut packages,
-            "stats".to_string(),
-            version("1.0.0"),
-            true,
-            &BTreeSet::from(["stats".to_string()]),
-        )
-        .expect("base package dependency should not reference the project");
-
-        assert_eq!(packages.keys().collect::<Vec<_>>(), ["helper"]);
-    }
-
     fn git_access_error(remote: &str) -> RepositoryError {
         RepositoryError::Git {
             repository: remote.to_string(),
@@ -1895,21 +1468,6 @@ mod tests {
             resource: "fixture".to_string(),
             details: "invalid".to_string(),
         }
-    }
-
-    #[test]
-    fn pins_unconstrained_dependency_to_resolved_major_range() {
-        let mut relations = BTreeSet::from([relation("digest"), relation("cli (>= 3.0.0)")]);
-
-        pin_dependency_to_resolved_major(&mut relations, "digest", &version("0.6.39"));
-
-        assert_eq!(
-            relations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["cli (>= 3.0.0)", "digest (< 1.0.0)", "digest (>= 0.6.39)"]
-        );
     }
 
     #[test]

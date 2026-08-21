@@ -1,29 +1,37 @@
 use crate::{
     LockError,
-    description::read_description,
-    lockfile::{LockfileReadError, read_lockfile, write_lockfile},
     output::status,
-    project::find_project_root,
-    resolve_lockfile_for_description,
+    project::{
+        LockfileState, ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project,
+        resolve_project, write_project_lockfile,
+    },
 };
+use miette::Diagnostic;
+use thiserror::Error;
 
-pub(crate) async fn run() -> Result<(), LockError> {
-    let current_dir = find_project_root()?;
-    let description = read_description(&current_dir)?;
-    let old_lockfile = match read_lockfile(&current_dir) {
-        Ok(lockfile) => Some(lockfile),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            None
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => None,
-        Err(source) => return Err(source.into()),
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum Error {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectLoad(#[from] ProjectLoadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectWrite(#[from] ProjectWriteError),
+}
+
+pub(crate) async fn run() -> Result<(), Error> {
+    let project = load_project()?;
+    let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
+    let changed = match &project.lockfile {
+        LockfileState::Present(lockfile) => lockfile != &resolution.lockfile,
+        LockfileState::Missing | LockfileState::Outdated => true,
     };
-    let lockfile =
-        resolve_lockfile_for_description(&current_dir, &description, old_lockfile.as_ref()).await?;
-    let changed = old_lockfile.as_ref() != Some(&lockfile);
-    write_lockfile(&current_dir, &lockfile)?;
+    write_project_lockfile(&project, &resolution)?;
 
     if changed {
         status("Updated rpx.lock");

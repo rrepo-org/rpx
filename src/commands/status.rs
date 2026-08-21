@@ -1,13 +1,12 @@
 use crate::{
-    description::{DescriptionParseError, DescriptionReadError, read_description, root_package},
+    LockError,
+    description::{DescriptionParseError, root_package},
     host_supports_system_sync,
-    lockfile::{LockfileReadError, read_lockfile},
     output::status,
     project::{
-        LockedResolutionError, ProjectDiscoveryError, find_project_root, project_library_path,
-        validate_locked_resolution,
+        ProjectLoadError, ResolutionPolicy, load_project, project_library_path, resolve_project,
     },
-    r::{BasePackagesError, RVersionError, base_packages, installed_packages, r_version_async},
+    r::{BasePackagesError, base_packages, installed_packages},
     system_plan_from_lockfile,
 };
 use miette::Diagnostic;
@@ -93,19 +92,7 @@ impl std::fmt::Display for StatusMismatches {
 pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    ProjectDiscovery(#[from] ProjectDiscoveryError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
+    ProjectLoad(#[from] ProjectLoadError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -117,7 +104,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
+    Lock(#[from] LockError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -132,11 +119,9 @@ pub(crate) enum Error {
 }
 
 pub(crate) async fn run() -> Result<(), Error> {
-    let current_dir = find_project_root()?;
-    let description = read_description(&current_dir)?;
-    let lockfile = read_lockfile(&current_dir)?;
-    let r_version = r_version_async().await?;
-    validate_locked_resolution(&current_dir, &description, &r_version, &lockfile)?;
+    let project = load_project()?;
+    let resolution = resolve_project(&project, ResolutionPolicy::RequireValid).await?;
+    let lockfile = &resolution.lockfile;
     let base_packages = base_packages().await?;
 
     let mut expected_packages = lockfile
@@ -145,10 +130,10 @@ pub(crate) async fn run() -> Result<(), Error> {
         .filter(|(name, _)| !base_packages.contains(*name))
         .map(|(name, package)| (name.clone(), package.version.clone()))
         .collect::<BTreeMap<_, _>>();
-    let (root_name, root_version) = root_package(&current_dir, &description)?;
+    let (root_name, root_version) = root_package(&project.root, &project.description)?;
     expected_packages.insert(root_name, root_version);
 
-    let project_library = project_library_path(&current_dir);
+    let project_library = project_library_path(&project.root);
     let installed = installed_packages(&project_library).await?;
     let missing_packages = expected_packages
         .keys()
@@ -181,7 +166,7 @@ pub(crate) async fn run() -> Result<(), Error> {
     };
 
     let system_plan = if host_supports_system_sync() {
-        system_plan_from_lockfile(&lockfile).ok()
+        system_plan_from_lockfile(lockfile).ok()
     } else {
         None
     };
