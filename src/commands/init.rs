@@ -9,7 +9,7 @@ use crate::{
     output::status,
     project::{
         Project, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
-        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
+        pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -438,7 +438,11 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         DependencyField::Suggests,
     )?;
 
-    write_project_metadata(&project, &resolution)?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;

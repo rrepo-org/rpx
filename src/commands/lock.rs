@@ -2,7 +2,7 @@ use crate::{
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
-        resolve_project, write_project_lockfile,
+        resolve_project, write_project_files,
     },
 };
 use miette::Diagnostic;
@@ -27,7 +27,7 @@ pub(crate) async fn run() -> Result<(), Error> {
     let project = load_project()?;
     let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
     let changed = resolution.lockfile_changed;
-    write_project_lockfile(&project, &resolution)?;
+    write_project_files(&project.root, None, &resolution.lockfile)?;
 
     if changed {
         status("Updated rpx.lock");

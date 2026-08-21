@@ -506,29 +506,43 @@ pub(crate) enum ProjectWriteError {
         source: serde_json::Error,
     },
 
-    #[error("failed to stage project file at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::file_stage_failed))]
-    Stage {
+    #[error("failed to prepare project file at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::file_prepare_failed))]
+    Prepare {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("failed to commit project file at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::file_commit_failed))]
-    Commit {
+    #[error("failed to replace project file at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::file_replace_failed))]
+    Replace {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "DESCRIPTION was updated, but failed to replace rpx.lock at {}: {source}",
+        path.display()
+    )]
+    #[diagnostic(
+        code(rpx::project::metadata_partially_written),
+        help("Run `rpx lock` to bring rpx.lock back in sync with DESCRIPTION.")
+    )]
+    LockfileReplaceAfterDescription {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 }
 
-struct StagedProjectFile {
+struct PreparedProjectFile {
     path: PathBuf,
     destination: PathBuf,
 }
 
-impl StagedProjectFile {
+impl PreparedProjectFile {
     fn new(destination: PathBuf, contents: &[u8]) -> Result<Self, ProjectWriteError> {
         let parent = destination
             .parent()
@@ -548,27 +562,37 @@ impl StagedProjectFile {
             {
                 Ok(file) => file,
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(source) => return Err(ProjectWriteError::Stage { path, source }),
+                Err(source) => {
+                    return Err(ProjectWriteError::Prepare {
+                        path: destination,
+                        source,
+                    });
+                }
             };
             if let Ok(metadata) = fs::metadata(&destination)
                 && let Err(source) = file.set_permissions(metadata.permissions())
             {
                 drop(file);
                 let _ = fs::remove_file(&path);
-                return Err(ProjectWriteError::Stage { path, source });
+                return Err(ProjectWriteError::Prepare {
+                    path: destination,
+                    source,
+                });
             }
             if let Err(source) = file.write_all(contents).and_then(|()| file.sync_all()) {
                 drop(file);
                 let _ = fs::remove_file(&path);
-                return Err(ProjectWriteError::Stage { path, source });
+                return Err(ProjectWriteError::Prepare {
+                    path: destination,
+                    source,
+                });
             }
 
             return Ok(Self { path, destination });
         }
 
-        let path = parent.join(format!(".{name}.rpx-stage"));
-        Err(ProjectWriteError::Stage {
-            path,
+        Err(ProjectWriteError::Prepare {
+            path: destination,
             source: std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "failed to allocate a unique staging file",
@@ -576,24 +600,18 @@ impl StagedProjectFile {
         })
     }
 
-    fn commit(mut self) -> Result<(), ProjectWriteError> {
+    fn replace(mut self) -> Result<(), std::io::Error> {
         #[cfg(windows)]
         if self.destination.exists() {
-            fs::remove_file(&self.destination).map_err(|source| ProjectWriteError::Commit {
-                path: self.destination.clone(),
-                source,
-            })?;
+            fs::remove_file(&self.destination)?;
         }
-        fs::rename(&self.path, &self.destination).map_err(|source| ProjectWriteError::Commit {
-            path: self.destination.clone(),
-            source,
-        })?;
+        fs::rename(&self.path, &self.destination)?;
         self.path = PathBuf::new();
         Ok(())
     }
 }
 
-impl Drop for StagedProjectFile {
+impl Drop for PreparedProjectFile {
     fn drop(&mut self) {
         if !self.path.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.path);
@@ -601,32 +619,46 @@ impl Drop for StagedProjectFile {
     }
 }
 
-pub(crate) fn write_project_lockfile(
-    project: &Project,
-    resolution: &ProjectResolution,
+pub(crate) fn write_project_files(
+    root: &Path,
+    description: Option<&RDescription>,
+    lockfile: &Lockfile,
 ) -> Result<(), ProjectWriteError> {
-    let lockfile = serialize_lockfile(&resolution.lockfile)?;
-    StagedProjectFile::new(project.root.join(LOCKFILE_NAME), &lockfile)?.commit()
-}
-
-pub(crate) fn write_project_metadata(
-    project: &Project,
-    resolution: &ProjectResolution,
-) -> Result<(), ProjectWriteError> {
-    let description = project.description.to_string();
-    let lockfile = serialize_lockfile(&resolution.lockfile)?;
-    let description =
-        StagedProjectFile::new(project.root.join(DESCRIPTION_NAME), description.as_bytes())?;
-    let lockfile = StagedProjectFile::new(project.root.join(LOCKFILE_NAME), &lockfile)?;
-
-    description.commit()?;
-    lockfile.commit()
-}
-
-fn serialize_lockfile(lockfile: &Lockfile) -> Result<Vec<u8>, ProjectWriteError> {
-    let contents = serde_json::to_string_pretty(lockfile)
+    let mut lockfile_contents = serde_json::to_vec_pretty(lockfile)
         .map_err(|source| ProjectWriteError::SerializeLockfile { source })?;
-    Ok(format!("{contents}\n").into_bytes())
+    lockfile_contents.push(b'\n');
+
+    let description_path = root.join(DESCRIPTION_NAME);
+    let description = description
+        .map(|description| {
+            let contents = description.to_string();
+            PreparedProjectFile::new(description_path.clone(), contents.as_bytes())
+        })
+        .transpose()?;
+    let lockfile_path = root.join(LOCKFILE_NAME);
+    let lockfile = PreparedProjectFile::new(lockfile_path.clone(), &lockfile_contents)?;
+
+    if let Some(description) = description {
+        description
+            .replace()
+            .map_err(|source| ProjectWriteError::Replace {
+                path: description_path,
+                source,
+            })?;
+        lockfile.replace().map_err(
+            |source| ProjectWriteError::LockfileReplaceAfterDescription {
+                path: lockfile_path,
+                source,
+            },
+        )
+    } else {
+        lockfile
+            .replace()
+            .map_err(|source| ProjectWriteError::Replace {
+                path: lockfile_path,
+                source,
+            })
+    }
 }
 
 pub(crate) async fn resolve_project(
@@ -1311,18 +1343,13 @@ mod tests {
     }
 
     #[test]
-    fn writes_only_lockfile_from_staged_contents() {
+    fn writes_only_requested_project_files() {
         let directory = TestProject::new("write-lockfile");
-        let project = Project {
-            root: directory.0.clone(),
-            description: read_description(&directory.0).expect("DESCRIPTION should be readable"),
-        };
         let description_before =
             fs::read(directory.0.join(DESCRIPTION_NAME)).expect("DESCRIPTION should be readable");
         let expected = lockfile();
 
-        write_project_lockfile(&project, &resolution(expected.clone()))
-            .expect("lockfile should be written");
+        write_project_files(&directory.0, None, &expected).expect("lockfile should be written");
 
         assert_eq!(
             fs::read(directory.0.join(DESCRIPTION_NAME))
@@ -1336,17 +1363,13 @@ mod tests {
     }
 
     #[test]
-    fn stages_and_writes_project_metadata_without_consistency_validation() {
+    fn prepares_and_writes_project_files_without_consistency_validation() {
         let directory = TestProject::new("write-metadata");
-        let project = Project {
-            root: directory.0.clone(),
-            description: RDescription::parse(
-                "Package: changed\nVersion: 2.0.0\nImports: dependency\n",
-            ),
-        };
+        let description =
+            RDescription::parse("Package: changed\nVersion: 2.0.0\nImports: dependency\n");
         let expected = lockfile();
 
-        write_project_metadata(&project, &resolution(expected.clone()))
+        write_project_files(&directory.0, Some(&description), &expected)
             .expect("metadata should be written");
 
         let description = read_description(&directory.0).expect("DESCRIPTION should be readable");
@@ -1368,6 +1391,44 @@ mod tests {
                         .to_string_lossy()
                         .contains(".rpx-stage-")
                 })
+        );
+    }
+
+    #[test]
+    fn project_file_preparation_error_names_destination() {
+        let root = synthetic_path("missing-write-root");
+        let expected = root.join(LOCKFILE_NAME);
+
+        let error = write_project_files(&root, None, &lockfile())
+            .expect_err("missing project root should prevent preparation");
+
+        assert!(matches!(
+            error,
+            ProjectWriteError::Prepare { path, .. } if path == expected
+        ));
+    }
+
+    #[test]
+    fn reports_lockfile_replacement_after_description_was_updated() {
+        let directory = TestProject::new("partial-project-write");
+        let lockfile_path = directory.0.join(LOCKFILE_NAME);
+        fs::create_dir(&lockfile_path).expect("lockfile destination should block replacement");
+        let description = RDescription::parse("Package: changed\nVersion: 2.0.0\n");
+
+        let error = write_project_files(&directory.0, Some(&description), &lockfile())
+            .expect_err("lockfile replacement should fail");
+
+        assert!(matches!(
+            error,
+            ProjectWriteError::LockfileReplaceAfterDescription { path, .. }
+                if path == lockfile_path
+        ));
+        assert_eq!(
+            read_description(&directory.0)
+                .expect("updated DESCRIPTION should be readable")
+                .package()
+                .expect("updated package name should be valid"),
+            "changed"
         );
     }
 

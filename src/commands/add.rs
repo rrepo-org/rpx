@@ -4,7 +4,7 @@ use crate::{
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
-        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
+        pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -64,7 +64,11 @@ pub(crate) async fn run(
         dependency_field,
     )?;
 
-    write_project_metadata(&project, &resolution)?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     sync_resolved_project(
         &project,
         resolution,

@@ -15,7 +15,7 @@ use crate::{
     output::status,
     project::{
         Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
-        find_project_root, resolve_project, write_project_metadata,
+        find_project_root, resolve_project, write_project_files,
     },
     repository::{RepositoryError, built_in_repository_url, parse_repository_url},
 };
@@ -277,7 +277,11 @@ async fn relock_and_write(path: &Path, description: &RDescription) -> Result<(),
         description: description.clone(),
     };
     let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
-    write_project_metadata(&project, &resolution)?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     Ok(())
 }
 

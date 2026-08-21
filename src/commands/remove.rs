@@ -4,7 +4,7 @@ use crate::{
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
-        resolve_project, write_project_metadata,
+        resolve_project, write_project_files,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -40,7 +40,11 @@ pub(crate) async fn run(packages: &[String], no_install_project: bool) -> Result
     let removed_packages = packages.iter().cloned().collect::<BTreeSet<_>>();
     remove_dependencies(&project.root, &mut project.description, &removed_packages)?;
     let resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
-    write_project_metadata(&project, &resolution)?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     let report = sync_resolved_project(
         &project,
         resolution,

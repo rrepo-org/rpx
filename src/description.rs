@@ -146,26 +146,6 @@ pub fn read_description(path: &PathBuf) -> Result<RDescription, DescriptionReadE
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum DescriptionWriteError {
-    #[error("failed to write DESCRIPTION at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::project::description_write_failed))]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-pub fn write_description(
-    path: &PathBuf,
-    description: &RDescription,
-) -> Result<(), DescriptionWriteError> {
-    let path = path.join(DESCRIPTION_NAME);
-    fs::write(&path, description.to_string())
-        .map_err(|source| DescriptionWriteError::Write { path, source })
-}
-
-#[derive(Debug, Error, Diagnostic)]
 pub enum NamespaceWriteError {
     #[error("failed to write NAMESPACE at {}: {source}", path.display())]
     #[diagnostic(code(rpx::project::namespace_write_failed))]
@@ -1136,7 +1116,7 @@ mod tests {
         ));
 
         let expected = RDescription::parse("Package: project\nVersion: 2.0.0\nImports: cli\n");
-        write_description(&directory.0, &expected).expect("DESCRIPTION should be written");
+        fs::write(&path, expected.to_string()).expect("DESCRIPTION should be written");
         let actual = read_description(&directory.0).expect("DESCRIPTION should be reread");
 
         assert_eq!(actual.to_string(), expected.to_string());
