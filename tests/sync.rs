@@ -114,12 +114,56 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
 
     let after = read_project_file(&container, project_path, "rpx.lock");
     assert_eq!(
         after, before,
         "lockfile changed during sync\nbefore:\n{before}\nafter:\n{after}"
     );
+}
+
+#[test]
+fn sync_without_project_installs_dependencies_and_removes_project() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-without-project";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest",
+    );
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    let before = read_project_file(&container, project_path, "rpx.lock");
+
+    let sync_command = format!("cd {project_path} && rpx sync --no-install-project");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "FALSE");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
+
+    let sync_command = format!("cd {project_path} && rpx sync --no-install-project");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "FALSE");
+
+    let after = read_project_file(&container, project_path, "rpx.lock");
+    assert_eq!(after, before, "lockfile changed during sync");
 }
 
 #[test]

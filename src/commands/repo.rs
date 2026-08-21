@@ -1,27 +1,27 @@
 use crate::{
-    LockError,
     cli::{
         RepoAdditionalAddArgs, RepoAdditionalCommands, RepoAdditionalRemoveArgs, RepoBaseCommands,
         RepoBaseResetArgs, RepoBaseSetArgs, RepoCommands, RepoListArgs, RepoRemoteArgs,
         RepoRemoteCommands, RepositoryType,
     },
     description::{
-        BASE_REPOSITORY_FIELD, DescriptionParseError, DescriptionReadError, DescriptionWriteError,
+        BASE_REPOSITORY_FIELD, DescriptionParseError, DescriptionReadError,
         RepositoryMutationError, add_additional_repository, add_remote_repository,
         additional_repositories, base_repository, read_description, remotes,
         remove_additional_repository, remove_remote_repository, reset_base_repository,
-        set_base_repository, write_description,
+        set_base_repository,
     },
     http,
-    lockfile::{Lockfile, LockfileReadError, LockfileWriteError, read_lockfile, write_lockfile},
     output::status,
-    project::{ProjectDiscoveryError, find_project_root},
+    project::{
+        Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
+        find_project_root, resolve_project, write_project_files,
+    },
     repository::{RepositoryError, built_in_repository_url, parse_repository_url},
-    resolve_lockfile_for_description,
 };
 use miette::Diagnostic;
 use r_description::{FieldMutationError, PositionedRemoteParseError, RDescription, Remote, Url};
-use std::path::PathBuf;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error, Diagnostic)]
@@ -33,10 +33,6 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionRead(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    DescriptionWrite(#[from] DescriptionWriteError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -63,15 +59,11 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
+    ProjectWrite(#[from] ProjectWriteError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LockfileWrite(#[from] LockfileWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lock(Box<LockError>),
+    Resolve(Box<ResolveProjectError>),
 
     #[error("invalid {action} repository URL {url}: {source}")]
     #[diagnostic(code(rpx::repo::invalid_url))]
@@ -87,9 +79,9 @@ pub(crate) enum Error {
     CredentialRemove { details: String },
 }
 
-impl From<LockError> for Error {
-    fn from(error: LockError) -> Self {
-        Self::Lock(Box::new(error))
+impl From<ResolveProjectError> for Error {
+    fn from(error: ResolveProjectError) -> Self {
+        Self::Resolve(Box::new(error))
     }
 }
 
@@ -279,26 +271,18 @@ fn list(args: RepoListArgs) -> Result<(), Error> {
     Ok(())
 }
 
-async fn relock_and_write(path: &PathBuf, description: &RDescription) -> Result<(), Error> {
-    let old_lockfile = optional_lockfile(path)?;
-    let lockfile =
-        resolve_lockfile_for_description(path, description, old_lockfile.as_ref()).await?;
-    write_description(path, description)?;
-    write_lockfile(path, &lockfile)?;
+async fn relock_and_write(path: &Path, description: &RDescription) -> Result<(), Error> {
+    let project = Project {
+        root: path.to_path_buf(),
+        description: description.clone(),
+    };
+    let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     Ok(())
-}
-
-fn optional_lockfile(path: &PathBuf) -> Result<Option<Lockfile>, Error> {
-    match read_lockfile(path) {
-        Ok(lockfile) => Ok(Some(lockfile)),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(None)
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => Ok(None),
-        Err(source) => Err(source.into()),
-    }
 }
 
 fn repository_url(action: &'static str, value: &str) -> Result<Url, Error> {

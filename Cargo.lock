@@ -2492,7 +2492,6 @@ dependencies = [
  "petname",
  "pubgrub",
  "r-description-scalerail",
- "regex",
  "relative-path",
  "reqwest",
  "reqwest-middleware",

@@ -124,6 +124,25 @@ fn runs_rpx_add_inside_custom_r_image() {
 }
 
 #[test]
+fn add_and_remove_can_sync_without_installing_project() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-deps-without-project";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx add --no-install-project digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "FALSE");
+
+    let remove_command = format!("cd {project_path} && rpx remove --no-install-project digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "FALSE");
+    assert_package_state(&container, project_path, "testpkg", "FALSE");
+}
+
+#[test]
 fn constrained_add_replaces_default_dependency_bounds() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-constraint";

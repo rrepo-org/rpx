@@ -71,6 +71,18 @@ pub enum PackageInstallError {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum InstalledPackagesError {
+    #[error("failed to inspect project library at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::runtime::project_library_inspection_failed))]
+    LibraryMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("project library path is not a directory: {}", path.display())]
+    #[diagnostic(code(rpx::runtime::project_library_not_directory))]
+    LibraryNotDirectory { path: PathBuf },
+
     #[error("failed to inspect installed R packages: {source}")]
     #[diagnostic(code(rpx::runtime::installed_packages_failed))]
     Command {
@@ -137,18 +149,6 @@ pub enum RVersionError {
         version: String,
         #[source]
         source: semver::Error,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum PackageRemovalError {
-    #[error("failed to remove package {package} at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::library::package_remove_failed))]
-    Remove {
-        package: String,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
     },
 }
 
@@ -280,6 +280,24 @@ pub async fn base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
 pub async fn installed_packages(
     project_library: &Path,
 ) -> Result<BTreeMap<String, PackageVersion>, InstalledPackagesError> {
+    let metadata = match tokio::fs::metadata(project_library).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(source) => {
+            return Err(InstalledPackagesError::LibraryMetadata {
+                path: project_library.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(InstalledPackagesError::LibraryNotDirectory {
+            path: project_library.to_path_buf(),
+        });
+    }
+
     let expression = concat!(
         "packages <- installed.packages(lib.loc = .libPaths()[1]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
@@ -296,6 +314,18 @@ pub async fn installed_packages(
         .map_err(|source| InstalledPackagesError::InvalidUtf8 { source })?;
 
     parse_installed_packages(&stdout)
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum PackageRemovalError {
+    #[error("failed to remove package {package} at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::library::package_remove_failed))]
+    Remove {
+        package: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub fn remove_packages_from_venv(
@@ -523,5 +553,32 @@ mod tests {
             InstalledPackagesError::InvalidVersion { package, version, .. }
                 if package == "digest" && version == "not-a-version"
         ));
+    }
+
+    #[tokio::test]
+    async fn missing_project_library_has_no_installed_packages() {
+        let path = install_log_path();
+
+        let packages = installed_packages(&path)
+            .await
+            .expect("missing library should be empty");
+
+        assert!(packages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_library_must_be_a_directory() {
+        let path = install_log_path();
+        fs::write(&path, "not a directory").expect("test file should be written");
+
+        let error = installed_packages(&path)
+            .await
+            .expect_err("file should not be accepted as a library");
+
+        assert!(matches!(
+            error,
+            InstalledPackagesError::LibraryNotDirectory { path: actual } if actual == path
+        ));
+        fs::remove_file(path).expect("test file should be removed");
     }
 }

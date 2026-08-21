@@ -272,15 +272,6 @@ fn packages_entry_to_description(
         description.set_linking_to(entry.linking_to.clone());
     }
 
-    if let Some(system_requirements) = &entry.system_requirements {
-        description
-            .set_system_requirements(system_requirements)
-            .map_err(|source| RepositoryError::InvalidData {
-                resource: "SystemRequirements in CRAN PACKAGES index".to_string(),
-                details: source.to_string(),
-            })?;
-    }
-
     Ok(description)
 }
 

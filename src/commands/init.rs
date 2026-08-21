@@ -1,14 +1,16 @@
 use crate::{
-    LockError, SyncError,
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionParseError, DescriptionWriteError, NamespaceWriteError,
-        add_dependencies, project_dependencies, write_description, write_namespace_if_missing,
+        DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
+        write_namespace_if_missing,
     },
     git,
-    lockfile::write_lockfile,
     output::status,
-    pin_dependency_to_resolved_major, resolve_lockfile_for_description, sync_project,
+    project::{
+        Project, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
+        pin_unconstrained_dependencies, resolve_project, write_project_files,
+    },
+    sync::{ProjectPackageMode, SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
 use r_description::{RDescription, Relation};
@@ -105,10 +107,6 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    WriteDescription(#[from] DescriptionWriteError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
     WriteNamespace(#[from] NamespaceWriteError),
 
     #[error("failed to write .Rbuildignore at {}: {source}", path.display())]
@@ -167,7 +165,11 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    InitialLock(#[from] LockError),
+    Resolve(#[from] ResolveProjectError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectWrite(#[from] ProjectWriteError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -423,37 +425,27 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         path: target.clone(),
         source,
     })?;
-    let mut lockfile = resolve_lockfile_for_description(&target, &description, None).await?;
-    let mut pinned_development_relations = development_relations.clone();
-    for package in development_packages {
-        let version = &lockfile
-            .packages
-            .get(package.name())
-            .expect("resolved lockfile should contain selected development packages")
-            .version;
-        pin_dependency_to_resolved_major(
-            &mut pinned_development_relations,
-            package.name(),
-            version,
-        );
-    }
-    if pinned_development_relations != development_relations {
-        add_dependencies(
-            &target,
-            &mut description,
-            &pinned_development_relations,
-            DependencyField::Suggests,
-        )?;
-        lockfile.requirements = project_dependencies(&target, &description)?;
-    }
+    let mut project = Project {
+        root: target.clone(),
+        description,
+    };
+    let mut resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
+    pin_unconstrained_dependencies(
+        &mut project,
+        &mut resolution,
+        &development_relations,
+        DependencyField::Suggests,
+    )?;
 
-    write_description(&target, &description)?;
+    write_project_files(
+        &project.root,
+        Some(&project.description),
+        &resolution.lockfile,
+    )?;
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
-    write_lockfile(&target, &lockfile).map_err(LockError::from)?;
-    let r_version = lockfile.r.clone();
-    sync_project(&target, description, &lockfile, &r_version, false, false).await?;
+    sync_resolved_project(&project, resolution, ProjectPackageMode::Install).await?;
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),
