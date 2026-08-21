@@ -18,14 +18,14 @@ use thiserror::Error;
 use crate::{
     LockError, RpxWarning,
     description::{
-        ConfiguredRepository, DESCRIPTION_NAME, DescriptionParseError, DescriptionReadError,
-        configured_repositories, project_dependencies, read_description,
-        repositories_from_description,
+        ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
+        DescriptionReadError, add_dependencies, configured_repositories, project_dependencies,
+        read_description, repositories_from_description,
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
     output::warning,
-    r::{BasePackagesError, base_packages, r_version_async},
+    r::r_version_async,
     repository::{GitRepository, LocalRepository, PackageRepository, RepositoryError},
     resolver::{PackageVersion, ResolutionError, resolve_from_registry},
     sysreqs::{
@@ -605,23 +605,38 @@ pub(crate) async fn resolve_project(
     })
 }
 
-pub(crate) async fn pin_unconstrained_relations(
+pub(crate) fn pin_unconstrained_dependencies(
+    project: &mut Project,
+    resolution: &mut ProjectResolution,
     relations: &BTreeSet<Relation>,
-    packages: &BTreeSet<String>,
-    resolution: &ProjectResolution,
-) -> Result<BTreeSet<Relation>, BasePackagesError> {
-    let base_packages = base_packages().await?;
-    Ok(packages
+    dependency_field: DependencyField,
+) -> Result<(), DescriptionParseError> {
+    let pinned_relations = relations
         .iter()
-        .filter(|package| !base_packages.contains(package.as_str()))
-        .fold(relations.clone(), |mut relations, package| {
-            let (selected, _) = resolution
+        .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
+        .filter_map(|relation| {
+            resolution
                 .packages
-                .get(package)
-                .expect("resolved package map should contain every pinned package");
-            pin_dependency_to_resolved_major(&mut relations, package, selected.version());
+                .get(relation.package())
+                .map(|(selected, _)| (relation.package(), selected.version()))
+        })
+        .fold(relations.clone(), |mut relations, (package, version)| {
+            pin_dependency_to_resolved_major(&mut relations, package, version);
             relations
-        }))
+        });
+
+    if pinned_relations != *relations {
+        add_dependencies(
+            &project.root,
+            &mut project.description,
+            &pinned_relations,
+            dependency_field,
+        )?;
+        resolution.lockfile.requirements =
+            project_dependencies(&project.root, &project.description)?;
+    }
+
+    Ok(())
 }
 
 fn pin_dependency_to_resolved_major(
@@ -930,7 +945,7 @@ mod tests {
             ArchiveSupport as LockedArchiveSupport, GitReference, LOCKFILE_REVISION,
             LOCKFILE_VERSION, Package, Repository, SystemRequirements,
         },
-        repository::{ArchiveSupport, CranRepository, RrepoRepository},
+        repository::{ArchiveSupport, CranRepository, RrepoRepository, built_in_repository},
     };
     use r_description::{Relation, Version};
     use std::{
@@ -995,6 +1010,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["cli (>= 3.0.0)", "digest (< 1.0.0)", "digest (>= 0.6.39)"]
         );
+    }
+
+    #[test]
+    fn pins_only_unconstrained_dependencies_present_in_resolution() {
+        let test_project = TestProject::new("pin-selected-dependencies");
+        let mut project = Project {
+            root: test_project.0.clone(),
+            description: read_description(&test_project.0)
+                .expect("project DESCRIPTION should parse"),
+            lockfile: LockfileState::Missing,
+        };
+        let mut resolution = resolution(lockfile());
+        resolution.packages.insert(
+            "digest".to_string(),
+            (
+                PackageVersion::new(version("0.6.39"), built_in_repository()),
+                Arc::new(project.description.clone()),
+            ),
+        );
+        let relations = BTreeSet::from([relation("digest"), relation("stats")]);
+
+        pin_unconstrained_dependencies(
+            &mut project,
+            &mut resolution,
+            &relations,
+            DependencyField::Suggests,
+        )
+        .expect("dependencies should be pinned");
+
+        let expected = BTreeSet::from([
+            relation("digest (>= 0.6.39)"),
+            relation("digest (< 1.0.0)"),
+            relation("stats"),
+        ]);
+        assert_eq!(
+            project_dependencies(&project.root, &project.description)
+                .expect("project dependencies should parse"),
+            expected
+        );
+        assert_eq!(resolution.lockfile.requirements, expected);
     }
 
     fn version(value: &str) -> Version {

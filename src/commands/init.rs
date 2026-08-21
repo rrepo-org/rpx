@@ -3,13 +3,13 @@ use crate::{
     cli::{InitArgs, InitLicense},
     description::{
         DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
-        project_dependencies, write_namespace_if_missing,
+        write_namespace_if_missing,
     },
     git,
     output::status,
     project::{
-        LockfileState, Project, ProjectWriteError, ResolutionPolicy, pin_unconstrained_relations,
-        resolve_project, write_project_metadata,
+        LockfileState, Project, ProjectWriteError, ResolutionPolicy,
+        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -432,26 +432,12 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         lockfile: LockfileState::Missing,
     };
     let mut resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
-    let development_package_names = development_packages
-        .iter()
-        .map(|package| package.name().to_string())
-        .collect();
-    let pinned_development_relations = pin_unconstrained_relations(
+    pin_unconstrained_dependencies(
+        &mut project,
+        &mut resolution,
         &development_relations,
-        &development_package_names,
-        &resolution,
-    )
-    .await
-    .map_err(LockError::BasePackages)?;
-    if pinned_development_relations != development_relations {
-        add_dependencies(
-            &target,
-            &mut project.description,
-            &pinned_development_relations,
-            DependencyField::Suggests,
-        )?;
-        resolution.lockfile.requirements = project_dependencies(&target, &project.description)?;
-    }
+        DependencyField::Suggests,
+    )?;
 
     write_project_metadata(&project, &resolution)?;
     write_namespace_if_missing(&target)?;

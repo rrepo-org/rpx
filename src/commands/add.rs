@@ -1,10 +1,10 @@
 use crate::{
     LockError, SyncError,
-    description::{DependencyField, DescriptionParseError, add_dependencies, project_dependencies},
+    description::{DependencyField, DescriptionParseError, add_dependencies},
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project,
-        pin_unconstrained_relations, resolve_project, write_project_metadata,
+        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
     },
     repository::RepositoryError,
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
@@ -55,11 +55,6 @@ pub(crate) async fn run(
 ) -> Result<(), Error> {
     let mut project = load_project()?;
     let added_relations = parse_add_packages(packages)?;
-    let unconstrained_packages = added_relations
-        .iter()
-        .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
-        .map(|relation| relation.package().to_string())
-        .collect::<BTreeSet<_>>();
 
     add_dependencies(
         &project.root,
@@ -67,24 +62,17 @@ pub(crate) async fn run(
         &added_relations,
         dependency_field,
     )?;
+
     let mut resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid)
         .await
         .map_err(map_resolution_error)?;
-    let final_added_relations =
-        pin_unconstrained_relations(&added_relations, &unconstrained_packages, &resolution)
-            .await
-            .map_err(LockError::BasePackages)?;
 
-    if final_added_relations != added_relations {
-        add_dependencies(
-            &project.root,
-            &mut project.description,
-            &final_added_relations,
-            dependency_field,
-        )?;
-        resolution.lockfile.requirements =
-            project_dependencies(&project.root, &project.description)?;
-    }
+    pin_unconstrained_dependencies(
+        &mut project,
+        &mut resolution,
+        &added_relations,
+        dependency_field,
+    )?;
 
     write_project_metadata(&project, &resolution)?;
     sync_resolved_project(
