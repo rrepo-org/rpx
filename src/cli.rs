@@ -27,45 +27,19 @@ pub enum Commands {
         about = "Install one or more packages",
         long_about = "Install one or more packages for this project. Each package is recorded in DESCRIPTION, then rpx regenerates rpx.lock and syncs the project library."
     )]
-    Add {
-        #[command(flatten)]
-        dependency_type: AddDependencyTypeArgs,
-
-        #[arg(
-            help = "Packages to add, optionally with a constraint such as digest@>=0.6.37",
-            value_name = "PACKAGE[@CONSTRAINTVERSION]",
-            required = true
-        )]
-        packages: Vec<String>,
-    },
+    Add(AddArgs),
 
     #[command(
         about = "Remove one or more packages",
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
-    Remove {
-        #[arg(
-            help = "Package names to remove from the project's dependencies",
-            value_name = "PACKAGE",
-            required = true
-        )]
-        packages: Vec<String>,
-    },
+    Remove(RemoveArgs),
 
     #[command(
         about = "Run a command in the project environment",
         long_about = "Run a command with this project's isolated R package library activated."
     )]
-    Run {
-        #[arg(
-            help = "Command and arguments to run inside the project environment",
-            value_name = "COMMAND",
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            required = true
-        )]
-        command: Vec<String>,
-    },
+    Run(RunArgs),
 
     #[command(
         about = "Resolve project dependencies",
@@ -83,21 +57,7 @@ pub enum Commands {
         about = "Install the locked package set",
         long_about = "Install the exact package set recorded in rpx.lock into the project library."
     )]
-    Sync {
-        #[arg(
-            long,
-            conflicts_with = "install_only_system",
-            help = "Install missing system dependencies before syncing R packages"
-        )]
-        install_system: bool,
-
-        #[arg(
-            long,
-            conflicts_with = "install_system",
-            help = "Install only missing system dependencies and stop"
-        )]
-        install_only_system: bool,
-    },
+    Sync(SyncArgs),
 
     #[command(
         about = "Remove project library and caches",
@@ -138,6 +98,62 @@ pub struct InitArgs {
 
     #[arg(long, value_enum, help = "Package license")]
     pub license: Option<InitLicense>,
+}
+
+#[derive(Args, Debug)]
+pub struct AddArgs {
+    #[command(flatten)]
+    pub dependency_type: AddDependencyTypeArgs,
+
+    #[arg(
+        long,
+        help = "Do not install the current project; remove it if already installed"
+    )]
+    pub no_install_project: bool,
+
+    #[arg(
+        help = "Packages to add; quote constraints containing shell operators, for example 'digest@>=0.6.37'",
+        value_name = "PACKAGE[@CONSTRAINTVERSION]",
+        required = true
+    )]
+    pub packages: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoveArgs {
+    #[arg(
+        long,
+        help = "Do not install the current project; remove it if already installed"
+    )]
+    pub no_install_project: bool,
+
+    #[arg(
+        help = "Package names to remove from the project's dependencies",
+        value_name = "PACKAGE",
+        required = true
+    )]
+    pub packages: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    #[arg(
+        help = "Command and arguments to run inside the project environment",
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true
+    )]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SyncArgs {
+    #[arg(
+        long,
+        help = "Do not install the current project; remove it if already installed"
+    )]
+    pub no_install_project: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -387,17 +403,76 @@ mod tests {
             arguments.extend(flag);
             arguments.push("digest@>=0.6.37");
 
-            let Commands::Add {
+            let Commands::Add(AddArgs {
                 packages,
                 dependency_type,
-            } = parse(&arguments)
+                no_install_project,
+            }) = parse(&arguments)
             else {
                 panic!("add command should parse");
             };
 
             assert_eq!(packages, ["digest@>=0.6.37"]);
             assert_eq!(DependencyField::from(dependency_type), expected);
+            assert!(!no_install_project);
         }
+    }
+
+    #[test]
+    fn parses_project_installation_opt_out() {
+        assert!(matches!(
+            parse(&["rpx", "add", "--no-install-project", "digest"]),
+            Commands::Add(AddArgs {
+                no_install_project: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["rpx", "remove", "--no-install-project", "digest"]),
+            Commands::Remove(RemoveArgs {
+                no_install_project: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["rpx", "sync", "--no-install-project"]),
+            Commands::Sync(SyncArgs {
+                no_install_project: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn package_sync_help_lists_project_installation_opt_out() {
+        let mut command = Cli::command();
+
+        for subcommand in ["add", "remove", "sync"] {
+            let help = command
+                .find_subcommand_mut(subcommand)
+                .expect("command should exist")
+                .render_long_help()
+                .to_string();
+
+            assert!(help.contains("--no-install-project"));
+            assert!(help.contains("remove it if already installed"));
+        }
+    }
+
+    #[test]
+    fn rejects_system_dependency_flags() {
+        assert!(Cli::try_parse_from(["rpx", "init", "--system-dependencies", "skip"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rpx", "add", "--system-dependencies", "skip", "digest"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["rpx", "remove", "--system-dependencies", "skip", "digest"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["rpx", "sync", "--system-dependencies", "skip"]).is_err());
+        assert!(Cli::try_parse_from(["rpx", "sync", "--system-only"]).is_err());
+        assert!(Cli::try_parse_from(["rpx", "sync", "--install-system"]).is_err());
+        assert!(Cli::try_parse_from(["rpx", "sync", "--install-only-system"]).is_err());
     }
 
     #[test]

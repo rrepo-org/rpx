@@ -1,26 +1,48 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use r_description::RDescription;
+use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
+use r_description::{RDescription, Relation, VersionRequirement};
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
+    io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
 use crate::{
     description::{
-        ConfiguredRepository, DESCRIPTION_NAME, DescriptionParseError, configured_repositories,
-        project_dependencies,
+        ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
+        DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
+        configured_repositories, project_dependencies, read_description,
+        repositories_from_description,
     },
-    lockfile::{self, LOCKFILE_NAME, Lockfile},
-    repository::{GitRepository, PackageRepository, RepositoryError},
-    resolver::PackageVersion,
+    git,
+    lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
+    r::{BasePackagesError, RVersionError, r_version_async},
+    repository::{GitRepository, LocalRepository, PackageRepository, RepositoryError},
+    resolver::{PackageVersion, ProviderError, ResolutionError, resolve_from_registry},
 };
 
 pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
+
+static NEXT_STAGED_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum ProjectLibraryError {
+    #[error("failed to create project library at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::library_create_failed))]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum ProjectDiscoveryError {
@@ -81,32 +103,31 @@ pub fn find_project_root() -> Result<PathBuf, ProjectDiscoveryError> {
         .unwrap_or_else(|| Err(ProjectDiscoveryError::RootNotFound { start: current_dir }))
 }
 
+#[derive(Debug)]
+pub(crate) struct Project {
+    pub(crate) root: PathBuf,
+    pub(crate) description: RDescription,
+}
+
 #[derive(Debug, Error, Diagnostic)]
-pub enum LockedPackagesError {
-    #[error("DESCRIPTION at {} is missing required field {field}", path.display())]
-    #[diagnostic(code(rpx::project::description_missing_field))]
-    MissingField { path: PathBuf, field: &'static str },
+pub(crate) enum ProjectLoadError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Discovery(#[from] ProjectDiscoveryError),
 
-    #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::project::description_invalid_version))]
-    InvalidVersion { path: PathBuf, details: String },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Description(#[from] DescriptionReadError),
+}
 
-    #[error("invalid locked version {version} for {package}: {details}")]
-    #[diagnostic(code(rpx::project::locked_package_invalid_version))]
-    InvalidLockedVersion {
-        package: String,
-        version: String,
-        details: String,
-    },
+pub(crate) fn load_project() -> Result<Project, ProjectLoadError> {
+    let root = find_project_root()?;
+    let description = read_description(&root)?;
+    Ok(Project { root, description })
+}
 
-    #[error("locked package map key {key} does not match package field {package}")]
-    #[diagnostic(code(rpx::project::locked_package_name_mismatch))]
-    LockedPackageNameMismatch { key: String, package: String },
-
-    #[error("locked package {package} is missing source_url")]
-    #[diagnostic(code(rpx::project::locked_package_missing_source_url))]
-    MissingSourceUrl { package: String },
-
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum LockedPackagesError {
     #[error("locked package {package} references missing repository {repository}")]
     #[diagnostic(code(rpx::project::locked_package_repository_not_found))]
     RepositoryNotFound {
@@ -122,16 +143,12 @@ pub enum LockedPackagesError {
         source: RepositoryError,
     },
 
-    #[error("invalid locked repository URL {url}: {details}")]
-    #[diagnostic(code(rpx::project::locked_repository_invalid_url))]
-    InvalidRepository { url: String, details: String },
-
     #[error("failed to reconstruct DESCRIPTION for locked package {package}: {details}")]
     #[diagnostic(code(rpx::project::locked_package_description_invalid))]
     InvalidLockedDescription { package: String, details: String },
 }
 
-pub fn required_packages_from_lockfile(
+fn required_packages_from_lockfile(
     lockfile: &Lockfile,
 ) -> Result<RequiredPackages, LockedPackagesError> {
     let packages = lockfile
@@ -282,6 +299,632 @@ pub fn validate_locked_resolution(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolutionPolicy {
+    AlwaysResolve,
+    ReuseIfValid,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProjectResolution {
+    pub(crate) lockfile: Lockfile,
+    pub(crate) lockfile_changed: bool,
+    pub(crate) packages: RequiredPackages,
+    pub(crate) r_version: semver::Version,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum LoadProjectResolutionError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockfileRead(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedResolution(#[from] LockedResolutionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum ResolveProjectError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    PreviousLockfile(#[from] LockfileReadError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RVersion(#[from] RVersionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LockedPackages(#[from] LockedPackagesError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repositories(#[from] RepositoriesFromDescriptionError),
+
+    #[error("failed to reconstruct repository from rpx.lock: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    LockedRepository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("failed to load resolved package metadata: {source}")]
+    #[diagnostic(code(rpx::project::package_metadata_failed))]
+    PackageMetadata {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("package requirements are incompatible\n\n{explanation}")]
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Adjust package constraints in DESCRIPTION and try again.")
+    )]
+    NoSolution { explanation: String },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BasePackages(#[from] BasePackagesError),
+
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable {
+        repository: String,
+        #[source]
+        source: Box<ResolutionError>,
+    },
+
+    #[error("failed to resolve package set")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    Resolution {
+        #[source]
+        source: Box<ResolutionError>,
+    },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    BuildLockfile(#[from] LockfileBuildError),
+}
+
+impl From<ResolutionError> for ResolveProjectError {
+    fn from(error: ResolutionError) -> Self {
+        match error {
+            ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
+                derivation_tree.collapse_no_versions();
+                Self::NoSolution {
+                    explanation: DefaultStringReporter::report(&derivation_tree),
+                }
+            }
+            ResolutionError::BasePackages(source) => Self::BasePackages(source),
+            ResolutionError::Provider(provider) => {
+                let repository = match &provider {
+                    ProviderError::Repository(source)
+                    | ProviderError::DependencyMetadata { source, .. } => {
+                        inaccessible_git_repository(source).map(str::to_owned)
+                    }
+                };
+                let source = ResolutionError::Provider(provider);
+                if let Some(repository) = repository {
+                    Self::GitRepositoryUnavailable {
+                        repository,
+                        source: Box::new(source),
+                    }
+                } else {
+                    Self::Resolution {
+                        source: Box::new(source),
+                    }
+                }
+            }
+            source => Self::Resolution {
+                source: Box::new(source),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum LockfileBuildError {
+    #[error("repository operation failed: {source}")]
+    #[diagnostic(code(rpx::lock::repository_failed))]
+    Repository {
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("could not access Git repository {repository}")]
+    #[diagnostic(
+        code(rpx::lock::git_repository_unavailable),
+        help(
+            "Check that the repository exists. For private repositories, configure Git credentials."
+        )
+    )]
+    GitRepositoryUnavailable {
+        repository: String,
+        #[source]
+        source: RepositoryError,
+    },
+
+    #[error("repository {repository} cannot be written to the lockfile")]
+    #[diagnostic(code(rpx::lock::unsupported_repository))]
+    UnsupportedRepository { repository: String },
+
+    #[error("failed to read package requirements for {package}: {details}")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in the package DESCRIPTION.")
+    )]
+    InvalidPackageRequirements { package: String, details: String },
+}
+
+impl From<RepositoryError> for LockfileBuildError {
+    fn from(source: RepositoryError) -> Self {
+        if let Some(repository) = inaccessible_git_repository(&source) {
+            Self::GitRepositoryUnavailable {
+                repository: repository.to_string(),
+                source,
+            }
+        } else {
+            Self::Repository { source }
+        }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum ProjectWriteError {
+    #[error("failed to serialize rpx.lock: {source}")]
+    #[diagnostic(code(rpx::project::lockfile_serialize_failed))]
+    SerializeLockfile {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("failed to prepare project file at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::file_prepare_failed))]
+    Prepare {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to replace project file at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::project::file_replace_failed))]
+    Replace {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "DESCRIPTION was updated, but failed to replace rpx.lock at {}: {source}",
+        path.display()
+    )]
+    #[diagnostic(
+        code(rpx::project::metadata_partially_written),
+        help("Run `rpx lock` to bring rpx.lock back in sync with DESCRIPTION.")
+    )]
+    LockfileReplaceAfterDescription {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+struct PreparedProjectFile {
+    path: PathBuf,
+    destination: PathBuf,
+}
+
+impl PreparedProjectFile {
+    fn new(destination: PathBuf, contents: &[u8]) -> Result<Self, ProjectWriteError> {
+        let parent = destination
+            .parent()
+            .expect("project file destination should have a parent");
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("project file name should be valid UTF-8");
+
+        for _ in 0..100 {
+            let unique = NEXT_STAGED_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".{name}.rpx-stage-{}-{unique}", std::process::id()));
+            let mut file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(ProjectWriteError::Prepare {
+                        path: destination,
+                        source,
+                    });
+                }
+            };
+            if let Ok(metadata) = fs::metadata(&destination)
+                && let Err(source) = file.set_permissions(metadata.permissions())
+            {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(ProjectWriteError::Prepare {
+                    path: destination,
+                    source,
+                });
+            }
+            if let Err(source) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(ProjectWriteError::Prepare {
+                    path: destination,
+                    source,
+                });
+            }
+
+            return Ok(Self { path, destination });
+        }
+
+        Err(ProjectWriteError::Prepare {
+            path: destination,
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "failed to allocate a unique staging file",
+            ),
+        })
+    }
+
+    fn replace(mut self) -> Result<(), std::io::Error> {
+        #[cfg(windows)]
+        if self.destination.exists() {
+            fs::remove_file(&self.destination)?;
+        }
+        fs::rename(&self.path, &self.destination)?;
+        self.path = PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Drop for PreparedProjectFile {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) fn write_project_files(
+    root: &Path,
+    description: Option<&RDescription>,
+    lockfile: &Lockfile,
+) -> Result<(), ProjectWriteError> {
+    let mut lockfile_contents = serde_json::to_vec_pretty(lockfile)
+        .map_err(|source| ProjectWriteError::SerializeLockfile { source })?;
+    lockfile_contents.push(b'\n');
+
+    let description_path = root.join(DESCRIPTION_NAME);
+    let description = description
+        .map(|description| {
+            let contents = description.to_string();
+            PreparedProjectFile::new(description_path.clone(), contents.as_bytes())
+        })
+        .transpose()?;
+    let lockfile_path = root.join(LOCKFILE_NAME);
+    let lockfile = PreparedProjectFile::new(lockfile_path.clone(), &lockfile_contents)?;
+
+    if let Some(description) = description {
+        description
+            .replace()
+            .map_err(|source| ProjectWriteError::Replace {
+                path: description_path,
+                source,
+            })?;
+        lockfile.replace().map_err(
+            |source| ProjectWriteError::LockfileReplaceAfterDescription {
+                path: lockfile_path,
+                source,
+            },
+        )
+    } else {
+        lockfile
+            .replace()
+            .map_err(|source| ProjectWriteError::Replace {
+                path: lockfile_path,
+                source,
+            })
+    }
+}
+
+pub(crate) async fn resolve_project(
+    project: &Project,
+    policy: ResolutionPolicy,
+) -> Result<ProjectResolution, ResolveProjectError> {
+    let previous = read_previous_lockfile(&project.root)?;
+    let r_version = r_version_async().await?;
+    let requirements = project_dependencies(&project.root, &project.description)?;
+
+    let repositories = match (policy, previous.as_ref()) {
+        (ResolutionPolicy::ReuseIfValid, Some(lockfile)) => {
+            match validate_locked_resolution(
+                &project.root,
+                &project.description,
+                &r_version,
+                lockfile,
+            ) {
+                Ok(()) => {
+                    return Ok(ProjectResolution {
+                        lockfile: lockfile.clone(),
+                        lockfile_changed: false,
+                        packages: required_packages_from_lockfile(lockfile)?,
+                        r_version,
+                    });
+                }
+                Err(LockedResolutionError::Validation { failures })
+                    if failures.iter().all(|failure| {
+                        matches!(
+                            failure,
+                            LockedResolutionFailure::PackageRequirementsChanged
+                                | LockedResolutionFailure::RVersionChanged { .. }
+                        )
+                    }) =>
+                {
+                    lockfile
+                        .repos
+                        .iter()
+                        .map(<dyn PackageRepository>::from_lockfile)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|source| ResolveProjectError::LockedRepository { source })?
+                }
+                Err(LockedResolutionError::Validation { .. }) => {
+                    repositories_from_description(&project.root, &project.description).await?
+                }
+                Err(LockedResolutionError::Parse(source)) => return Err(source.into()),
+            }
+        }
+        (ResolutionPolicy::AlwaysResolve, _) | (ResolutionPolicy::ReuseIfValid, None) => {
+            repositories_from_description(&project.root, &project.description).await?
+        }
+    };
+    let preferred_versions = previous
+        .as_ref()
+        .map(|lockfile| {
+            lockfile
+                .packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let root = Arc::new(
+        LocalRepository::new(project.root.clone()).with_description(project.description.clone()),
+    );
+    let selected = resolve_from_registry(
+        repositories.clone(),
+        Arc::clone(&root),
+        requirements.clone(),
+        preferred_versions,
+    )
+    .await?;
+    let mut packages = hydrate_resolved_packages(selected)
+        .await
+        .map_err(|source| ResolveProjectError::PackageMetadata { source })?;
+    packages.retain(|_, (version, _)| !version.repository().equals(root.as_ref()));
+    let lockfile =
+        lockfile_from_resolution(requirements, &packages, &repositories, &r_version).await?;
+    let lockfile_changed = previous.as_ref() != Some(&lockfile);
+
+    Ok(ProjectResolution {
+        lockfile,
+        lockfile_changed,
+        packages,
+        r_version,
+    })
+}
+
+pub(crate) async fn load_project_resolution(
+    project: &Project,
+) -> Result<ProjectResolution, LoadProjectResolutionError> {
+    let lockfile = read_lockfile(&project.root)?;
+    let r_version = r_version_async().await?;
+    validate_locked_resolution(&project.root, &project.description, &r_version, &lockfile)?;
+    let packages = required_packages_from_lockfile(&lockfile)?;
+
+    Ok(ProjectResolution {
+        lockfile,
+        lockfile_changed: false,
+        packages,
+        r_version,
+    })
+}
+
+fn read_previous_lockfile(project_root: &PathBuf) -> Result<Option<Lockfile>, LockfileReadError> {
+    match read_lockfile(project_root) {
+        Ok(lockfile) => Ok(Some(lockfile)),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(LockfileReadError::OutdatedLockfile { .. }) => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+pub(crate) fn pin_unconstrained_dependencies(
+    project: &mut Project,
+    resolution: &mut ProjectResolution,
+    relations: &BTreeSet<Relation>,
+    dependency_field: DependencyField,
+) -> Result<(), DescriptionParseError> {
+    let pinned_relations = relations
+        .iter()
+        .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
+        .filter_map(|relation| {
+            resolution
+                .packages
+                .get(relation.package())
+                .map(|(selected, _)| (relation.package(), selected.version()))
+        })
+        .fold(relations.clone(), |mut relations, (package, version)| {
+            pin_dependency_to_resolved_major(&mut relations, package, version);
+            relations
+        });
+
+    if pinned_relations != *relations {
+        add_dependencies(
+            &project.root,
+            &mut project.description,
+            &pinned_relations,
+            dependency_field,
+        )?;
+        resolution.lockfile.requirements =
+            project_dependencies(&project.root, &project.description)?;
+        resolution.lockfile_changed = true;
+    }
+
+    Ok(())
+}
+
+fn pin_dependency_to_resolved_major(
+    relations: &mut BTreeSet<Relation>,
+    package: &str,
+    version: &r_description::Version,
+) {
+    let next_major = format!("{}.0.0", version.major() + 1)
+        .parse::<r_description::Version>()
+        .expect("next major version should be valid");
+
+    relations.retain(|relation| {
+        relation.package() != package || !matches!(relation.requirement(), VersionRequirement::Any)
+    });
+    relations.insert(
+        Relation::new(
+            package,
+            VersionRequirement::GreaterThanEqual(version.clone()),
+        )
+        .expect("previously parsed package name should remain valid"),
+    );
+    relations.insert(
+        Relation::new(package, VersionRequirement::LessThan(next_major))
+            .expect("previously parsed package name should remain valid"),
+    );
+}
+
+fn inaccessible_git_repository(error: &RepositoryError) -> Option<&str> {
+    let RepositoryError::Git { source, .. } = error else {
+        return None;
+    };
+    let git::GitError::Access { remote, .. } = source.as_ref() else {
+        return None;
+    };
+    Some(remote)
+}
+
+pub(crate) async fn hydrate_resolved_packages(
+    selected: BTreeMap<String, PackageVersion>,
+) -> Result<RequiredPackages, RepositoryError> {
+    // TODO: make sure the web requests are under a central semaphore in the repos not here
+    futures_util::future::join_all(selected.into_iter().map(|(name, version)| async move {
+        let description = version
+            .repository()
+            .description(&name, version.version())
+            .await?;
+
+        Ok::<_, RepositoryError>((name, (version, description)))
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
+pub(crate) async fn lockfile_from_resolution(
+    requirements: BTreeSet<r_description::Relation>,
+    resolved_packages: &RequiredPackages,
+    repositories: &[Arc<dyn PackageRepository>],
+    r_version: &semver::Version,
+) -> Result<Lockfile, LockfileBuildError> {
+    let repos = futures_util::future::join_all(
+        repositories
+            .iter()
+            .map(|repository| repository.to_lockfile()),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, RepositoryError>>()
+    .map_err(LockfileBuildError::from)?;
+
+    let packages = resolved_packages
+        .iter()
+        .map(|(name, (version, description))| {
+            let repository = repositories
+                .iter()
+                .zip(&repos)
+                .find(|(runtime, _)| version.repository().equals(runtime.as_ref()))
+                .map(|(_, locked)| locked.url().clone())
+                .ok_or_else(|| LockfileBuildError::UnsupportedRepository {
+                    repository: version.repository().to_string(),
+                })?;
+
+            let depends = description.depends().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
+                    details: source.to_string(),
+                }
+            })?;
+            let imports = description.imports().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
+                    details: source.to_string(),
+                }
+            })?;
+            let linking_to = description.linking_to().map_err(|source| {
+                LockfileBuildError::InvalidPackageRequirements {
+                    package: name.clone(),
+                    details: source.to_string(),
+                }
+            })?;
+            let dependencies = depends.chain(imports).chain(linking_to).collect();
+
+            Ok((
+                name.clone(),
+                lockfile::Package {
+                    version: version.version().clone(),
+                    repository,
+                    dependencies,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, LockfileBuildError>>()?;
+
+    Ok(Lockfile {
+        version: lockfile::LOCKFILE_VERSION,
+        revision: lockfile::LOCKFILE_REVISION,
+        r: r_version.clone(),
+        repos,
+        requirements,
+        packages,
+    })
+}
+
 fn locked_package_description(
     name: &str,
     package: &lockfile::Package,
@@ -298,28 +941,20 @@ fn locked_package_description(
     Ok(description)
 }
 
-#[derive(Debug, Error, Diagnostic)]
-pub enum ProjectPathError {
-    #[error("failed to get current directory: {source}")]
-    #[diagnostic(code(rpx::project::current_dir_failed))]
-    CurrentDirFailed {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("{DESCRIPTION_NAME} not found in current directory or any parent directory")]
-    #[diagnostic(code(rpx::project::description_not_found))]
-    DescriptionNotFound,
+pub fn project_library_path(path: &Path) -> PathBuf {
+    project_library_root_path(path).join("library")
 }
 
-pub fn project_library_path(path: &PathBuf) -> PathBuf {
-    let library_path = project_library_root_path(path).join("library");
-
-    fs::create_dir_all(&library_path).expect("failed to create project library");
-    library_path
+pub(crate) fn ensure_project_library(path: &Path) -> Result<PathBuf, ProjectLibraryError> {
+    let library_path = project_library_path(path);
+    fs::create_dir_all(&library_path).map_err(|source| ProjectLibraryError::Create {
+        path: library_path.clone(),
+        source,
+    })?;
+    Ok(library_path)
 }
 
-pub fn project_library_root_path(path: &PathBuf) -> PathBuf {
+pub fn project_library_root_path(path: &Path) -> PathBuf {
     let project_key = hash_path(path);
     project_dirs()
         .data_dir()
@@ -331,35 +966,8 @@ pub fn cache_dir_path() -> PathBuf {
     project_dirs().cache_dir().to_path_buf()
 }
 
-pub fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {
-    let path = project_dirs()
-        .cache_dir()
-        .join("artifacts")
-        .join(package)
-        .join(version)
-        .join(file_name);
-    ensure_parent_dir(&path);
-    path
-}
-
-pub fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
-    let path = project_dirs()
-        .cache_dir()
-        .join("build-temp")
-        .join(format!("{package}-{unique}"))
-        .join("library");
-    fs::create_dir_all(&path).expect("failed to create temporary build library");
-    path
-}
-
 fn project_dirs() -> ProjectDirs {
     ProjectDirs::from("de", "scalerail", "rpx").expect("failed to resolve rpx data directory")
-}
-
-fn ensure_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).expect("failed to create cache directory");
-    }
 }
 
 fn hash_path(path: &Path) -> String {
@@ -374,9 +982,9 @@ mod tests {
     use crate::{
         lockfile::{
             ArchiveSupport as LockedArchiveSupport, GitReference, LOCKFILE_REVISION,
-            LOCKFILE_VERSION, Package, Repository, SystemRequirements,
+            LOCKFILE_VERSION, Package, Repository,
         },
-        repository::{ArchiveSupport, CranRepository, RrepoRepository},
+        repository::{ArchiveSupport, CranRepository, RrepoRepository, built_in_repository},
     };
     use r_description::{Relation, Version};
     use std::{
@@ -399,12 +1007,88 @@ mod tests {
         env::temp_dir().join(unique(name))
     }
 
+    struct TestProject(PathBuf);
+
+    impl TestProject {
+        fn new(name: &str) -> Self {
+            let path = synthetic_path(name);
+            fs::create_dir_all(&path).expect("test project should be created");
+            fs::write(
+                path.join(DESCRIPTION_NAME),
+                "Package: project\nVersion: 1.0.0\n",
+            )
+            .expect("DESCRIPTION should be written");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            remove_dir_if_present(&self.0);
+        }
+    }
+
     fn url(value: &str) -> url::Url {
         value.parse().expect("URL should parse")
     }
 
     fn relation(value: &str) -> Relation {
         value.parse().expect("relation should parse")
+    }
+
+    #[test]
+    fn pins_unconstrained_dependency_to_resolved_major_range() {
+        let mut relations = BTreeSet::from([relation("digest"), relation("cli (>= 3.0.0)")]);
+
+        pin_dependency_to_resolved_major(&mut relations, "digest", &version("0.6.39"));
+
+        assert_eq!(
+            relations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["cli (>= 3.0.0)", "digest (< 1.0.0)", "digest (>= 0.6.39)"]
+        );
+    }
+
+    #[test]
+    fn pins_only_unconstrained_dependencies_present_in_resolution() {
+        let test_project = TestProject::new("pin-selected-dependencies");
+        let mut project = Project {
+            root: test_project.0.clone(),
+            description: read_description(&test_project.0)
+                .expect("project DESCRIPTION should parse"),
+        };
+        let mut resolution = resolution(lockfile());
+        resolution.packages.insert(
+            "digest".to_string(),
+            (
+                PackageVersion::new(version("0.6.39"), built_in_repository()),
+                Arc::new(project.description.clone()),
+            ),
+        );
+        let relations = BTreeSet::from([relation("digest"), relation("stats")]);
+
+        pin_unconstrained_dependencies(
+            &mut project,
+            &mut resolution,
+            &relations,
+            DependencyField::Suggests,
+        )
+        .expect("dependencies should be pinned");
+
+        let expected = BTreeSet::from([
+            relation("digest (>= 0.6.39)"),
+            relation("digest (< 1.0.0)"),
+            relation("stats"),
+        ]);
+        assert_eq!(
+            project_dependencies(&project.root, &project.description)
+                .expect("project dependencies should parse"),
+            expected
+        );
+        assert_eq!(resolution.lockfile.requirements, expected);
+        assert!(resolution.lockfile_changed);
     }
 
     fn version(value: &str) -> Version {
@@ -416,13 +1100,18 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             r: semver::Version::new(4, 5, 0),
-            sysreqs: SystemRequirements {
-                db_commit: None,
-                rules: BTreeMap::new(),
-            },
             repos: Vec::new(),
             requirements: BTreeSet::new(),
             packages: BTreeMap::new(),
+        }
+    }
+
+    fn resolution(lockfile: Lockfile) -> ProjectResolution {
+        ProjectResolution {
+            r_version: lockfile.r.clone(),
+            lockfile,
+            lockfile_changed: false,
+            packages: RequiredPackages::new(),
         }
     }
 
@@ -537,6 +1226,150 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("test directory should be removed");
         }
+    }
+
+    #[test]
+    fn writes_only_requested_project_files() {
+        let directory = TestProject::new("write-lockfile");
+        let description_before =
+            fs::read(directory.0.join(DESCRIPTION_NAME)).expect("DESCRIPTION should be readable");
+        let expected = lockfile();
+
+        write_project_files(&directory.0, None, &expected).expect("lockfile should be written");
+
+        assert_eq!(
+            fs::read(directory.0.join(DESCRIPTION_NAME))
+                .expect("DESCRIPTION should remain readable"),
+            description_before
+        );
+        assert_eq!(
+            read_lockfile(&directory.0).expect("lockfile should be readable"),
+            expected
+        );
+    }
+
+    #[test]
+    fn prepares_and_writes_project_files_without_consistency_validation() {
+        let directory = TestProject::new("write-metadata");
+        let description =
+            RDescription::parse("Package: changed\nVersion: 2.0.0\nImports: dependency\n");
+        let expected = lockfile();
+
+        write_project_files(&directory.0, Some(&description), &expected)
+            .expect("metadata should be written");
+
+        let description = read_description(&directory.0).expect("DESCRIPTION should be readable");
+        assert_eq!(
+            description.package().expect("Package should be valid"),
+            "changed"
+        );
+        assert_eq!(
+            read_lockfile(&directory.0).expect("lockfile should be readable"),
+            expected
+        );
+        assert!(
+            fs::read_dir(&directory.0)
+                .expect("project directory should be readable")
+                .all(|entry| {
+                    !entry
+                        .expect("project entry should be readable")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".rpx-stage-")
+                })
+        );
+    }
+
+    #[test]
+    fn project_file_preparation_error_names_destination() {
+        let root = synthetic_path("missing-write-root");
+        let expected = root.join(LOCKFILE_NAME);
+
+        let error = write_project_files(&root, None, &lockfile())
+            .expect_err("missing project root should prevent preparation");
+
+        assert!(matches!(
+            error,
+            ProjectWriteError::Prepare { path, .. } if path == expected
+        ));
+    }
+
+    #[test]
+    fn reports_lockfile_replacement_after_description_was_updated() {
+        let directory = TestProject::new("partial-project-write");
+        let lockfile_path = directory.0.join(LOCKFILE_NAME);
+        fs::create_dir(&lockfile_path).expect("lockfile destination should block replacement");
+        let description = RDescription::parse("Package: changed\nVersion: 2.0.0\n");
+
+        let error = write_project_files(&directory.0, Some(&description), &lockfile())
+            .expect_err("lockfile replacement should fail");
+
+        assert!(matches!(
+            error,
+            ProjectWriteError::LockfileReplaceAfterDescription { path, .. }
+                if path == lockfile_path
+        ));
+        assert_eq!(
+            read_description(&directory.0)
+                .expect("updated DESCRIPTION should be readable")
+                .package()
+                .expect("updated package name should be valid"),
+            "changed"
+        );
+    }
+
+    #[test]
+    fn treats_missing_and_outdated_lockfiles_as_absent_previous_resolutions() {
+        let directory = TestProject::new("previous-lockfile");
+        assert_eq!(
+            read_previous_lockfile(&directory.0).expect("missing lockfile should be accepted"),
+            None
+        );
+
+        fs::write(directory.0.join(LOCKFILE_NAME), r#"{"version": 0}"#)
+            .expect("outdated lockfile should be written");
+        assert_eq!(
+            read_previous_lockfile(&directory.0).expect("outdated lockfile should be accepted"),
+            None
+        );
+    }
+
+    #[test]
+    fn preserves_other_previous_lockfile_errors() {
+        let directory = TestProject::new("invalid-previous-lockfile");
+        fs::write(directory.0.join(LOCKFILE_NAME), "not JSON")
+            .expect("invalid lockfile should be written");
+
+        assert!(matches!(
+            read_previous_lockfile(&directory.0),
+            Err(LockfileReadError::Parse { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_resolution_requires_a_current_lockfile() {
+        let directory = TestProject::new("strict-lockfile");
+        let project = Project {
+            root: directory.0.clone(),
+            description: read_description(&directory.0).expect("DESCRIPTION should be readable"),
+        };
+
+        assert!(matches!(
+            load_project_resolution(&project).await,
+            Err(LoadProjectResolutionError::LockfileRead(
+                LockfileReadError::Read { source, .. }
+            ))
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        fs::write(directory.0.join(LOCKFILE_NAME), r#"{"version": 0}"#)
+            .expect("outdated lockfile should be written");
+        assert!(matches!(
+            load_project_resolution(&project).await,
+            Err(LoadProjectResolutionError::LockfileRead(
+                LockfileReadError::OutdatedLockfile { .. }
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -782,45 +1615,47 @@ mod tests {
     }
 
     #[test]
-    fn project_library_path_creates_root_and_library() {
+    fn project_library_path_does_not_create_root_or_library() {
         let project = synthetic_path("library-path");
         let root = project_library_root_path(&project);
         remove_dir_if_present(&root);
         let library = project_library_path(&project);
         assert_eq!(library, root.join("library"));
+        assert!(!root.exists());
+        assert!(!library.exists());
+    }
+
+    #[test]
+    fn ensure_project_library_creates_root_and_library() {
+        let project = synthetic_path("ensure-library");
+        let root = project_library_root_path(&project);
+        remove_dir_if_present(&root);
+        let library = ensure_project_library(&project).expect("project library should be created");
         assert!(root.is_dir());
         assert!(library.is_dir());
         remove_dir_if_present(&root);
     }
 
     #[test]
+    fn ensure_project_library_reports_creation_failure() {
+        let project = synthetic_path("ensure-library-error");
+        let root = project_library_root_path(&project);
+        remove_dir_if_present(&root);
+        fs::create_dir_all(root.parent().expect("library root should have a parent"))
+            .expect("library parent should be created");
+        fs::write(&root, "not a directory").expect("blocking file should be written");
+
+        let error = ensure_project_library(&project).expect_err("library creation should fail");
+
+        assert!(matches!(
+            error,
+            ProjectLibraryError::Create { path, .. } if path == root.join("library")
+        ));
+        fs::remove_file(root).expect("blocking file should be removed");
+    }
+
+    #[test]
     fn cache_dir_matches_project_directories() {
         assert_eq!(cache_dir_path(), project_dirs().cache_dir());
-    }
-
-    #[test]
-    fn artifact_cache_path_has_exact_layout_and_creates_only_parent() {
-        let package = unique("artifact");
-        let root = project_dirs().cache_dir().join("artifacts").join(&package);
-        remove_dir_if_present(&root);
-        let path = artifact_cache_path(&package, "1.2.3", "package.tar.gz");
-        assert_eq!(path, root.join("1.2.3").join("package.tar.gz"));
-        assert!(path.parent().expect("artifact should have parent").is_dir());
-        assert!(!path.exists());
-        remove_dir_if_present(&root);
-    }
-
-    #[test]
-    fn build_temp_library_path_has_exact_layout_and_creates_directory() {
-        let package = unique("build");
-        let root = project_dirs()
-            .cache_dir()
-            .join("build-temp")
-            .join(format!("{package}-unique"));
-        remove_dir_if_present(&root);
-        let path = build_temp_library_path(&package, "unique");
-        assert_eq!(path, root.join("library"));
-        assert!(path.is_dir());
-        remove_dir_if_present(&root);
     }
 }

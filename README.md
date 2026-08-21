@@ -53,6 +53,8 @@ rpx sync
 rpx status
 ```
 
+By default, `rpx add`, `rpx remove`, and `rpx sync` also install the current project package. Pass `--no-install-project` to any of those commands to synchronize only its dependencies.
+
 Commit both `DESCRIPTION` and `rpx.lock`.
 
 ## Documentation

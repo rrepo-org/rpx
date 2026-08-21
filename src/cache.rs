@@ -1,12 +1,31 @@
 use crate::project::cache_dir_path;
-use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    time::Duration,
 };
+
+pub(crate) fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {
+    let path = cache_dir_path()
+        .join("artifacts")
+        .join(package)
+        .join(version)
+        .join(file_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("failed to create cache directory");
+    }
+    path
+}
+
+pub(crate) fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
+    let path = cache_dir_path()
+        .join("build-temp")
+        .join(format!("{package}-{unique}"))
+        .join("library");
+    fs::create_dir_all(&path).expect("failed to create temporary build library");
+    path
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CompiledPackageCacheKey {
@@ -89,55 +108,6 @@ pub async fn store(key: &CompiledPackageCacheKey, package_dir: &Path) -> Result<
         .map_err(|error| format!("failed to join cache store task: {error}"))?
 }
 
-pub fn repository_metadata_cache_path(repository_url: &str, parts: &[&str]) -> PathBuf {
-    let mut path = cache_dir_path()
-        .join("metadata")
-        .join("repositories")
-        .join(hash_string(repository_url));
-
-    for part in parts {
-        path = path.join(part);
-    }
-
-    path
-}
-
-pub async fn read_json_metadata_cache<T>(path: &Path, ttl: Option<Duration>) -> Option<T>
-where
-    T: DeserializeOwned,
-{
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    if let Some(ttl) = ttl
-        && metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > ttl)
-    {
-        return None;
-    }
-
-    let contents = tokio::fs::read_to_string(path).await.ok()?;
-    serde_json::from_str(&contents).ok()
-}
-
-pub async fn write_json_metadata_cache<T>(path: &Path, value: &T) -> Result<(), String>
-where
-    T: Serialize,
-{
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("failed to create metadata cache directory: {error}"))?;
-    }
-
-    let contents = serde_json::to_string(value)
-        .map_err(|error| format!("failed to serialize metadata cache: {error}"))?;
-    tokio::fs::write(path, contents)
-        .await
-        .map_err(|error| format!("failed to write metadata cache: {error}"))
-}
-
 fn host_platform_key() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -147,12 +117,6 @@ fn package_cache_path(key: &CompiledPackageCacheKey) -> PathBuf {
         .join("builds")
         .join(key.cache_dir_name())
         .join("package")
-}
-
-fn hash_string(value: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 fn copy_package_dir(source: &Path, destination: &Path) -> Result<(), String> {
@@ -189,4 +153,51 @@ fn copy_package_dir(source: &Path, destination: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+
+    fn unique(name: &str) -> String {
+        format!(
+            "rpx-cache-test-{name}-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn remove_dir_if_present(path: &Path) {
+        if path.exists() {
+            fs::remove_dir_all(path).expect("test cache directory should be removed");
+        }
+    }
+
+    #[test]
+    fn artifact_cache_path_has_exact_layout_and_creates_only_parent() {
+        let package = unique("artifact");
+        let root = cache_dir_path().join("artifacts").join(&package);
+        remove_dir_if_present(&root);
+        let path = artifact_cache_path(&package, "1.2.3", "package.tar.gz");
+        assert_eq!(path, root.join("1.2.3").join("package.tar.gz"));
+        assert!(path.parent().expect("artifact should have parent").is_dir());
+        assert!(!path.exists());
+        remove_dir_if_present(&root);
+    }
+
+    #[test]
+    fn build_temp_library_path_has_exact_layout_and_creates_directory() {
+        let package = unique("build");
+        let root = cache_dir_path()
+            .join("build-temp")
+            .join(format!("{package}-unique"));
+        remove_dir_if_present(&root);
+        let path = build_temp_library_path(&package, "unique");
+        assert_eq!(path, root.join("library"));
+        assert!(path.is_dir());
+        remove_dir_if_present(&root);
+    }
 }
