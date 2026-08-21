@@ -1,7 +1,7 @@
 use crate::{
     LockError, SyncError,
     output::status,
-    project::{ProjectLoadError, ResolutionPolicy, load_project, resolve_project},
+    project::{ProjectLoadError, load_project, load_project_resolution},
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
 use miette::Diagnostic;
@@ -28,7 +28,7 @@ pub(crate) async fn run(
     install_only_system: bool,
 ) -> Result<(), Error> {
     let project = load_project()?;
-    let resolution = resolve_project(&project, ResolutionPolicy::RequireValid).await?;
+    let resolution = load_project_resolution(&project).await?;
     sync_resolved_project(
         &project,
         resolution,

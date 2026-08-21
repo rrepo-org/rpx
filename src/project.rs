@@ -101,25 +101,12 @@ pub fn find_project_root() -> Result<PathBuf, ProjectDiscoveryError> {
 pub(crate) struct Project {
     pub(crate) root: PathBuf,
     pub(crate) description: RDescription,
-    pub(crate) lockfile: LockfileState,
 }
 
 #[derive(Debug)]
-pub(crate) enum LockfileState {
-    Missing,
-    Outdated,
-    Present(Lockfile),
-}
-
-#[derive(Debug)]
-pub(crate) enum LockfileAssessment<'a> {
-    Missing,
-    Outdated,
-    Valid {
-        lockfile: &'a Lockfile,
-    },
+pub(crate) enum LockfileAssessment {
+    Valid,
     Stale {
-        lockfile: &'a Lockfile,
         failures: Vec<LockedResolutionFailure>,
     },
 }
@@ -133,31 +120,12 @@ pub(crate) enum ProjectLoadError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Description(#[from] DescriptionReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Lockfile(#[from] LockfileReadError),
 }
 
 pub(crate) fn load_project() -> Result<Project, ProjectLoadError> {
     let root = find_project_root()?;
     let description = read_description(&root)?;
-    let lockfile = match read_lockfile(&root) {
-        Ok(lockfile) => LockfileState::Present(lockfile),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            LockfileState::Missing
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => LockfileState::Outdated,
-        Err(source) => return Err(source.into()),
-    };
-
-    Ok(Project {
-        root,
-        description,
-        lockfile,
-    })
+    Ok(Project { root, description })
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -337,20 +305,14 @@ impl Project {
     pub(crate) fn assess_lockfile(
         &self,
         r_version: &semver::Version,
-    ) -> Result<LockfileAssessment<'_>, LockedResolutionError> {
-        match &self.lockfile {
-            LockfileState::Missing => Ok(LockfileAssessment::Missing),
-            LockfileState::Outdated => Ok(LockfileAssessment::Outdated),
-            LockfileState::Present(lockfile) => {
-                match validate_locked_resolution(&self.root, &self.description, r_version, lockfile)
-                {
-                    Ok(()) => Ok(LockfileAssessment::Valid { lockfile }),
-                    Err(LockedResolutionError::Validation { failures }) => {
-                        Ok(LockfileAssessment::Stale { lockfile, failures })
-                    }
-                    Err(source) => Err(source),
-                }
+        lockfile: &Lockfile,
+    ) -> Result<LockfileAssessment, LockedResolutionError> {
+        match validate_locked_resolution(&self.root, &self.description, r_version, lockfile) {
+            Ok(()) => Ok(LockfileAssessment::Valid),
+            Err(LockedResolutionError::Validation { failures }) => {
+                Ok(LockfileAssessment::Stale { failures })
             }
+            Err(source) => Err(source),
         }
     }
 }
@@ -359,12 +321,12 @@ impl Project {
 pub(crate) enum ResolutionPolicy {
     AlwaysResolve,
     ReuseIfValid,
-    RequireValid,
 }
 
 #[derive(Debug)]
 pub(crate) struct ProjectResolution {
     pub(crate) lockfile: Lockfile,
+    pub(crate) lockfile_changed: bool,
     pub(crate) packages: RequiredPackages,
     pub(crate) r_version: semver::Version,
 }
@@ -505,68 +467,49 @@ pub(crate) async fn resolve_project(
     project: &Project,
     policy: ResolutionPolicy,
 ) -> Result<ProjectResolution, LockError> {
-    if policy == ResolutionPolicy::RequireValid {
-        let reloaded_lockfile;
-        let lockfile = match &project.lockfile {
-            LockfileState::Missing | LockfileState::Outdated => {
-                reloaded_lockfile = read_lockfile(&project.root)?;
-                &reloaded_lockfile
-            }
-            LockfileState::Present(lockfile) => lockfile,
-        };
-        let r_version = r_version_async().await?;
-        validate_locked_resolution(&project.root, &project.description, &r_version, lockfile)?;
-        return Ok(ProjectResolution {
-            lockfile: lockfile.clone(),
-            packages: required_packages_from_lockfile(lockfile)?,
-            r_version,
-        });
-    }
-
+    let previous = read_previous_lockfile(&project.root)?;
     let r_version = r_version_async().await?;
     let requirements = project_dependencies(&project.root, &project.description)?;
-    let previous = match &project.lockfile {
-        LockfileState::Present(lockfile) => Some(lockfile),
-        LockfileState::Missing | LockfileState::Outdated => None,
-    };
 
     let repositories = match policy {
         ResolutionPolicy::AlwaysResolve => {
             repositories_from_description(&project.root, &project.description).await?
         }
-        ResolutionPolicy::ReuseIfValid => match project.assess_lockfile(&r_version)? {
-            LockfileAssessment::Valid { lockfile } => {
-                return Ok(ProjectResolution {
-                    lockfile: lockfile.clone(),
-                    packages: required_packages_from_lockfile(lockfile)?,
-                    r_version,
-                });
-            }
-            LockfileAssessment::Stale { lockfile, failures }
-                if failures.iter().all(|failure| {
-                    matches!(
-                        failure,
-                        LockedResolutionFailure::PackageRequirementsChanged
-                            | LockedResolutionFailure::RVersionChanged { .. }
-                    )
-                }) =>
-            {
-                lockfile
-                    .repos
-                    .iter()
-                    .map(<dyn PackageRepository>::from_lockfile)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(lock_error_from_repository)?
-            }
-            LockfileAssessment::Missing
-            | LockfileAssessment::Outdated
-            | LockfileAssessment::Stale { .. } => {
-                repositories_from_description(&project.root, &project.description).await?
-            }
+        ResolutionPolicy::ReuseIfValid => match previous.as_ref() {
+            Some(lockfile) => match project.assess_lockfile(&r_version, lockfile)? {
+                LockfileAssessment::Valid => {
+                    return Ok(ProjectResolution {
+                        lockfile: lockfile.clone(),
+                        lockfile_changed: false,
+                        packages: required_packages_from_lockfile(lockfile)?,
+                        r_version,
+                    });
+                }
+                LockfileAssessment::Stale { failures }
+                    if failures.iter().all(|failure| {
+                        matches!(
+                            failure,
+                            LockedResolutionFailure::PackageRequirementsChanged
+                                | LockedResolutionFailure::RVersionChanged { .. }
+                        )
+                    }) =>
+                {
+                    lockfile
+                        .repos
+                        .iter()
+                        .map(<dyn PackageRepository>::from_lockfile)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(lock_error_from_repository)?
+                }
+                LockfileAssessment::Stale { .. } => {
+                    repositories_from_description(&project.root, &project.description).await?
+                }
+            },
+            None => repositories_from_description(&project.root, &project.description).await?,
         },
-        ResolutionPolicy::RequireValid => unreachable!("strict resolution returned above"),
     };
     let preferred_versions = previous
+        .as_ref()
         .map(|lockfile| {
             lockfile
                 .packages
@@ -588,7 +531,7 @@ pub(crate) async fn resolve_project(
     .map_err(lock_error_from_resolution)?;
     let mut packages = hydrate_resolved_packages(selected).await?;
     packages.retain(|_, (version, _)| !version.repository().equals(root.as_ref()));
-    let sysreq_db = load_sysreq_snapshot_for_lock(previous).await;
+    let sysreq_db = load_sysreq_snapshot_for_lock(previous.as_ref()).await;
     let lockfile = lockfile_from_resolution(
         requirements,
         &packages,
@@ -597,12 +540,43 @@ pub(crate) async fn resolve_project(
         &r_version,
     )
     .await?;
+    let lockfile_changed = previous.as_ref() != Some(&lockfile);
 
     Ok(ProjectResolution {
         lockfile,
+        lockfile_changed,
         packages,
         r_version,
     })
+}
+
+pub(crate) async fn load_project_resolution(
+    project: &Project,
+) -> Result<ProjectResolution, LockError> {
+    let lockfile = read_lockfile(&project.root)?;
+    let r_version = r_version_async().await?;
+    validate_locked_resolution(&project.root, &project.description, &r_version, &lockfile)?;
+    let packages = required_packages_from_lockfile(&lockfile)?;
+
+    Ok(ProjectResolution {
+        lockfile,
+        lockfile_changed: false,
+        packages,
+        r_version,
+    })
+}
+
+fn read_previous_lockfile(project_root: &PathBuf) -> Result<Option<Lockfile>, LockfileReadError> {
+    match read_lockfile(project_root) {
+        Ok(lockfile) => Ok(Some(lockfile)),
+        Err(LockfileReadError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(LockfileReadError::OutdatedLockfile { .. }) => Ok(None),
+        Err(source) => Err(source),
+    }
 }
 
 pub(crate) fn pin_unconstrained_dependencies(
@@ -634,6 +608,7 @@ pub(crate) fn pin_unconstrained_dependencies(
         )?;
         resolution.lockfile.requirements =
             project_dependencies(&project.root, &project.description)?;
+        resolution.lockfile_changed = true;
     }
 
     Ok(())
@@ -1019,7 +994,6 @@ mod tests {
             root: test_project.0.clone(),
             description: read_description(&test_project.0)
                 .expect("project DESCRIPTION should parse"),
-            lockfile: LockfileState::Missing,
         };
         let mut resolution = resolution(lockfile());
         resolution.packages.insert(
@@ -1050,6 +1024,7 @@ mod tests {
             expected
         );
         assert_eq!(resolution.lockfile.requirements, expected);
+        assert!(resolution.lockfile_changed);
     }
 
     fn version(value: &str) -> Version {
@@ -1075,6 +1050,7 @@ mod tests {
         ProjectResolution {
             r_version: lockfile.r.clone(),
             lockfile,
+            lockfile_changed: false,
             packages: RequiredPackages::new(),
         }
     }
@@ -1198,7 +1174,6 @@ mod tests {
         let project = Project {
             root: directory.0.clone(),
             description: read_description(&directory.0).expect("DESCRIPTION should be readable"),
-            lockfile: LockfileState::Missing,
         };
         let description_before =
             fs::read(directory.0.join(DESCRIPTION_NAME)).expect("DESCRIPTION should be readable");
@@ -1226,7 +1201,6 @@ mod tests {
             description: RDescription::parse(
                 "Package: changed\nVersion: 2.0.0\nImports: dependency\n",
             ),
-            lockfile: LockfileState::Missing,
         };
         let expected = lockfile();
 
@@ -1256,41 +1230,67 @@ mod tests {
     }
 
     #[test]
-    fn assesses_non_present_lockfile_states_without_validation() {
-        let description = RDescription::parse("Package: project\nVersion: 1.0.0\n");
-        for lockfile in [LockfileState::Missing, LockfileState::Outdated] {
-            let project = Project {
-                root: synthetic_path("assess-non-present"),
-                description: description.clone(),
-                lockfile,
-            };
-            let assessment = project
-                .assess_lockfile(&semver::Version::new(4, 5, 0))
-                .expect("non-present lockfile should be assessed");
-            assert!(matches!(
-                assessment,
-                LockfileAssessment::Missing | LockfileAssessment::Outdated
-            ));
-        }
+    fn treats_missing_and_outdated_lockfiles_as_absent_previous_resolutions() {
+        let directory = TestProject::new("previous-lockfile");
+        assert_eq!(
+            read_previous_lockfile(&directory.0).expect("missing lockfile should be accepted"),
+            None
+        );
+
+        fs::write(directory.0.join(LOCKFILE_NAME), r#"{"version": 0}"#)
+            .expect("outdated lockfile should be written");
+        assert_eq!(
+            read_previous_lockfile(&directory.0).expect("outdated lockfile should be accepted"),
+            None
+        );
+    }
+
+    #[test]
+    fn preserves_other_previous_lockfile_errors() {
+        let directory = TestProject::new("invalid-previous-lockfile");
+        fs::write(directory.0.join(LOCKFILE_NAME), "not JSON")
+            .expect("invalid lockfile should be written");
+
+        assert!(matches!(
+            read_previous_lockfile(&directory.0),
+            Err(LockfileReadError::Parse { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_resolution_requires_a_current_lockfile() {
+        let directory = TestProject::new("strict-lockfile");
+        let project = Project {
+            root: directory.0.clone(),
+            description: read_description(&directory.0).expect("DESCRIPTION should be readable"),
+        };
+
+        assert!(matches!(
+            load_project_resolution(&project).await,
+            Err(LockError::LockfileRead(LockfileReadError::Read { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        fs::write(directory.0.join(LOCKFILE_NAME), r#"{"version": 0}"#)
+            .expect("outdated lockfile should be written");
+        assert!(matches!(
+            load_project_resolution(&project).await,
+            Err(LockError::LockfileRead(
+                LockfileReadError::OutdatedLockfile { .. }
+            ))
+        ));
     }
 
     #[test]
     fn assesses_matching_lockfile_as_valid() {
         let (root, description, r_version, lockfile) = validation_fixture();
-        let project = Project {
-            root,
-            description,
-            lockfile: LockfileState::Present(lockfile.clone()),
-        };
+        let project = Project { root, description };
 
         let assessment = project
-            .assess_lockfile(&r_version)
+            .assess_lockfile(&r_version, &lockfile)
             .expect("matching lockfile should be assessed");
 
-        assert!(matches!(
-            assessment,
-            LockfileAssessment::Valid { lockfile: actual } if actual == &lockfile
-        ));
+        assert!(matches!(assessment, LockfileAssessment::Valid));
     }
 
     #[test]
@@ -1298,24 +1298,15 @@ mod tests {
         let (root, description, r_version, mut lockfile) = validation_fixture();
         lockfile.requirements = BTreeSet::from([relation("different")]);
         lockfile.r = semver::Version::new(4, 4, 0);
-        let project = Project {
-            root,
-            description,
-            lockfile: LockfileState::Present(lockfile.clone()),
-        };
+        let project = Project { root, description };
 
         let assessment = project
-            .assess_lockfile(&r_version)
+            .assess_lockfile(&r_version, &lockfile)
             .expect("stale lockfile should be assessed");
 
-        let LockfileAssessment::Stale {
-            lockfile: actual,
-            failures,
-        } = assessment
-        else {
+        let LockfileAssessment::Stale { failures } = assessment else {
             panic!("lockfile should be stale");
         };
-        assert_eq!(actual, &lockfile);
         assert_eq!(failures.len(), 2);
         assert!(matches!(
             failures[0],

@@ -2,8 +2,8 @@ use crate::{
     LockError,
     output::status,
     project::{
-        LockfileState, ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project,
-        resolve_project, write_project_lockfile,
+        ProjectLoadError, ProjectWriteError, ResolutionPolicy, load_project, resolve_project,
+        write_project_lockfile,
     },
 };
 use miette::Diagnostic;
@@ -27,10 +27,7 @@ pub(crate) enum Error {
 pub(crate) async fn run() -> Result<(), Error> {
     let project = load_project()?;
     let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
-    let changed = match &project.lockfile {
-        LockfileState::Present(lockfile) => lockfile != &resolution.lockfile,
-        LockfileState::Missing | LockfileState::Outdated => true,
-    };
+    let changed = resolution.lockfile_changed;
     write_project_lockfile(&project, &resolution)?;
 
     if changed {

@@ -3,9 +3,7 @@ use crate::{
     description::{DescriptionParseError, root_package},
     host_supports_system_sync,
     output::status,
-    project::{
-        ProjectLoadError, ResolutionPolicy, load_project, project_library_path, resolve_project,
-    },
+    project::{ProjectLoadError, load_project, load_project_resolution, project_library_path},
     r::{BasePackagesError, base_packages, installed_packages},
     system_plan_from_lockfile,
 };
@@ -120,7 +118,7 @@ pub(crate) enum Error {
 
 pub(crate) async fn run() -> Result<(), Error> {
     let project = load_project()?;
-    let resolution = resolve_project(&project, ResolutionPolicy::RequireValid).await?;
+    let resolution = load_project_resolution(&project).await?;
     let lockfile = &resolution.lockfile;
     let base_packages = base_packages().await?;
 

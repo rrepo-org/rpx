@@ -13,17 +13,16 @@ use crate::{
         set_base_repository,
     },
     http,
-    lockfile::{LockfileReadError, read_lockfile},
     output::status,
     project::{
-        LockfileState, Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy,
-        find_project_root, resolve_project, write_project_metadata,
+        Project, ProjectDiscoveryError, ProjectWriteError, ResolutionPolicy, find_project_root,
+        resolve_project, write_project_metadata,
     },
     repository::{RepositoryError, built_in_repository_url, parse_repository_url},
 };
 use miette::Diagnostic;
 use r_description::{FieldMutationError, PositionedRemoteParseError, RDescription, Remote, Url};
-use std::path::PathBuf;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error, Diagnostic)]
@@ -58,10 +57,6 @@ pub(crate) enum Error {
         #[source]
         source: PositionedRemoteParseError,
     },
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockfileRead(#[from] LockfileReadError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -277,28 +272,14 @@ fn list(args: RepoListArgs) -> Result<(), Error> {
     Ok(())
 }
 
-async fn relock_and_write(path: &PathBuf, description: &RDescription) -> Result<(), Error> {
+async fn relock_and_write(path: &Path, description: &RDescription) -> Result<(), Error> {
     let project = Project {
-        root: path.clone(),
+        root: path.to_path_buf(),
         description: description.clone(),
-        lockfile: optional_lockfile(path)?,
     };
     let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
     write_project_metadata(&project, &resolution)?;
     Ok(())
-}
-
-fn optional_lockfile(path: &PathBuf) -> Result<LockfileState, Error> {
-    match read_lockfile(path) {
-        Ok(lockfile) => Ok(LockfileState::Present(lockfile)),
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(LockfileState::Missing)
-        }
-        Err(LockfileReadError::OutdatedLockfile { .. }) => Ok(LockfileState::Outdated),
-        Err(source) => Err(source.into()),
-    }
 }
 
 fn repository_url(action: &'static str, value: &str) -> Result<Url, Error> {

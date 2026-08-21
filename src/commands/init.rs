@@ -8,8 +8,8 @@ use crate::{
     git,
     output::status,
     project::{
-        LockfileState, Project, ProjectWriteError, ResolutionPolicy,
-        pin_unconstrained_dependencies, resolve_project, write_project_metadata,
+        Project, ProjectWriteError, ResolutionPolicy, pin_unconstrained_dependencies,
+        resolve_project, write_project_metadata,
     },
     sync::{ProjectPackageMode, SyncProjectOptions, SystemSyncMode, sync_resolved_project},
 };
@@ -429,7 +429,6 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     let mut project = Project {
         root: target.clone(),
         description,
-        lockfile: LockfileState::Missing,
     };
     let mut resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
     pin_unconstrained_dependencies(
