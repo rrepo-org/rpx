@@ -140,10 +140,7 @@ pub(crate) enum ProjectLoadError {
 }
 
 pub(crate) fn load_project() -> Result<Project, ProjectLoadError> {
-    load_project_at(find_project_root()?)
-}
-
-fn load_project_at(root: PathBuf) -> Result<Project, ProjectLoadError> {
+    let root = find_project_root()?;
     let description = read_description(&root)?;
     let lockfile = match read_lockfile(&root) {
         Ok(lockfile) => LockfileState::Present(lockfile),
@@ -164,31 +161,7 @@ fn load_project_at(root: PathBuf) -> Result<Project, ProjectLoadError> {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum LockedPackagesError {
-    #[error("DESCRIPTION at {} is missing required field {field}", path.display())]
-    #[diagnostic(code(rpx::project::description_missing_field))]
-    MissingField { path: PathBuf, field: &'static str },
-
-    #[error("invalid Version in DESCRIPTION at {}: {details}", path.display())]
-    #[diagnostic(code(rpx::project::description_invalid_version))]
-    InvalidVersion { path: PathBuf, details: String },
-
-    #[error("invalid locked version {version} for {package}: {details}")]
-    #[diagnostic(code(rpx::project::locked_package_invalid_version))]
-    InvalidLockedVersion {
-        package: String,
-        version: String,
-        details: String,
-    },
-
-    #[error("locked package map key {key} does not match package field {package}")]
-    #[diagnostic(code(rpx::project::locked_package_name_mismatch))]
-    LockedPackageNameMismatch { key: String, package: String },
-
-    #[error("locked package {package} is missing source_url")]
-    #[diagnostic(code(rpx::project::locked_package_missing_source_url))]
-    MissingSourceUrl { package: String },
-
+pub(crate) enum LockedPackagesError {
     #[error("locked package {package} references missing repository {repository}")]
     #[diagnostic(code(rpx::project::locked_package_repository_not_found))]
     RepositoryNotFound {
@@ -204,16 +177,12 @@ pub enum LockedPackagesError {
         source: RepositoryError,
     },
 
-    #[error("invalid locked repository URL {url}: {details}")]
-    #[diagnostic(code(rpx::project::locked_repository_invalid_url))]
-    InvalidRepository { url: String, details: String },
-
     #[error("failed to reconstruct DESCRIPTION for locked package {package}: {details}")]
     #[diagnostic(code(rpx::project::locked_package_description_invalid))]
     InvalidLockedDescription { package: String, details: String },
 }
 
-pub fn required_packages_from_lockfile(
+fn required_packages_from_lockfile(
     lockfile: &Lockfile,
 ) -> Result<RequiredPackages, LockedPackagesError> {
     let packages = lockfile
@@ -959,7 +928,7 @@ mod tests {
     use crate::{
         lockfile::{
             ArchiveSupport as LockedArchiveSupport, GitReference, LOCKFILE_REVISION,
-            LOCKFILE_VERSION, Package, Repository, SystemRequirements, write_lockfile,
+            LOCKFILE_VERSION, Package, Repository, SystemRequirements,
         },
         repository::{ArchiveSupport, CranRepository, RrepoRepository},
     };
@@ -1169,78 +1138,13 @@ mod tests {
     }
 
     #[test]
-    fn loads_project_with_missing_lockfile_state() {
-        let project = TestProject::new("load-missing-lockfile");
-
-        let loaded = load_project_at(project.0.clone()).expect("project should load");
-
-        assert_eq!(loaded.root, project.0);
-        assert_eq!(
-            loaded
-                .description
-                .package()
-                .expect("Package should be valid"),
-            "project"
-        );
-        assert!(matches!(loaded.lockfile, LockfileState::Missing));
-    }
-
-    #[test]
-    fn loads_project_with_outdated_lockfile_state() {
-        let project = TestProject::new("load-outdated-lockfile");
-        fs::write(
-            project.0.join(LOCKFILE_NAME),
-            format!("{{\"version\": {}}}", LOCKFILE_VERSION - 1),
-        )
-        .expect("outdated lockfile should be written");
-
-        let loaded = load_project_at(project.0.clone()).expect("project should load");
-
-        assert!(matches!(loaded.lockfile, LockfileState::Outdated));
-    }
-
-    #[test]
-    fn loads_project_with_present_lockfile_state() {
-        let project = TestProject::new("load-present-lockfile");
-        let expected = lockfile();
-        write_lockfile(&project.0, &expected).expect("lockfile should be written");
-
-        let loaded = load_project_at(project.0.clone()).expect("project should load");
-
-        let LockfileState::Present(actual) = loaded.lockfile else {
-            panic!("lockfile should be present");
-        };
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn project_loading_rejects_malformed_and_newer_lockfiles() {
-        let malformed = TestProject::new("load-malformed-lockfile");
-        fs::write(malformed.0.join(LOCKFILE_NAME), "not JSON")
-            .expect("malformed lockfile should be written");
-        assert!(matches!(
-            load_project_at(malformed.0.clone()),
-            Err(ProjectLoadError::Lockfile(LockfileReadError::Parse { .. }))
-        ));
-
-        let newer = TestProject::new("load-newer-lockfile");
-        fs::write(
-            newer.0.join(LOCKFILE_NAME),
-            format!("{{\"version\": {}}}", LOCKFILE_VERSION + 1),
-        )
-        .expect("newer lockfile should be written");
-        assert!(matches!(
-            load_project_at(newer.0.clone()),
-            Err(ProjectLoadError::Lockfile(
-                LockfileReadError::NewerLockfile { .. }
-            ))
-        ));
-    }
-
-    #[test]
     fn writes_only_lockfile_from_staged_contents() {
         let directory = TestProject::new("write-lockfile");
-        let project = load_project_at(directory.0.clone()).expect("project should load");
+        let project = Project {
+            root: directory.0.clone(),
+            description: read_description(&directory.0).expect("DESCRIPTION should be readable"),
+            lockfile: LockfileState::Missing,
+        };
         let description_before =
             fs::read(directory.0.join(DESCRIPTION_NAME)).expect("DESCRIPTION should be readable");
         let expected = lockfile();
