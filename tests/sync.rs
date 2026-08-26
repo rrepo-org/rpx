@@ -124,6 +124,50 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
 }
 
 #[test]
+fn sync_installs_project_without_mutating_its_sources() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-clean-sources";
+    create_package_project(&container, project_path);
+    let add_build_sources = format!(
+        "cd {project_path} && mkdir src && cat > configure <<'EOF'\n#!/bin/sh\ntouch configured-during-install\nEOF\nchmod +x configure && cat > src/native.c <<'EOF'\nvoid native(void) {{}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_build_sources);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
+
+    let assert_clean = format!(
+        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- /tmp/rpx-build-* && test ! -e \"$1\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_clean);
+    assert_eq!(
+        exit_code, 0,
+        "project sources or temporary build files were left behind\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let fail_configure = format!(
+        "cd {project_path} && cat > configure <<'EOF'\n#!/bin/sh\ntouch configured-during-install\nexit 1\nEOF\nchmod +x configure"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &fail_configure);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_clean);
+    assert_eq!(
+        exit_code, 0,
+        "failed installation left project sources or temporary build files behind\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn sync_without_project_installs_dependencies_and_removes_project() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-without-project";

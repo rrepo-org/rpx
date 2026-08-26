@@ -310,6 +310,8 @@ async fn install_required_packages(
                     install_package_directory(
                         &project_path,
                         &install_project_library,
+                        &package_name,
+                        package_version.version().as_ref(),
                         "project package",
                     )
                     .await
@@ -379,6 +381,8 @@ async fn install_required_packages(
                     install_package_directory(
                         &package_root,
                         &install_project_library,
+                        &package_name,
+                        package_version.version().as_ref(),
                         &format!("{package_name} from Git"),
                     )
                     .await

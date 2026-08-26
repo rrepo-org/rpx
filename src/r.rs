@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Output,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -40,25 +41,40 @@ pub enum PackageInstallError {
     #[diagnostic(code(rpx::install::invalid_path))]
     InvalidPath { path: PathBuf },
 
-    #[error("failed to install {target}: {source}")]
+    #[error("failed to {action} {target}: {source}")]
     #[diagnostic(code(rpx::install::command_failed))]
     Command {
+        action: &'static str,
         target: String,
         #[source]
-        source: RSubprocessError,
+        source: Box<RSubprocessError>,
     },
 
     #[error(
-        "failed to install {target}: {source} (log: {})",
+        "failed to {action} {target}: {source} (log: {})",
         log_path.display()
     )]
     #[diagnostic(code(rpx::install::command_failed))]
     Failed {
+        action: &'static str,
         target: String,
         log_path: PathBuf,
         #[source]
-        source: RSubprocessError,
+        source: Box<RSubprocessError>,
     },
+
+    #[error("failed to {operation} temporary package build directory at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::install::temporary_build_directory_failed))]
+    TemporaryBuildDirectory {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("R CMD build did not create the expected source archive at {}", path.display())]
+    #[diagnostic(code(rpx::install::build_archive_missing))]
+    BuildArchiveMissing { path: PathBuf },
 
     #[error("failed to write installation log at {}: {source}", path.display())]
     #[diagnostic(code(rpx::install::log_write_failed))]
@@ -204,42 +220,142 @@ pub async fn install_local_package(
     command.arg("-e").arg(expression);
     let output = run_subprocess(command, "Rscript").await;
 
-    install_command_result(output, format!("{package}@{version}"))
+    package_command_result(output, "install", format!("{package}@{version}"))
 }
 
 pub async fn install_package_directory(
     package_root: &Path,
     target_library: &Path,
+    package: &str,
+    version: &str,
     target: &str,
 ) -> Result<(), PackageInstallError> {
-    let mut command = Command::with_venv("R", target_library);
-    command
-        .arg("CMD")
-        .arg("INSTALL")
-        .arg(format!("--library={}", target_library.display()))
-        .arg(package_root);
-    let output = run_subprocess(command, "R").await;
+    let build_directory = TemporaryBuildDirectory::create()?;
+    let archive_path = build_directory
+        .path()
+        .join(format!("{package}_{version}.tar.gz"));
 
-    install_command_result(output, target.to_string())
+    let result = async {
+        let mut build = Command::with_venv("R", target_library);
+        build
+            .arg("CMD")
+            .arg("build")
+            .arg("--no-build-vignettes")
+            .arg("--no-manual")
+            .arg("--no-resave-data")
+            .arg(package_root)
+            .current_dir(build_directory.path());
+        build.kill_on_drop(true);
+        let output = run_subprocess(build, "R").await;
+        package_command_result(output, "build", target.to_string())?;
+
+        match tokio::fs::metadata(&archive_path).await {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(PackageInstallError::BuildArchiveMissing {
+                    path: archive_path.clone(),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PackageInstallError::BuildArchiveMissing {
+                    path: archive_path.clone(),
+                });
+            }
+            Err(source) => {
+                return Err(PackageInstallError::TemporaryBuildDirectory {
+                    operation: "inspect",
+                    path: archive_path.clone(),
+                    source,
+                });
+            }
+        }
+
+        let mut install = Command::with_venv("R", target_library);
+        install
+            .arg("CMD")
+            .arg("INSTALL")
+            .arg(format!("--library={}", target_library.display()))
+            .arg(&archive_path);
+        install.kill_on_drop(true);
+        let output = run_subprocess(install, "R").await;
+
+        package_command_result(output, "install", target.to_string())
+    }
+    .await;
+
+    if let Err(source) = build_directory.remove().await {
+        if result.is_ok() {
+            return Err(PackageInstallError::TemporaryBuildDirectory {
+                operation: "remove",
+                path: build_directory.path().to_path_buf(),
+                source,
+            });
+        }
+        tracing::warn!(
+            path = %build_directory.path().display(),
+            error = %source,
+            "failed to remove temporary package build directory"
+        );
+    }
+
+    result
 }
 
-fn install_command_result(
+fn package_command_result(
     result: Result<Output, RSubprocessError>,
+    action: &'static str,
     target: String,
 ) -> Result<(), PackageInstallError> {
     let Err(source) = result else {
         return Ok(());
     };
     match &source {
-        RSubprocessError::Start { .. } => Err(PackageInstallError::Command { target, source }),
+        RSubprocessError::Start { .. } => Err(PackageInstallError::Command {
+            action,
+            target,
+            source: Box::new(source),
+        }),
         RSubprocessError::Failed { stdout, stderr, .. } => {
             let log_path = install_log_path();
             write_install_log(&log_path, stdout, stderr)?;
             Err(PackageInstallError::Failed {
+                action,
                 target,
                 log_path,
-                source,
+                source: Box::new(source),
             })
+        }
+    }
+}
+
+struct TemporaryBuildDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryBuildDirectory {
+    fn create() -> Result<Self, PackageInstallError> {
+        let path = temporary_build_directory_path();
+        fs::create_dir(&path).map_err(|source| PackageInstallError::TemporaryBuildDirectory {
+            operation: "create",
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn remove(&self) -> Result<(), std::io::Error> {
+        tokio::fs::remove_dir_all(&self.path).await
+    }
+}
+
+impl Drop for TemporaryBuildDirectory {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -526,6 +642,20 @@ fn install_log_path() -> PathBuf {
         .expect("system time should be after unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("rpx-install-{}-{unique}.log", std::process::id()))
+}
+
+fn temporary_build_directory_path() -> PathBuf {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "rpx-build-{}-{unique}-{sequence}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
