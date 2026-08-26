@@ -508,6 +508,8 @@ fn parse_packages_relations_field(
 
     value
         .split(',')
+        .map(str::trim)
+        .filter(|relation| !relation.is_empty())
         .map(|relation| {
             relation
                 .parse()
@@ -742,4 +744,35 @@ pub async fn cran_macos_binary(
         ]);
 
     client().get(url).send().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CranPackagesIndex;
+
+    #[test]
+    fn parses_trailing_commas_in_cran_package_relations() {
+        let index = "Package: first\nVersion: 1.0.0\nDepends: R (>= 4.0.0),\nImports: cli, digest,\nSuggests: testthat,\nLinkingTo: cpp11,\n\nPackage: second\nVersion: 2.0.0\nImports: first\n";
+
+        let index = index
+            .parse::<CranPackagesIndex>()
+            .expect("trailing commas should be accepted");
+
+        assert_eq!(index.packages.len(), 2);
+        let first = &index.packages[0];
+        assert_eq!(first.depends.len(), 1);
+        assert_eq!(first.imports.len(), 2);
+        assert_eq!(first.suggests.len(), 1);
+        assert_eq!(first.linking_to.len(), 1);
+        assert_eq!(index.packages[1].package, "second");
+    }
+
+    #[test]
+    fn rejects_malformed_nonempty_cran_package_relations() {
+        let error = "Package: example\nVersion: 1.0.0\nImports: cli (>= invalid),\n"
+            .parse::<CranPackagesIndex>()
+            .expect_err("malformed nonempty relations should be rejected");
+
+        assert!(error.contains("failed to parse Imports"));
+    }
 }
