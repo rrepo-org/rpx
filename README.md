@@ -40,22 +40,31 @@ Imports:
     examplepkg (< 2.0.0)
 ```
 
-The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint.
+The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint. Packages are added to `Imports` by default; use a dependency-type flag to select another field:
+
+```bash
+rpx add --depends package
+rpx add --imports package
+rpx add --linking-to package
+rpx add --suggests package
+```
+
+The flags are mutually exclusive. `--dev` is an alias for `--suggests`. `Enhances` is not currently supported.
 
 This uses semver because the major version is the common place to signal breaking changes. R packages do not universally follow semver, so this is not a guarantee that every `1.x` release is compatible or every `2.x` release is incompatible. It is a default constraint that is safer than leaving the dependency open-ended.
 
 For `0.x` packages, `rpx` records the selected version as the lower bound and `< 1.0.0` as the upper bound.
 
 To set a constraint yourself, use `PACKAGE@OPERATORVERSION`. For example, this writes
-`digest (>= 0.6.37)` to `Imports`:
+`digest (>= 0.6.37)` to `Suggests`:
 
 ```bash
-rpx add 'digest@>=0.6.37'
+rpx add --dev 'digest@>=0.6.37'
 ```
 
 Supported operators are `<`, `<=`, `==`, `!=`, `>=`, and `>`. A constrained add replaces every
 existing relation for that package in `DESCRIPTION` before adding the requested relation to
-`Imports`.
+the selected field.
 
 ## Install
 
@@ -119,6 +128,10 @@ rpx add digest
 rpx run R
 ```
 
+Interactive initialization can add `testthat`, `roxygen2`, and `devtools` to
+`Suggests`. `rpx init` resolves the initial lockfile and syncs the project
+library before completing.
+
 `rpx add` updates `DESCRIPTION`, resolves a compatible package set, writes `rpx.lock`, and syncs the project library.
 
 ## Use an Existing Project
@@ -131,11 +144,23 @@ rpx sync
 rpx run R
 ```
 
+By default, `rpx add`, `rpx remove`, and `rpx sync` also install the current
+project package. Use `--no-install-project` to synchronize its dependencies
+without installing the project itself:
+
+```bash
+rpx sync --no-install-project
+```
+
+Like `uv sync`, synchronization is exact: this flag removes an already
+installed copy of the project while retaining its dependencies. The resulting
+package set must still contain every non-base dependency required for installation.
+
 Commit both `DESCRIPTION` and `rpx.lock`. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
 
 ## Daily Workflow
 
-Add or remove direct dependencies with `rpx` so the manifest, lockfile, and project library stay together:
+Add or remove direct dependencies with `rpx` so DESCRIPTION, the lockfile, and the project library stay together:
 
 ```bash
 rpx add jsonlite
@@ -167,38 +192,37 @@ The package universe is the set of package versions and metadata available to th
 
 By default, `rpx` uses the public rrepo-backed CRAN universe at `https://upstream.rrepo.dev/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
 
-Projects can add additional repositories. `rpx` supports rrepo API repositories, CRAN repositories, and CRAN-like repositories:
+Projects can configure a base repository, additional rrepo or CRAN-like repositories, and package remotes:
 
 ```bash
-rpx repo add https://cloud.r-project.org
+rpx repo base set https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo additional add https://cloud.r-project.org
 rpx repo add https://packagemanager.posit.co/cran/latest
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo remote add github::owner/repository@main
 rpx repo list
-rpx repo remove https://packagemanager.posit.co/cran/latest
+rpx repo additional remove https://cloud.r-project.org
+rpx repo remote remove github::owner/repository@main
+rpx repo base reset
 ```
 
-The default rrepo-backed CRAN universe remains enabled unless you explicitly disable it. A useful setup is to keep the default universe enabled and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
+`rpx repo add` and `rpx repo remove` are shortcuts for the corresponding `rpx repo additional` commands. Remote arguments use the same syntax as the `Remotes` field in `DESCRIPTION`.
+
+The base repository is always enabled. A useful setup is to keep the built-in base universe and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
 
 ```bash
-rpx repo add https://packagemanager.posit.co/cran/latest
+rpx repo additional add https://packagemanager.posit.co/cran/latest
 ```
 
 During locking, `rpx` merges versions across enabled repositories. Existing locked versions are preferred when they are still available from enabled repositories. If the same version is available from multiple repositories, the earlier repository wins for the locked source URL.
 
-When a repository requires authentication, `rpx` prompts for an API key and stores it in the operating system keyring for that repository URL.
+When a repository requires authentication, `rpx` prompts for an API key and stores it in the operating system keyring for that repository's origin.
 
-You can override the default public registry root with `RPX_REGISTRY_BASE_URL`:
-
-```bash
-RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
-```
-
-To lock without the default public registry, use `rpx lock --no-default-repo`. The default-repo choice is recorded in `rpx.lock`; use `--default-repo` to enable it again when regenerating the lockfile.
+Projects can set `Config/rpx/base-repository` in `DESCRIPTION` to replace the built-in base repository. When the field is absent, `rpx` uses the built-in repository.
 
 For private package universes, add an rrepo repository for your organization:
 
 ```bash
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo additional add https://<org-slug>.rrepo.dev/<repo-slug>
 ```
 
 ## rrepo
@@ -223,11 +247,12 @@ The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overvie
 
 ## How It Works
 
-- `DESCRIPTION` is the dependency manifest and compatibility contract.
+- `DESCRIPTION` is the dependency declaration and compatibility contract.
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
 - `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
 - `rpx` prefers existing locked versions when they are still available from enabled repositories.
-- `rpx sync` installs exactly what `rpx.lock` records into the project library.
+- `rpx sync` installs the packages in `rpx.lock` and the current project into the project library by default.
+- `--no-install-project` is available on `rpx add`, `rpx remove`, and `rpx sync` for dependency-only synchronization.
 - `rpx sync` tries Windows and macOS binary artifacts from enabled repositories when available, then falls back to the locked source artifact.
 - `rpx run` sets the R library path for the command it runs.
 

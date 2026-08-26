@@ -14,6 +14,7 @@ pub fn rpx_test_image() -> testcontainers::GenericImage {
         .with_dockerfile(root.join("tests/docker/rpx.Dockerfile"))
         .with_file(root.join("Cargo.toml"), "./Cargo.toml")
         .with_file(root.join("Cargo.lock"), "./Cargo.lock")
+        .with_file(root.join("assets"), "./assets")
         .with_file(root.join("src"), "./src")
         .build_image()
         .expect("image should build")

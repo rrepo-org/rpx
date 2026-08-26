@@ -3,7 +3,7 @@ use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use moka::future::Cache;
-use r_description::lossless::{RDescription, Version};
+use r_description::{RDescription, Version};
 use reqwest::Url;
 use std::{
     any::Any,
@@ -28,11 +28,7 @@ impl std::fmt::Display for CranRepository {
 }
 
 impl CranRepository {
-    pub fn new(mut url: Url, archives: ArchiveSupport) -> Self {
-        url.path_segments_mut()
-            .expect("repository base URL should support path segments")
-            .pop_if_empty();
-
+    pub fn new(url: Url, archives: ArchiveSupport) -> Self {
         Self {
             url,
             archives,
@@ -135,9 +131,9 @@ impl PackageRepository for CranRepository {
                 entry
                     .version
                     .parse::<Version>()
-                    .map_err(|details| RepositoryError::InvalidData {
+                    .map_err(|source| RepositoryError::InvalidData {
                         resource: "package version".to_string(),
-                        details,
+                        details: source.to_string(),
                     })
             })
             .collect::<Result<BTreeSet<_>, RepositoryError>>()?;
@@ -166,9 +162,9 @@ impl PackageRepository for CranRepository {
                         })?;
                     let listing =
                         text.parse::<http::CranPackageArchiveListing>()
-                            .map_err(|details| RepositoryError::InvalidData {
+                            .map_err(|source| RepositoryError::InvalidData {
                                 resource: "CRAN package archive listing".to_string(),
-                                details,
+                                details: source.to_string(),
                             })?;
 
                     Ok::<BTreeSet<Version>, RepositoryError>(listing.versions.into_iter().collect())
@@ -209,7 +205,7 @@ impl PackageRepository for CranRepository {
                     .iter()
                     .find(|entry| entry.package == package && entry.version == version_string)
                 {
-                    packages_entry_to_description(entry)
+                    packages_entry_to_description(entry)?
                 } else {
                     let response =
                         http::cran_archive_source_tarball(&self.url, package, &version_string)
@@ -239,11 +235,26 @@ impl PackageRepository for CranRepository {
     }
 }
 
-fn packages_entry_to_description(entry: &http::CranPackageIndexEntry) -> RDescription {
-    let mut description = RDescription::new();
+fn packages_entry_to_description(
+    entry: &http::CranPackageIndexEntry,
+) -> Result<RDescription, RepositoryError> {
+    let mut description = RDescription::parse("");
 
-    description.set_package(&entry.package);
-    description.set_version(&entry.version);
+    description
+        .set_package(&entry.package)
+        .map_err(|source| RepositoryError::InvalidData {
+            resource: "Package in CRAN PACKAGES index".to_string(),
+            details: source.to_string(),
+        })?;
+    let version =
+        entry
+            .version
+            .parse::<Version>()
+            .map_err(|source| RepositoryError::InvalidData {
+                resource: "Version in CRAN PACKAGES index".to_string(),
+                details: source.to_string(),
+            })?;
+    description.set_version(&version);
 
     if !entry.depends.is_empty() {
         description.set_depends(entry.depends.clone());
@@ -261,18 +272,18 @@ fn packages_entry_to_description(entry: &http::CranPackageIndexEntry) -> RDescri
         description.set_linking_to(entry.linking_to.clone());
     }
 
-    if let Some(system_requirements) = &entry.system_requirements {
-        description.set_system_requirements(&[system_requirements]);
-    }
-
-    description
+    Ok(description)
 }
 
 async fn description_from_source_tarball_response(
     response: reqwest::Response,
     package: &str,
 ) -> Result<RDescription, RepositoryError> {
-    let mut bytes = Vec::with_capacity(response.content_length().unwrap_or_default() as usize);
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default();
+    let mut bytes = Vec::with_capacity(capacity);
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream
@@ -316,12 +327,7 @@ async fn description_from_source_tarball_response(
                 source: Arc::new(source),
             })?;
 
-        return body
-            .parse::<RDescription>()
-            .map_err(|source| RepositoryError::Description {
-                location: format!("in source package for {package}"),
-                source: Arc::new(source),
-            });
+        return Ok(RDescription::parse(&body));
     }
 
     Err(RepositoryError::DescriptionNotFound {

@@ -1,7 +1,7 @@
 use super::{PackageRepository, RepositoryError};
 use crate::resolver::PackageVersion;
 use async_trait::async_trait;
-use r_description::lossless::{RDescription, Version};
+use r_description::{RDescription, Version};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -55,35 +55,25 @@ impl LocalRepository {
                     path: path.clone(),
                     source: Arc::new(source),
                 })?;
-        let description =
-            contents
-                .parse::<RDescription>()
-                .map_err(|source| RepositoryError::Description {
-                    location: format!("at {}", path.display()),
-                    source: Arc::new(source),
-                })?;
+        let description = RDescription::parse(&contents);
 
         Ok(Arc::new(description))
     }
 
     pub async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
         let description = self.description().await?;
+        let location = format!("at {}", self.path.join("DESCRIPTION").display());
         let package = description
             .package()
-            .ok_or_else(|| RepositoryError::MissingField {
-                path: self.path.join("DESCRIPTION"),
-                field: "Package",
+            .map_err(|source| RepositoryError::PackageField {
+                location: location.clone(),
+                source: Arc::new(source),
             })?;
         let version = description
             .version()
-            .ok_or_else(|| RepositoryError::MissingField {
-                path: self.path.join("DESCRIPTION"),
-                field: "Version",
-            })?
-            .parse::<Version>()
-            .map_err(|details| RepositoryError::InvalidData {
-                resource: format!("Version in DESCRIPTION at {}", self.path.display()),
-                details,
+            .map_err(|source| RepositoryError::VersionField {
+                location,
+                source: Arc::new(source),
             })?;
 
         let repository: Arc<dyn PackageRepository> = self.clone();
@@ -127,23 +117,21 @@ impl PackageRepository for LocalRepository {
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {
         let description = self.description().await?;
-        let local_package = description
-            .package()
-            .ok_or_else(|| RepositoryError::MissingField {
-                path: self.path.join("DESCRIPTION"),
-                field: "Package",
-            })?;
-        let local_version = description
-            .version()
-            .ok_or_else(|| RepositoryError::MissingField {
-                path: self.path.join("DESCRIPTION"),
-                field: "Version",
-            })?
-            .parse::<Version>()
-            .map_err(|details| RepositoryError::InvalidData {
-                resource: format!("Version in DESCRIPTION at {}", self.path.display()),
-                details,
-            })?;
+        let location = format!("at {}", self.path.join("DESCRIPTION").display());
+        let local_package =
+            description
+                .package()
+                .map_err(|source| RepositoryError::PackageField {
+                    location: location.clone(),
+                    source: Arc::new(source),
+                })?;
+        let local_version =
+            description
+                .version()
+                .map_err(|source| RepositoryError::VersionField {
+                    location,
+                    source: Arc::new(source),
+                })?;
 
         if package != local_package || version != &local_version {
             return Err(RepositoryError::PackageVersionNotFound {
@@ -164,12 +152,8 @@ mod tests {
 
     #[tokio::test]
     async fn package_uses_staged_description_and_preserves_repository() {
-        let initial: RDescription = "Package: initial\nVersion: 0.1.0\n"
-            .parse()
-            .expect("description should parse");
-        let staged: RDescription = "Package: project\nVersion: 1.2.3\n"
-            .parse()
-            .expect("description should parse");
+        let initial = RDescription::parse("Package: initial\nVersion: 0.1.0\n");
+        let staged = RDescription::parse("Package: project\nVersion: 1.2.3\n");
         let mut repository =
             LocalRepository::new(PathBuf::from("unused")).with_description(initial);
         repository.set_description(staged);
@@ -182,7 +166,7 @@ mod tests {
             .expect("description should load");
         let (package, version) = repository.package().await.expect("package should load");
 
-        assert_eq!(description.package().as_deref(), Some("project"));
+        assert_eq!(description.package().as_deref(), Ok("project"));
         assert_eq!(package, "project");
         assert_eq!(version.version().to_string(), "1.2.3");
         assert!(Arc::ptr_eq(version.repository(), &expected_repository));
@@ -214,7 +198,7 @@ mod tests {
             .await
             .expect("description should load");
 
-        assert_eq!(description.package().as_deref(), Some("diskproject"));
+        assert_eq!(description.package().as_deref(), Ok("diskproject"));
         tokio::fs::remove_dir_all(path)
             .await
             .expect("test directory should be removed");

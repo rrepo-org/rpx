@@ -6,10 +6,7 @@ use crate::{
 use async_trait::async_trait;
 use git2::Oid;
 use moka::future::Cache;
-use r_description::{
-    lossless::{RDescription, Version},
-    lossy::{Remote, RemoteSource},
-};
+use r_description::{RDescription, Remote, RemoteSource, Version};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -30,12 +27,13 @@ pub struct GitRepository {
 }
 
 impl GitRepository {
-    pub fn new(remote: &Remote) -> Result<Self, RepositoryError> {
+    pub fn new(remote: Remote) -> Result<Self, RepositoryError> {
+        let repository = remote.to_string();
+        let (reference, subdirectory) = remote_parts(&remote);
         let url = GitUrl::try_from(remote).map_err(|source| RepositoryError::Git {
-            repository: remote.to_string(),
+            repository,
             source: Arc::new(source),
         })?;
-        let (reference, subdirectory) = remote_parts(remote);
         let subdirectory = subdirectory
             .as_deref()
             .map(validate_subdirectory)
@@ -109,17 +107,7 @@ impl GitRepository {
                         source: Arc::new(source),
                     }
                 })?;
-                let description =
-                    contents
-                        .parse()
-                        .map_err(|source| RepositoryError::Description {
-                            location: format!(
-                                "at {} in {} commit {commit}",
-                                path.display(),
-                                self.remote
-                            ),
-                            source: Arc::new(source),
-                        })?;
+                let description = RDescription::parse(&contents);
 
                 Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
             })
@@ -129,23 +117,18 @@ impl GitRepository {
 
     async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
         let description = self.repository_description().await?;
-        let package =
-            description
-                .package()
-                .ok_or_else(|| RepositoryError::MissingRepositoryField {
-                    repository: self.to_string(),
-                    field: "Package",
-                })?;
+        let location = format!("from {self}");
+        let package = description
+            .package()
+            .map_err(|source| RepositoryError::PackageField {
+                location: location.clone(),
+                source: Arc::new(source),
+            })?;
         let version = description
             .version()
-            .ok_or_else(|| RepositoryError::MissingRepositoryField {
-                repository: self.to_string(),
-                field: "Version",
-            })?
-            .parse::<Version>()
-            .map_err(|details| RepositoryError::InvalidData {
-                resource: format!("Version in DESCRIPTION from {self}"),
-                details,
+            .map_err(|source| RepositoryError::VersionField {
+                location,
+                source: Arc::new(source),
             })?;
         let repository: Arc<dyn PackageRepository> = self.clone();
 
@@ -225,24 +208,21 @@ impl PackageRepository for GitRepository {
         version: &Version,
     ) -> Result<Arc<RDescription>, RepositoryError> {
         let description = self.repository_description().await?;
+        let location = format!("from {self}");
         let repository_package =
             description
                 .package()
-                .ok_or_else(|| RepositoryError::MissingRepositoryField {
-                    repository: self.to_string(),
-                    field: "Package",
+                .map_err(|source| RepositoryError::PackageField {
+                    location: location.clone(),
+                    source: Arc::new(source),
                 })?;
-        let repository_version = description
-            .version()
-            .ok_or_else(|| RepositoryError::MissingRepositoryField {
-                repository: self.to_string(),
-                field: "Version",
-            })?
-            .parse::<Version>()
-            .map_err(|details| RepositoryError::InvalidData {
-                resource: format!("Version in DESCRIPTION from {self}"),
-                details,
-            })?;
+        let repository_version =
+            description
+                .version()
+                .map_err(|source| RepositoryError::VersionField {
+                    location,
+                    source: Arc::new(source),
+                })?;
         if package != repository_package || version != &repository_version {
             return Err(RepositoryError::RepositoryPackageVersionNotFound {
                 repository: self.to_string(),
@@ -299,7 +279,7 @@ mod tests {
             .parse::<Remote>()
             .expect("remote should parse");
         let repository: Arc<dyn PackageRepository> = Arc::new(
-            GitRepository::new(&remote)
+            GitRepository::new(remote)
                 .expect("repository should build")
                 .with_commit(commit),
         );
@@ -369,7 +349,7 @@ mod tests {
         let remote = "alias=github::owner/repository/subdir@main"
             .parse::<Remote>()
             .expect("remote should parse");
-        let repository = GitRepository::new(&remote).expect("repository should build");
+        let repository = GitRepository::new(remote).expect("repository should build");
 
         assert_eq!(repository.reference(), Some("main"));
         assert_eq!(repository.subdirectory(), Some(Path::new("subdir")));

@@ -4,7 +4,7 @@ use git2::{
     Odb, Oid, ProxyOptions, Reference, RemoteCallbacks, RemoteRedirect, Repository,
     build::CheckoutBuilder,
 };
-use r_description::lossy::{HostedGitRemote, Remote, RemoteSource};
+use r_description::{HostedGitRemote, Remote, RemoteSource};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{self, Write as _},
@@ -21,6 +21,71 @@ const FETCHED_REF: &str = "refs/rpx/source";
 const FETCHED_COMMIT_REF: &str = "refs/rpx/commit";
 
 static GIT_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+#[derive(Debug, Default)]
+pub(crate) struct Identity {
+    pub(crate) name: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+pub(crate) fn configured_identity(path: &Path) -> Result<Identity, GitError> {
+    let config = match Repository::discover(path) {
+        Ok(repository) => repository
+            .config()
+            .map_err(|source| operation("read Git repository configuration", source))?,
+        Err(source) if source.code() == ErrorCode::NotFound => Config::open_default()
+            .map_err(|source| operation("read default Git configuration", source))?,
+        Err(source) => return Err(operation("discover Git repository", source)),
+    };
+
+    Ok(Identity {
+        name: config_value(&config, "user.name")?,
+        email: config_value(&config, "user.email")?,
+    })
+}
+
+pub(crate) fn is_inside_worktree(path: &Path) -> Result<bool, GitError> {
+    let mut existing_ancestor = None;
+    for ancestor in path.ancestors() {
+        match ancestor.try_exists() {
+            Ok(true) => {
+                existing_ancestor = Some(ancestor);
+                break;
+            }
+            Ok(false) => {}
+            Err(source) => {
+                return Err(GitError::FileSystem {
+                    operation: "inspect Git discovery path",
+                    path: ancestor.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    let Some(existing_ancestor) = existing_ancestor else {
+        return Ok(false);
+    };
+
+    match Repository::discover(existing_ancestor) {
+        Ok(repository) => Ok(repository.workdir().is_some()),
+        Err(source) if source.code() == ErrorCode::NotFound => Ok(false),
+        Err(source) => Err(operation("discover Git repository", source)),
+    }
+}
+
+pub(crate) fn initialize_repository(path: &Path) -> Result<(), GitError> {
+    Repository::init(path)
+        .map(|_| ())
+        .map_err(|source| operation("initialize Git repository", source))
+}
+
+fn config_value(config: &Config, key: &str) -> Result<Option<String>, GitError> {
+    match config.get_string(key) {
+        Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
+        Err(source) if source.code() == ErrorCode::NotFound => Ok(None),
+        Err(source) => Err(operation("read Git identity configuration", source)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GitUrl(String);
@@ -121,19 +186,19 @@ impl GitUrl {
     }
 }
 
-impl TryFrom<&Remote> for GitUrl {
+impl TryFrom<Remote> for GitUrl {
     type Error = GitError;
 
-    fn try_from(remote: &Remote) -> Result<Self, Self::Error> {
-        match &remote.source {
+    fn try_from(remote: Remote) -> Result<Self, Self::Error> {
+        match remote.source {
             RemoteSource::GitHub(source) => {
-                Self::from_hosted(remote.host.as_deref(), "github.com", source)
+                Self::from_hosted(remote.host.as_deref(), "github.com", &source)
             }
             RemoteSource::GitLab(source) => {
-                Self::from_hosted(remote.host.as_deref(), "gitlab.com", source)
+                Self::from_hosted(remote.host.as_deref(), "gitlab.com", &source)
             }
             RemoteSource::Bitbucket(source) => {
-                Self::from_hosted(remote.host.as_deref(), "bitbucket.org", source)
+                Self::from_hosted(remote.host.as_deref(), "bitbucket.org", &source)
             }
             RemoteSource::Git(source) => Self::from_generic(&source.url),
             _ => Err(GitError::UnsupportedRemote),
@@ -936,6 +1001,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reads_optional_identity_config_values() {
+        let path = temporary_path("identity-config");
+        fs::write(&path, "").expect("configuration file should be created");
+        let mut config = Config::open(&path).expect("configuration should initialize");
+        assert_eq!(config_value(&config, "user.name").unwrap(), None);
+
+        config
+            .set_str("user.name", "  Package Author  ")
+            .expect("identity should be configured");
+        assert_eq!(
+            config_value(&config, "user.name").unwrap().as_deref(),
+            Some("Package Author")
+        );
+        fs::remove_file(path).expect("configuration file should be removed");
+    }
+
+    #[test]
     fn compares_scp_and_ssh_authorities() {
         assert!(same_git_authority(
             "git@example.com:team/repository.git",
@@ -978,19 +1060,15 @@ pub(crate) mod tests {
             .expect("remote should parse");
 
         assert_eq!(
-            GitUrl::try_from(&github)
-                .expect("URL should build")
-                .as_str(),
+            GitUrl::try_from(github).expect("URL should build").as_str(),
             "https://github.com/owner/repository.git"
         );
         assert_eq!(
-            GitUrl::try_from(&gitlab)
-                .expect("URL should build")
-                .as_str(),
+            GitUrl::try_from(gitlab).expect("URL should build").as_str(),
             "https://code.example/group/subgroup/repository.git"
         );
         assert_eq!(
-            GitUrl::try_from(&bitbucket)
+            GitUrl::try_from(bitbucket)
                 .expect("URL should build")
                 .as_str(),
             "https://bitbucket.org/owner/repository.git"
@@ -1005,7 +1083,7 @@ pub(crate) mod tests {
             "git::git@example.com:team/repository.git",
         ] {
             let remote = value.parse::<Remote>().expect("remote should parse");
-            GitUrl::try_from(&remote).expect("Git URL should be accepted");
+            GitUrl::try_from(remote).expect("Git URL should be accepted");
         }
 
         for value in [
@@ -1017,7 +1095,7 @@ pub(crate) mod tests {
             "git::example.com:team/repository.git",
         ] {
             let remote = value.parse::<Remote>().expect("remote should parse");
-            assert!(GitUrl::try_from(&remote).is_err(), "{value} should fail");
+            assert!(GitUrl::try_from(remote).is_err(), "{value} should fail");
         }
     }
 

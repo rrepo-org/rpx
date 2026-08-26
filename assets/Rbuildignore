@@ -1,0 +1,16 @@
+^rpx\.lock$
+^.*\.Rproj$
+^\.Rproj\.user$
+^README\.Rmd$
+^LICENSE\.md$
+^cran-comments\.md$
+^CRAN-SUBMISSION$
+^CRAN-RELEASE$
+^revdep$
+^data-raw$
+^pkgdown$
+^_pkgdown\.yml$
+^docs$
+^\.github$
+^\.vscode$
+^[.]?air[.]toml$
