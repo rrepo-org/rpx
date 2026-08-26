@@ -189,6 +189,37 @@ mod tests {
     }
 
     #[test]
+    fn cran_index_diagnostic_survives_pubgrub_resolution_errors() {
+        let parse_error = crate::http::CranPackagesIndex::parse(
+            "https://example.test/src/contrib/PACKAGES",
+            "Package: fixture\nVersion: invalid\n".to_string(),
+        )
+        .expect_err("invalid CRAN version should fail");
+        let source = PubGrubError::ErrorChoosingVersion {
+            package: "fixture".to_string(),
+            source: ProviderError::Repository(RepositoryError::CranPackages(Box::new(parse_error))),
+        };
+
+        let error = ResolveProjectError::from(ResolutionError::from(source));
+
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("rpx::repository::cran_packages_parse_failed")
+        );
+        assert!(error.source_code().is_some());
+        let help = error
+            .help()
+            .expect("CRAN parse diagnostic should retain repository guidance")
+            .to_string();
+        assert!(help.contains("repository returned invalid metadata"));
+        assert!(!help.contains("DESCRIPTION"));
+        assert!(matches!(
+            error,
+            ResolveProjectError::Repository(RepositoryError::CranPackages(_))
+        ));
+    }
+
+    #[test]
     fn lockfile_build_error_maps_repository_categories() {
         assert!(matches!(
             LockfileBuildError::from(git_access_error("https://example.test/private.git")),

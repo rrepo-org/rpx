@@ -6,6 +6,7 @@ mod rrepo;
 use crate::http;
 use crate::resolver::PackageVersion;
 use async_trait::async_trait;
+use miette::Diagnostic;
 use r_description::{PackageError, RDescription, Version, VersionError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -48,8 +49,12 @@ pub enum ArchiveSupport {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, Error, Diagnostic)]
 pub enum RepositoryError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    CranPackages(Box<http::CranPackagesParseError>),
+
     #[error("request failed: {source}")]
     Request {
         #[source]
