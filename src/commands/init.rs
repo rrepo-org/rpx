@@ -2,7 +2,7 @@ use crate::{
     cli::{InitArgs, InitLicense},
     description::{
         DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
-        write_namespace_if_missing,
+        set_base_repository, write_namespace_if_missing,
     },
     git,
     output::status,
@@ -10,6 +10,7 @@ use crate::{
         Project, ProjectWriteError, ResolutionPolicy, ResolveProjectError,
         pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
+    repository::parse_repository_url,
     sync::{ProjectPackageMode, SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
@@ -27,6 +28,7 @@ const GITIGNORE: &str = include_str!("../../assets/R.gitignore");
 const DEFAULT_DESCRIPTION: &str = "Describe what this package does.";
 const DEFAULT_AUTHOR_NAME: &str = "Package Author";
 const DEFAULT_AUTHOR_EMAIL: &str = "author@example.com";
+const CRAN_REPOSITORY_URL: &str = "https://cloud.r-project.org/";
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
@@ -181,6 +183,12 @@ enum DevelopmentPackage {
     Testthat,
     Roxygen2,
     Devtools,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BaseRepository {
+    Rrepo,
+    Cran,
 }
 
 #[derive(Clone, Copy)]
@@ -390,6 +398,11 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         None if interactive => prompt_for_license()?,
         None => InitLicense::Mit,
     };
+    let base_repository = if interactive {
+        prompt_for_base_repository()?
+    } else {
+        BaseRepository::Rrepo
+    };
     let development_packages = if interactive {
         prompt_for_development_packages()?
     } else {
@@ -413,6 +426,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         maintainer: &maintainer,
         license: license.description_value(),
     })?;
+    configure_base_repository(&mut description, base_repository)?;
     let development_relations = development_relations(&development_packages);
     add_dependencies(
         &target,
@@ -650,6 +664,36 @@ fn prompt_for_license() -> Result<InitLicense, Error> {
         .max_rows(8)
         .interact()
         .map_err(Error::InteractivePrompt)?)
+}
+
+fn prompt_for_base_repository() -> Result<BaseRepository, Error> {
+    cliclack::select("Base repository")
+        .item(
+            BaseRepository::Rrepo,
+            "rrepo",
+            "Fast package resolution with historical versions (default)",
+        )
+        .item(
+            BaseRepository::Cran,
+            "CRAN",
+            "Packages directly from cloud.r-project.org",
+        )
+        .initial_value(BaseRepository::Rrepo)
+        .interact()
+        .map_err(Error::InteractivePrompt)
+}
+
+fn configure_base_repository(
+    description: &mut RDescription,
+    repository: BaseRepository,
+) -> Result<(), r_description::FieldMutationError> {
+    if repository == BaseRepository::Cran {
+        let repository = parse_repository_url(CRAN_REPOSITORY_URL)
+            .expect("built-in CRAN repository URL should be valid");
+        set_base_repository(description, &repository)?;
+    }
+
+    Ok(())
 }
 
 fn prompt_for_development_packages() -> Result<Vec<DevelopmentPackage>, Error> {
@@ -1121,6 +1165,28 @@ mod tests {
         ));
         assert!(rendered.contains("Author: Package Author [aut, cre]"));
         assert!(rendered.contains("Maintainer: Package Author <author@example.com>"));
+    }
+
+    #[test]
+    fn configures_selected_base_repository() {
+        let mut rrepo = RDescription::parse("Package: project\nVersion: 0.1.0\n");
+        configure_base_repository(&mut rrepo, BaseRepository::Rrepo)
+            .expect("rrepo should remain the implicit base repository");
+        assert_eq!(
+            crate::description::base_repository(Path::new("."), &rrepo).unwrap(),
+            None
+        );
+
+        let mut cran = RDescription::parse("Package: project\nVersion: 0.1.0\n");
+        configure_base_repository(&mut cran, BaseRepository::Cran)
+            .expect("CRAN should be configured as the base repository");
+        assert_eq!(
+            crate::description::base_repository(Path::new("."), &cran)
+                .unwrap()
+                .as_ref()
+                .map(url::Url::as_str),
+            Some(CRAN_REPOSITORY_URL)
+        );
     }
 
     #[test]
