@@ -379,6 +379,10 @@ pub(crate) enum ResolveProjectError {
     #[diagnostic(transparent)]
     BasePackages(#[from] BasePackagesError),
 
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repository(RepositoryError),
+
     #[error("could not access Git repository {repository}")]
     #[diagnostic(
         code(rpx::lock::git_repository_unavailable),
@@ -393,10 +397,7 @@ pub(crate) enum ResolveProjectError {
     },
 
     #[error("failed to resolve package set")]
-    #[diagnostic(
-        code(rpx::lock::resolve_failed),
-        help("Check package names and version constraints in DESCRIPTION.")
-    )]
+    #[diagnostic(code(rpx::lock::resolve_failed))]
     Resolution {
         #[source]
         source: Box<ResolutionError>,
@@ -416,6 +417,33 @@ impl From<ResolutionError> for ResolveProjectError {
                     explanation: DefaultStringReporter::report(&derivation_tree),
                 }
             }
+            ResolutionError::PubGrub(
+                PubGrubError::ErrorChoosingVersion {
+                    source:
+                        ProviderError::Repository(source @ RepositoryError::CranPackages(_))
+                        | ProviderError::DependencyMetadata {
+                            source: source @ RepositoryError::CranPackages(_),
+                            ..
+                        },
+                    ..
+                }
+                | PubGrubError::ErrorRetrievingDependencies {
+                    source:
+                        ProviderError::Repository(source @ RepositoryError::CranPackages(_))
+                        | ProviderError::DependencyMetadata {
+                            source: source @ RepositoryError::CranPackages(_),
+                            ..
+                        },
+                    ..
+                }
+                | PubGrubError::ErrorInShouldCancel(
+                    ProviderError::Repository(source @ RepositoryError::CranPackages(_))
+                    | ProviderError::DependencyMetadata {
+                        source: source @ RepositoryError::CranPackages(_),
+                        ..
+                    },
+                ),
+            ) => Self::Repository(source),
             ResolutionError::BasePackages(source) => Self::BasePackages(source),
             ResolutionError::Provider(provider) => {
                 let repository = match &provider {
@@ -424,15 +452,26 @@ impl From<ResolutionError> for ResolveProjectError {
                         inaccessible_git_repository(source).map(str::to_owned)
                     }
                 };
-                let source = ResolutionError::Provider(provider);
                 if let Some(repository) = repository {
                     Self::GitRepositoryUnavailable {
                         repository,
-                        source: Box::new(source),
+                        source: Box::new(ResolutionError::Provider(provider)),
                     }
+                } else if matches!(
+                    provider,
+                    ProviderError::Repository(RepositoryError::CranPackages(_))
+                        | ProviderError::DependencyMetadata {
+                            source: RepositoryError::CranPackages(_),
+                            ..
+                        }
+                ) {
+                    Self::Repository(match provider {
+                        ProviderError::Repository(source)
+                        | ProviderError::DependencyMetadata { source, .. } => source,
+                    })
                 } else {
                     Self::Resolution {
-                        source: Box::new(source),
+                        source: Box::new(ResolutionError::Provider(provider)),
                     }
                 }
             }

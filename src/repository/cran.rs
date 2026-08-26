@@ -49,7 +49,7 @@ impl CranRepository {
     async fn packages_index(&self) -> Result<Arc<http::CranPackagesIndex>, RepositoryError> {
         self.packages
             .try_get_with((), async {
-                let text = http::cran_packages(&self.url)
+                let response = http::cran_packages(&self.url)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -57,18 +57,16 @@ impl CranRepository {
                     .error_for_status()
                     .map_err(|source| RepositoryError::Response {
                         source: Arc::new(source),
-                    })?
+                    })?;
+                let source_name = http::display_safe_url(response.url()).to_string();
+                let text = response
                     .text()
                     .await
                     .map_err(|source| RepositoryError::Response {
                         source: Arc::new(source),
                     })?;
-                let index = text.parse::<http::CranPackagesIndex>().map_err(|details| {
-                    RepositoryError::InvalidData {
-                        resource: "CRAN PACKAGES index".to_string(),
-                        details,
-                    }
-                })?;
+                let index = http::CranPackagesIndex::parse(source_name, text)
+                    .map_err(|source| RepositoryError::CranPackages(Box::new(source)))?;
 
                 Ok::<Arc<http::CranPackagesIndex>, RepositoryError>(Arc::new(index))
             })
@@ -97,25 +95,11 @@ impl PackageRepository for CranRepository {
         Ok(index
             .packages
             .iter()
-            .filter_map(|package| {
-                let version = match package.version.parse::<Version>() {
-                    Ok(version) => version,
-                    Err(error) => {
-                        tracing::debug!(
-                            package = %package.package,
-                            version = %package.version,
-                            repository = %self.url,
-                            error = %error,
-                            "skipping package with invalid latest version"
-                        );
-                        return None;
-                    }
-                };
-
-                Some((
+            .map(|package| {
+                (
                     package.package.clone(),
-                    PackageVersion::new(version, Arc::clone(&repository)),
-                ))
+                    PackageVersion::new(package.version.clone(), Arc::clone(&repository)),
+                )
             })
             .collect())
     }
@@ -127,16 +111,8 @@ impl PackageRepository for CranRepository {
             .packages
             .iter()
             .filter(|entry| entry.package == package)
-            .map(|entry| {
-                entry
-                    .version
-                    .parse::<Version>()
-                    .map_err(|source| RepositoryError::InvalidData {
-                        resource: "package version".to_string(),
-                        details: source.to_string(),
-                    })
-            })
-            .collect::<Result<BTreeSet<_>, RepositoryError>>()?;
+            .map(|entry| entry.version.clone())
+            .collect::<BTreeSet<_>>();
 
         if versions.is_empty() {
             return Ok(BTreeSet::new());
@@ -198,15 +174,14 @@ impl PackageRepository for CranRepository {
         self.descriptions
             .try_get_with(key, async {
                 let index = self.packages_index().await?;
-                let version_string = version.to_string();
-
                 let description = if let Some(entry) = index
                     .packages
                     .iter()
-                    .find(|entry| entry.package == package && entry.version == version_string)
+                    .find(|entry| entry.package == package && &entry.version == version)
                 {
                     packages_entry_to_description(entry)?
                 } else {
+                    let version_string = version.to_string();
                     let response =
                         http::cran_archive_source_tarball(&self.url, package, &version_string)
                             .await
@@ -246,15 +221,7 @@ fn packages_entry_to_description(
             resource: "Package in CRAN PACKAGES index".to_string(),
             details: source.to_string(),
         })?;
-    let version =
-        entry
-            .version
-            .parse::<Version>()
-            .map_err(|source| RepositoryError::InvalidData {
-                resource: "Version in CRAN PACKAGES index".to_string(),
-                details: source.to_string(),
-            })?;
-    description.set_version(&version);
+    description.set_version(&entry.version);
 
     if !entry.depends.is_empty() {
         description.set_depends(entry.depends.clone());

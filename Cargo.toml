@@ -14,7 +14,7 @@ async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }
 bytes = "1"
 cliclack = "0.5.6"
-deb822-fast = "0.2.3"
+deb822-lossless = "0.5.18"
 directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
