@@ -19,6 +19,10 @@ pub(crate) enum Error {
     #[diagnostic(transparent)]
     ProjectLibrary(#[from] ProjectLibraryError),
 
+    #[error("command not found: {program}")]
+    #[diagnostic(code(rpx::run::command_not_found))]
+    CommandNotFound { program: String },
+
     #[error("failed to run {program}")]
     #[diagnostic(code(rpx::run::command_failed))]
     CommandFailed {
@@ -40,9 +44,17 @@ pub(crate) async fn run(args: RunArgs) -> Result<(), Error> {
         .args(command_args)
         .status()
         .await
-        .map_err(|source| Error::CommandFailed {
-            program: program.clone(),
-            source,
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                Error::CommandNotFound {
+                    program: program.clone(),
+                }
+            } else {
+                Error::CommandFailed {
+                    program: program.clone(),
+                    source,
+                }
+            }
         })?;
 
     exit_with_status(status.code());

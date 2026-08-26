@@ -54,6 +54,43 @@ fn run_from_subdirectory_uses_project_library_and_preserves_working_directory() 
 }
 
 #[test]
+fn run_reports_missing_command() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-missing-command";
+    create_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run command-that-does-not-exist");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::run::command_not_found"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("command not found: command-that-does-not-exist"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No such file or directory"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn run_preserves_command_errors_and_exit_code() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-command-error";
+    create_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run sh -c 'echo command-error >&2; exit 42'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 42, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stderr.trim(), "command-error");
+}
+
+#[test]
 fn runs_rpx_init_in_empty_directory() {
     let container = start_container();
     let project_path = "/tmp/new-rpx-project";
