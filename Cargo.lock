@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "rpx"
-version = "2.0.0-azure.2"
+version = "2.0.0-azure.3"
 dependencies = [
  "async-trait",
  "bytes",
