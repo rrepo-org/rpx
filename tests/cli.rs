@@ -152,7 +152,7 @@ fn run_requires_a_lockfile_before_starting_the_command() {
 
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("rpx::run::lockfile_required"),
+        stderr.contains("rpx::project::lockfile_read_failed"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     let (exit_code, stdout, stderr) = run_shell_command(

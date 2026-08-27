@@ -406,31 +406,6 @@ pub fn validate_locked_resolution(
     }
 }
 
-pub(crate) fn validate_runtime_resolution(
-    project_path: &Path,
-    description: &RDescription,
-    r_version: &semver::Version,
-    lockfile: &Lockfile,
-) -> Result<(), LockedResolutionError> {
-    let roots = project_dependencies(project_path, description)?;
-    let failures = (lockfile.requirements != roots)
-        .then_some(LockedResolutionFailure::PackageRequirementsChanged)
-        .into_iter()
-        .chain(
-            (&lockfile.r != r_version).then(|| LockedResolutionFailure::RVersionChanged {
-                locked: lockfile.r.clone(),
-                current: r_version.clone(),
-            }),
-        )
-        .collect::<Vec<_>>();
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(LockedResolutionError::Validation { failures })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResolutionPolicy {
     AlwaysResolve,

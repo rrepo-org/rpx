@@ -1,18 +1,16 @@
 use crate::{
     cli::RunArgs,
-    lockfile::{LOCKFILE_NAME, LockfileReadError, read_lockfile},
     project::{
-        LibraryMismatches, LockedResolutionError, ProjectLibraryError, ProjectLoadError,
-        ensure_project_library, library_mismatches, load_project, project_library_path,
-        validate_runtime_resolution,
+        LibraryMismatches, LoadProjectResolutionError, ProjectLibraryError, ProjectLoadError,
+        ensure_project_library, library_mismatches, load_project, load_project_resolution,
+        project_library_path,
     },
     r::{
-        BasePackagesError, InstalledPackagesError, RVersionError, RVirtualEnv, base_packages,
-        installed_packages, r_version_async,
+        BasePackagesError, InstalledPackagesError, RVirtualEnv, base_packages, installed_packages,
     },
 };
 use miette::Diagnostic;
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsString};
 use thiserror::Error;
 
 const RECURSION_DEPTH_ENV: &str = "RPX_RUN_RECURSION_DEPTH";
@@ -24,24 +22,9 @@ pub(crate) enum Error {
     #[diagnostic(transparent)]
     ProjectLoad(#[from] ProjectLoadError),
 
-    #[error("{} is required to run commands in this project", path.display())]
-    #[diagnostic(
-        code(rpx::run::lockfile_required),
-        help("Run `rpx lock`, then `rpx sync`, before running project commands.")
-    )]
-    LockfileRequired { path: PathBuf },
-
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Lockfile(#[from] LockfileReadError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    LockedResolution(#[from] LockedResolutionError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    RVersion(#[from] RVersionError),
+    LoadResolution(#[from] LoadProjectResolutionError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -118,11 +101,14 @@ pub(crate) struct PreparedCommand {
 pub(crate) async fn run(args: RunArgs) -> Result<RunOutcome, Error> {
     let depth = recursion_depth()?;
     let project = load_project()?;
-    let lockfile = required_lockfile(&project.root)?;
     let project_library = project_library_path(&project.root);
 
-    let (r_version, base_packages, installed) = tokio::try_join!(
-        async { r_version_async().await.map_err(Error::RVersion) },
+    let (resolution, base_packages, installed) = tokio::try_join!(
+        async {
+            load_project_resolution(&project)
+                .await
+                .map_err(Error::LoadResolution)
+        },
         async { base_packages().await.map_err(Error::BasePackages) },
         async {
             installed_packages(&project_library)
@@ -130,9 +116,9 @@ pub(crate) async fn run(args: RunArgs) -> Result<RunOutcome, Error> {
                 .map_err(Error::InstalledPackages)
         },
     )?;
-    validate_runtime_resolution(&project.root, &project.description, &r_version, &lockfile)?;
 
-    let expected = lockfile
+    let expected = resolution
+        .lockfile
         .packages
         .iter()
         .filter(|(name, _)| !base_packages.contains(*name))
@@ -155,19 +141,6 @@ pub(crate) async fn run(args: RunArgs) -> Result<RunOutcome, Error> {
 
     #[cfg(windows)]
     prepare_command(program, command_args, &project_library, depth + 1).await
-}
-
-fn required_lockfile(project_path: &PathBuf) -> Result<crate::lockfile::Lockfile, Error> {
-    match read_lockfile(project_path) {
-        Err(LockfileReadError::Read { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Err(Error::LockfileRequired {
-                path: project_path.join(LOCKFILE_NAME),
-            })
-        }
-        result => result.map_err(Error::Lockfile),
-    }
 }
 
 fn recursion_depth() -> Result<u32, Error> {

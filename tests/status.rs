@@ -101,7 +101,11 @@ fn reports_repository_lockfile_drift() {
 
     let run_command = format!("cd {project_path} && rpx run true");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &run_command);
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::project::repositories_changed"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
