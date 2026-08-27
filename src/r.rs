@@ -159,6 +159,12 @@ fn project_r_command(program: impl AsRef<OsStr>, project_library: &Path) -> Comm
     command
 }
 
+fn rscript_query() -> Command {
+    let mut command = Command::new("Rscript");
+    command.arg("--vanilla");
+    command
+}
+
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
@@ -294,14 +300,15 @@ pub async fn installed_packages(
     }
 
     let expression = concat!(
-        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
+        "args <- commandArgs(trailingOnly = TRUE);",
+        "packages <- utils::installed.packages(lib.loc = args[[1L]]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
-        "write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
+        "utils::write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let mut command = project_r_command("Rscript", project_library);
-    command.arg("-e").arg(expression);
+    let mut command = rscript_query();
+    command.arg("-e").arg(expression).arg(project_library);
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| InstalledPackagesError::Command { source })?;
@@ -410,15 +417,24 @@ pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
 }
 
 async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
-    let mut command = tokio::process::Command::new("Rscript");
-    command.arg("-e").arg("cat(as.character(getRversion()))");
+    let mut command = Command::new("Rscript");
+    command.arg("--version");
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| RVersionError::Command { source })?;
 
-    let version =
+    let output =
         String::from_utf8(output.stdout).map_err(|source| RVersionError::InvalidUtf8 { source })?;
-    let version = version.trim();
+
+    parse_rscript_version(&output)
+}
+
+fn parse_rscript_version(output: &str) -> Result<semver::Version, RVersionError> {
+    let output = output.trim();
+    let version = output
+        .strip_prefix("Rscript (R) version ")
+        .and_then(|remainder| remainder.split_whitespace().next())
+        .unwrap_or(output);
 
     version
         .parse()
@@ -470,10 +486,10 @@ fn write_install_log(
 }
 
 async fn fetch_base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
-    let mut command = Command::new("Rscript");
+    let mut command = rscript_query();
     command
         .arg("-e")
-        .arg("writeLines(rownames(installed.packages(priority = 'base')))");
+        .arg("writeLines(rownames(utils::installed.packages(priority = 'base')))");
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| BasePackagesError::Command { source })?;
@@ -547,6 +563,23 @@ mod tests {
             error,
             InstalledPackagesError::InvalidVersion { package, version, .. }
                 if package == "digest" && version == "not-a-version"
+        ));
+    }
+
+    #[test]
+    fn parses_rscript_version_output() {
+        let version = parse_rscript_version("Rscript (R) version 4.5.2 (2025-10-31)\n").unwrap();
+
+        assert_eq!(version, semver::Version::new(4, 5, 2));
+    }
+
+    #[test]
+    fn rejects_invalid_rscript_version_output() {
+        let error = parse_rscript_version("unexpected output\n").unwrap_err();
+
+        assert!(matches!(
+            error,
+            RVersionError::InvalidVersion { version, .. } if version == "unexpected output"
         ));
     }
 

@@ -33,6 +33,21 @@ fn runs_rpx_run_with_isolated_library() {
 }
 
 #[test]
+fn run_ignores_r_profiles_during_environment_validation() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-profile";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+    let command = format!(
+        "cd {project_path} && printf '%s\n' \"cat('profile-noise')\" \".libPaths(rev(.libPaths()))\" > .Rprofile && rpx run sh -c 'printf command-ran'"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stdout, "command-ran");
+}
+
+#[test]
 fn run_from_subdirectory_uses_project_library_and_preserves_working_directory() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-run-subdirectory";
