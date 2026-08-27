@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use crate::description::DependencyField;
 
@@ -37,7 +37,7 @@ pub enum Commands {
 
     #[command(
         about = "Run a command in the project environment",
-        long_about = "Run a command with this project's isolated R package library activated."
+        long_about = "Run a command directly with this project's isolated R package library activated. The command is not interpreted by a shell. The working directory, environment, and standard streams are inherited, with R_LIBS_USER set to the project library."
     )]
     Run(RunArgs),
 
@@ -138,13 +138,13 @@ pub struct RemoveArgs {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     #[arg(
-        help = "Command and arguments to run inside the project environment",
+        help = "Command and arguments to execute directly inside the project environment",
         value_name = "COMMAND",
         trailing_var_arg = true,
         allow_hyphen_values = true,
         required = true
     )]
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 }
 
 #[derive(Args, Debug)]
@@ -387,6 +387,54 @@ mod tests {
                 && author_email == "author@example.com"
                 && license == InitLicense::Apache2
         ));
+    }
+
+    #[test]
+    fn parses_run_arguments_without_shell_interpretation() {
+        let Commands::Run(args) =
+            parse(&["rpx", "run", "program", "--flag", "", "*", "|", "$VALUE"])
+        else {
+            panic!("run command should parse");
+        };
+
+        assert_eq!(
+            args.command,
+            ["program", "--flag", "", "*", "|", "$VALUE"].map(OsString::from)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_non_utf8_run_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let argument = OsString::from_vec(vec![0xff]);
+        let cli = Cli::try_parse_from([
+            OsString::from("rpx"),
+            OsString::from("run"),
+            OsString::from("program"),
+            argument.clone(),
+        ])
+        .expect("run command should accept native arguments");
+        let Commands::Run(args) = cli.command else {
+            panic!("run command should parse");
+        };
+
+        assert_eq!(args.command, [OsString::from("program"), argument]);
+    }
+
+    #[test]
+    fn run_help_describes_direct_execution() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("run")
+            .expect("command should exist")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("not interpreted by a shell"));
+        assert!(help.contains("standard streams are inherited"));
+        assert!(help.contains("R_LIBS_USER"));
     }
 
     #[test]

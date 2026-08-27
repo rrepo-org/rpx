@@ -180,6 +180,15 @@ rpx run R
 rpx run Rscript scripts/check.R
 ```
 
+`rpx run` executes the command directly without a shell. It preserves the
+current working directory, environment, and standard streams while setting
+`R_LIBS_USER` to the project library. Invoke a shell explicitly when using
+shell syntax such as pipes, redirects, or variable expansion:
+
+```bash
+rpx run sh -c 'Rscript scripts/check.R | tee check.log'
+```
+
 If local package state becomes confusing, remove the project library and caches:
 
 ```bash

@@ -1,7 +1,7 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
 use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
-use r_description::{RDescription, Relation, VersionRequirement};
+use r_description::{RDescription, Relation, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
@@ -32,6 +32,111 @@ use crate::{
 pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
 
 static NEXT_STAGED_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PackageVersionMismatch {
+    pub(crate) package: String,
+    pub(crate) installed: Version,
+    pub(crate) expected: Version,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LibraryMismatches {
+    pub(crate) missing_packages: Vec<String>,
+    pub(crate) extra_packages: Vec<String>,
+    pub(crate) version_mismatches: Vec<PackageVersionMismatch>,
+}
+
+impl LibraryMismatches {
+    pub(crate) fn is_exact(&self) -> bool {
+        self.missing_packages.is_empty()
+            && self.extra_packages.is_empty()
+            && self.version_mismatches.is_empty()
+    }
+
+    pub(crate) fn is_runnable(&self) -> bool {
+        self.missing_packages.is_empty() && self.version_mismatches.is_empty()
+    }
+
+    pub(crate) fn into_runtime_mismatches(mut self) -> Self {
+        self.extra_packages.clear();
+        self
+    }
+}
+
+impl std::fmt::Display for LibraryMismatches {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut groups = Vec::new();
+        if !self.missing_packages.is_empty() {
+            groups.push(format!(
+                "Required packages not installed:\n- {}",
+                self.missing_packages.join("\n- ")
+            ));
+        }
+        if !self.extra_packages.is_empty() {
+            groups.push(format!(
+                "Unexpected packages installed:\n- {}",
+                self.extra_packages.join("\n- ")
+            ));
+        }
+        if !self.version_mismatches.is_empty() {
+            let mismatches = self
+                .version_mismatches
+                .iter()
+                .map(|mismatch| {
+                    format!(
+                        "{} ({} installed, {} expected)",
+                        mismatch.package, mismatch.installed, mismatch.expected
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            groups.push(format!(
+                "Installed versions that differ from expected versions:\n- {mismatches}"
+            ));
+        }
+        formatter.write_str(&groups.join("\n\n"))
+    }
+}
+
+pub(crate) fn library_mismatches(
+    expected_packages: &BTreeMap<String, Version>,
+    installed: &BTreeMap<String, PackageVersion>,
+    ignored_extra_package: Option<&str>,
+) -> LibraryMismatches {
+    let missing_packages = expected_packages
+        .keys()
+        .filter(|package| !installed.contains_key(*package))
+        .cloned()
+        .collect();
+    let version_mismatches = expected_packages
+        .iter()
+        .filter_map(|(package, expected)| {
+            installed
+                .get(package)
+                .filter(|installed| installed.version() != expected)
+                .map(|installed| PackageVersionMismatch {
+                    package: package.clone(),
+                    installed: installed.version().clone(),
+                    expected: expected.clone(),
+                })
+        })
+        .collect();
+    let extra_packages = installed
+        .keys()
+        .filter(|package| {
+            ignored_extra_package != Some(package.as_str())
+                && !expected_packages.contains_key(*package)
+        })
+        .cloned()
+        .collect();
+
+    LibraryMismatches {
+        missing_packages,
+        extra_packages,
+        version_mismatches,
+    }
+}
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum ProjectLibraryError {
@@ -195,7 +300,9 @@ pub enum LockedResolutionError {
     #[error("rpx.lock does not match the current project configuration")]
     #[diagnostic(
         code(rpx::project::locked_resolution_invalid),
-        help("Run `rpx lock` to update rpx.lock.")
+        help(
+            "Run `rpx lock` to update rpx.lock, then `rpx sync` to synchronize the project library."
+        )
     )]
     Validation {
         #[related]
@@ -284,6 +391,31 @@ pub fn validate_locked_resolution(
             (lockfile.requirements != roots)
                 .then_some(LockedResolutionFailure::PackageRequirementsChanged),
         )
+        .chain(
+            (&lockfile.r != r_version).then(|| LockedResolutionFailure::RVersionChanged {
+                locked: lockfile.r.clone(),
+                current: r_version.clone(),
+            }),
+        )
+        .collect::<Vec<_>>();
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(LockedResolutionError::Validation { failures })
+    }
+}
+
+pub(crate) fn validate_runtime_resolution(
+    project_path: &Path,
+    description: &RDescription,
+    r_version: &semver::Version,
+    lockfile: &Lockfile,
+) -> Result<(), LockedResolutionError> {
+    let roots = project_dependencies(project_path, description)?;
+    let failures = (lockfile.requirements != roots)
+        .then_some(LockedResolutionFailure::PackageRequirementsChanged)
+        .into_iter()
         .chain(
             (&lockfile.r != r_version).then(|| LockedResolutionFailure::RVersionChanged {
                 locked: lockfile.r.clone(),

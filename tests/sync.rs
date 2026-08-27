@@ -71,6 +71,7 @@ fn runs_rpx_lock_from_current_library() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-lock";
     create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
     let install_command = format!(
         "mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"install.packages('digest')\""
     );
@@ -107,7 +108,13 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let before = read_project_file(&container, project_path, "rpx.lock");
-    assert_package_state(&container, project_path, "digest", "FALSE");
+    let status_command = format!("cd {project_path} && rpx status");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("Required packages not installed") && stderr.contains("digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 
     let sync_command = format!("mkdir -p {working_path} && cd {working_path} && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);

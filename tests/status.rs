@@ -99,6 +99,10 @@ fn reports_repository_lockfile_drift() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
+    let run_command = format!("cd {project_path} && rpx run true");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &run_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -148,6 +152,10 @@ fn runs_rpx_status_for_extra_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &extra_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
+    let run_command = format!("cd {project_path} && rpx run true");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &run_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -177,6 +185,14 @@ fn runs_rpx_status_for_version_mismatch() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_description);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
+    let run_command = format!("cd {project_path} && rpx run true");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &run_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::run::library_out_of_sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -201,6 +217,14 @@ fn reports_r_runtime_version_lockfile_drift() {
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let run_command = format!("cd {project_path} && rpx run true");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &run_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::project::r_version_changed"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);

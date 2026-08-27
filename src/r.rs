@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Output,
@@ -153,12 +154,20 @@ pub enum RVersionError {
 }
 
 pub(crate) trait RVirtualEnv {
-    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self;
+    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self;
 }
 
 impl RVirtualEnv for tokio::process::Command {
-    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self {
+    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self {
         let mut command = tokio::process::Command::new(program.as_ref());
+        command.env("R_LIBS_USER", project_library);
+        command
+    }
+}
+
+impl RVirtualEnv for std::process::Command {
+    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self {
+        let mut command = std::process::Command::new(program.as_ref());
         command.env("R_LIBS_USER", project_library);
         command
     }
