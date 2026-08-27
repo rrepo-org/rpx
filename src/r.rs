@@ -1,10 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs,
     path::{Path, PathBuf},
     process::Output,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use miette::Diagnostic;
@@ -19,15 +17,17 @@ pub enum RSubprocessError {
     #[error("failed to start {program}: {source}")]
     #[diagnostic(code(rpx::r::start_failed))]
     Start {
-        program: &'static str,
+        program: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("{program} exited unsuccessfully with code {exit_code:?}: {summary}")]
+    #[error(
+        "{program} exited unsuccessfully with code {exit_code:?}: {summary}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+    )]
     #[diagnostic(code(rpx::r::command_failed))]
     Failed {
-        program: &'static str,
+        program: String,
         exit_code: Option<i32>,
         stdout: String,
         stderr: String,
@@ -36,33 +36,69 @@ pub enum RSubprocessError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum PackageInstallError {
-    #[error("failed to install {target}: {source}")]
-    #[diagnostic(code(rpx::install::command_failed))]
-    Command {
-        target: String,
-        #[source]
-        source: RSubprocessError,
-    },
-
-    #[error(
-        "failed to install {target}: {source} (log: {})",
-        log_path.display()
-    )]
-    #[diagnostic(code(rpx::install::command_failed))]
-    Failed {
-        target: String,
-        log_path: PathBuf,
-        #[source]
-        source: RSubprocessError,
-    },
-
-    #[error("failed to write installation log at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::install::log_write_failed))]
-    LogWrite {
+pub enum PackageBuildError {
+    #[error("failed to prepare package artifact directory at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::artifact_directory_failed))]
+    ArtifactDirectory {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    #[error("failed to create temporary package build directory in {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::temporary_directory_failed))]
+    TemporaryDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to build package at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::command_failed))]
+    Command {
+        path: PathBuf,
+        #[source]
+        source: Box<RSubprocessError>,
+    },
+
+    #[error("R CMD build did not create the expected source archive at {}", path.display())]
+    #[diagnostic(code(rpx::build::archive_missing))]
+    ArchiveMissing { path: PathBuf },
+
+    #[error("failed to inspect source archive at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::archive_inspection_failed))]
+    InspectArchive {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to publish source archive at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::archive_publication_failed))]
+    PublishArchive {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to clean temporary package build directory at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::temporary_directory_cleanup_failed))]
+    Cleanup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum PackageInstallError {
+    #[error("failed to {action} {target}: {source}")]
+    #[diagnostic(code(rpx::install::command_failed))]
+    Command {
+        action: &'static str,
+        target: String,
+        #[source]
+        source: Box<RSubprocessError>,
     },
 }
 
@@ -164,7 +200,7 @@ fn rscript_query() -> Command {
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
-pub async fn install_local_package(
+pub async fn install_package_artifact(
     project_library: &Path,
     artifact_path: &Path,
     package: &str,
@@ -195,47 +231,105 @@ pub async fn install_local_package(
         .arg(target_library)
         .arg(package)
         .arg(version);
-    let output = run_subprocess(command, "Rscript").await;
-
-    install_command_result(output, format!("{package}@{version}"))
+    command.kill_on_drop(true);
+    run_subprocess(command)
+        .await
+        .map(|_| ())
+        .map_err(|source| PackageInstallError::Command {
+            action: "install",
+            target: format!("{package}@{version}"),
+            source: Box::new(source),
+        })
 }
 
-pub async fn install_package_directory(
+pub async fn build_package_archive(
     package_root: &Path,
-    target_library: &Path,
-    target: &str,
-) -> Result<(), PackageInstallError> {
-    let mut command = project_r_command("R", target_library);
-    command
-        .arg("CMD")
-        .arg("INSTALL")
-        .arg("-l")
-        .arg(target_library)
-        .arg(package_root);
-    let output = run_subprocess(command, "R").await;
+    package: &str,
+    version: &str,
+    archive: &Path,
+) -> Result<(), PackageBuildError> {
+    let artifact_directory = archive
+        .parent()
+        .expect("source artifact path should have a parent");
+    tokio::fs::create_dir_all(artifact_directory)
+        .await
+        .map_err(|source| PackageBuildError::ArtifactDirectory {
+            path: artifact_directory.to_path_buf(),
+            source,
+        })?;
+    let workspace = tempfile::Builder::new()
+        .prefix(".rpx-build-")
+        .tempdir_in(artifact_directory)
+        .map_err(|source| PackageBuildError::TemporaryDirectory {
+            path: artifact_directory.to_path_buf(),
+            source,
+        })?;
+    let workspace_path = workspace.path().to_path_buf();
+    let staged_archive = workspace.path().join(format!("{package}_{version}.tar.gz"));
 
-    install_command_result(output, target.to_string())
-}
+    let result = async {
+        let mut build = Command::new("R");
+        build
+            .arg("CMD")
+            .arg("build")
+            .arg("--no-build-vignettes")
+            .arg("--no-manual")
+            .arg("--no-resave-data")
+            .arg(package_root)
+            .current_dir(&workspace_path);
+        build.kill_on_drop(true);
+        run_subprocess(build)
+            .await
+            .map_err(|source| PackageBuildError::Command {
+                path: package_root.to_path_buf(),
+                source: Box::new(source),
+            })?;
 
-fn install_command_result(
-    result: Result<Output, RSubprocessError>,
-    target: String,
-) -> Result<(), PackageInstallError> {
-    let Err(source) = result else {
-        return Ok(());
-    };
-    match &source {
-        RSubprocessError::Start { .. } => Err(PackageInstallError::Command { target, source }),
-        RSubprocessError::Failed { stdout, stderr, .. } => {
-            let log_path = install_log_path();
-            write_install_log(&log_path, stdout, stderr)?;
-            Err(PackageInstallError::Failed {
-                target,
-                log_path,
-                source,
-            })
+        match tokio::fs::metadata(&staged_archive).await {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(PackageBuildError::ArchiveMissing {
+                    path: staged_archive.clone(),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PackageBuildError::ArchiveMissing {
+                    path: staged_archive.clone(),
+                });
+            }
+            Err(source) => {
+                return Err(PackageBuildError::InspectArchive {
+                    path: staged_archive.clone(),
+                    source,
+                });
+            }
         }
+
+        tempfile::TempPath::try_from_path(staged_archive.clone())
+            .and_then(|temporary| temporary.persist(archive).map_err(|error| error.error))
+            .map_err(|source| PackageBuildError::PublishArchive {
+                path: archive.to_path_buf(),
+                source,
+            })?;
+
+        Ok(())
     }
+    .await;
+
+    let cleanup = tokio::task::spawn_blocking(move || workspace.close())
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result);
+    if let Err(error) = &cleanup
+        && result.is_err()
+    {
+        tracing::warn!(%error, path = %workspace_path.display(), "failed to clean temporary package build directory");
+    }
+    result?;
+    cleanup.map_err(|source| PackageBuildError::Cleanup {
+        path: workspace_path,
+        source,
+    })
 }
 
 pub async fn base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
@@ -302,7 +396,7 @@ pub async fn installed_packages(
 
     let mut command = rscript_query();
     command.arg("-e").arg(expression).arg(project_library);
-    let output = run_subprocess(command, "Rscript")
+    let output = run_subprocess(command)
         .await
         .map_err(|source| InstalledPackagesError::Command { source })?;
     let stdout = String::from_utf8(output.stdout)
@@ -408,7 +502,7 @@ pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
 async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
     let mut command = Command::new("Rscript");
     command.arg("--version");
-    let output = run_subprocess(command, "Rscript")
+    let output = run_subprocess(command)
         .await
         .map_err(|source| RVersionError::Command { source })?;
 
@@ -428,14 +522,19 @@ async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
         })
 }
 
-async fn run_subprocess(
-    mut command: Command,
-    program: &'static str,
-) -> Result<Output, RSubprocessError> {
+async fn run_subprocess(mut command: Command) -> Result<Output, RSubprocessError> {
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
     let output = command
         .output()
         .await
-        .map_err(|source| RSubprocessError::Start { program, source })?;
+        .map_err(|source| RSubprocessError::Start {
+            program: program.clone(),
+            source,
+        })?;
     if output.status.success() {
         return Ok(output);
     }
@@ -449,32 +548,12 @@ async fn run_subprocess(
     })
 }
 
-fn write_install_log(
-    log_path: &Path,
-    stdout: &str,
-    stderr: &str,
-) -> Result<(), PackageInstallError> {
-    let mut contents = String::new();
-    contents.push_str("# stdout\n");
-    contents.push_str(stdout);
-    if !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str("# stderr\n");
-    contents.push_str(stderr);
-
-    fs::write(log_path, contents).map_err(|source| PackageInstallError::LogWrite {
-        path: log_path.to_path_buf(),
-        source,
-    })
-}
-
 async fn fetch_base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
     let mut command = rscript_query();
     command
         .arg("-e")
         .arg("writeLines(rownames(utils::installed.packages(priority = 'base')))");
-    let output = run_subprocess(command, "Rscript")
+    let output = run_subprocess(command)
         .await
         .map_err(|source| BasePackagesError::Command { source })?;
     let stdout = String::from_utf8(output.stdout)
@@ -515,17 +594,9 @@ fn summarize_subprocess_output(stdout: &[u8], stderr: &[u8]) -> String {
         .to_string()
 }
 
-fn install_log_path() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("rpx-install-{}-{unique}.log", std::process::id()))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     use super::*;
 
@@ -552,7 +623,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_project_library_has_no_installed_packages() {
-        let path = install_log_path();
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("missing-library");
 
         let packages = installed_packages(&path)
             .await
@@ -563,7 +635,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_library_must_be_a_directory() {
-        let path = install_log_path();
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("library");
         fs::write(&path, "not a directory").expect("test file should be written");
 
         let error = installed_packages(&path)
@@ -574,6 +647,5 @@ mod tests {
             error,
             InstalledPackagesError::LibraryNotDirectory { path: actual } if actual == path
         ));
-        fs::remove_file(path).expect("test file should be removed");
     }
 }

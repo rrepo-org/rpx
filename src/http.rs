@@ -14,6 +14,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::IsTerminal;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use target_lexicon::{Aarch64Architecture, Architecture, OperatingSystem, Triple};
 use thiserror::Error;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -754,52 +755,61 @@ pub async fn rrepo_source_artifact(
     client().get(url).send().await
 }
 
-pub async fn rrepo_windows_binary(
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-    r_version: &semver::Version,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "packages",
-            package,
-            "versions",
-            version,
-            "binaries",
-            "windows",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-        ]);
-
-    client().get(url).send().await
+#[derive(Debug, Error)]
+pub enum BinaryArtifactRequestError {
+    #[error("binary artifacts are not supported for target {target}")]
+    UnsupportedTarget { target: Triple },
+    #[error(transparent)]
+    Request(#[from] reqwest_middleware::Error),
 }
 
-pub async fn rrepo_macos_binary(
+pub(crate) fn r_macos_binary_target(
+    target: &Triple,
+) -> Result<&'static str, BinaryArtifactRequestError> {
+    match (target.operating_system, target.architecture) {
+        (
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_),
+            Architecture::Aarch64(Aarch64Architecture::Aarch64),
+        ) => Ok("big-sur-arm64"),
+        (OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_), Architecture::X86_64) => {
+            Ok("big-sur-x86_64")
+        }
+        _ => Err(BinaryArtifactRequestError::UnsupportedTarget {
+            target: target.clone(),
+        }),
+    }
+}
+
+pub async fn rrepo_binary(
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
-    target: &str,
+    target: &Triple,
     r_version: &semver::Version,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
+) -> Result<reqwest::Response, BinaryArtifactRequestError> {
     let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
+    let r_version = format!("{}.{}", r_version.major, r_version.minor);
+    let target_path = match target.operating_system {
+        OperatingSystem::Windows => vec!["windows", r_version.as_str()],
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+            vec!["macos", r_macos_binary_target(target)?, r_version.as_str()]
+        }
+        _ => {
+            return Err(BinaryArtifactRequestError::UnsupportedTarget {
+                target: target.clone(),
+            });
+        }
+    };
+    let mut segments = url
+        .path_segments_mut()
+        .expect("repository base URL should support path segments");
+    segments
         .pop_if_empty()
-        .extend([
-            "packages",
-            package,
-            "versions",
-            version,
-            "binaries",
-            "macos",
-            target,
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-        ]);
+        .extend(["packages", package, "versions", version, "binaries"]);
+    segments.extend(target_path);
+    drop(segments);
 
-    client().get(url).send().await
+    Ok(client().get(url).send().await?)
 }
 
 pub async fn cran_packages(
@@ -883,56 +893,52 @@ pub async fn cran_latest_package_description(
     client().get(url).send().await
 }
 
-pub async fn cran_windows_binary(
+pub async fn cran_binary(
     base_url: &reqwest::Url,
-    r_version: &semver::Version,
     package: &str,
     version: &str,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let file_name = format!("{package}_{version}.zip");
-    let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "bin",
-            "windows",
-            "contrib",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-            &file_name,
-        ]);
-
-    client().get(url).send().await
-}
-
-pub async fn cran_macos_binary(
-    base_url: &reqwest::Url,
-    target: &str,
+    target: &Triple,
     r_version: &semver::Version,
-    package: &str,
-    version: &str,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let file_name = format!("{package}_{version}.tgz");
+) -> Result<reqwest::Response, BinaryArtifactRequestError> {
+    let r_version = format!("{}.{}", r_version.major, r_version.minor);
+    let file_name;
+    let target_path = match target.operating_system {
+        OperatingSystem::Windows => {
+            file_name = format!("{package}_{version}.zip");
+            vec!["windows", "contrib", r_version.as_str(), file_name.as_str()]
+        }
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+            file_name = format!("{package}_{version}.tgz");
+            vec![
+                "macosx",
+                r_macos_binary_target(target)?,
+                "contrib",
+                r_version.as_str(),
+                file_name.as_str(),
+            ]
+        }
+        _ => {
+            return Err(BinaryArtifactRequestError::UnsupportedTarget {
+                target: target.clone(),
+            });
+        }
+    };
     let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "bin",
-            "macosx",
-            target,
-            "contrib",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-            &file_name,
-        ]);
+    let mut segments = url
+        .path_segments_mut()
+        .expect("repository base URL should support path segments");
+    segments.pop_if_empty().extend(["bin"]);
+    segments.extend(target_path);
+    drop(segments);
 
-    client().get(url).send().await
+    Ok(client().get(url).send().await?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CranPackagesIndex, CranPackagesParseError, CranPackagesParseIssue, display_safe_url,
+        BinaryArtifactRequestError, CranPackagesIndex, CranPackagesParseError,
+        CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
     };
 
     fn parse_packages_index(input: &str) -> Result<CranPackagesIndex, CranPackagesParseError> {
@@ -950,6 +956,20 @@ mod tests {
             display_safe_url(&url).as_str(),
             "https://example.test/repository/src/contrib/PACKAGES"
         );
+    }
+
+    #[test]
+    fn derives_r_macos_binary_targets_from_target_lexicon() {
+        let arm = "aarch64-apple-darwin".parse().unwrap();
+        let x86 = "x86_64-apple-darwin".parse().unwrap();
+        let linux = "x86_64-unknown-linux-gnu".parse().unwrap();
+
+        assert_eq!(r_macos_binary_target(&arm).unwrap(), "big-sur-arm64");
+        assert_eq!(r_macos_binary_target(&x86).unwrap(), "big-sur-x86_64");
+        assert!(matches!(
+            r_macos_binary_target(&linux),
+            Err(BinaryArtifactRequestError::UnsupportedTarget { .. })
+        ));
     }
 
     #[test]

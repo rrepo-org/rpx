@@ -1,164 +1,159 @@
-use crate::project::cache_dir_path;
+use crate::{git::GitUrl, project::cache_dir_path};
+use git2::Oid;
+use r_description::Version;
+use semver::Version as RVersion;
 use std::{
     collections::hash_map::DefaultHasher,
-    fmt, fs,
     hash::{Hash, Hasher},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
+use target_lexicon::{OperatingSystem, Triple};
+use url::Url;
 
-pub(crate) fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {
-    let path = cache_dir_path()
-        .join("artifacts")
-        .join(package)
-        .join(version)
-        .join(file_name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).expect("failed to create cache directory");
-    }
-    path
+const SOURCE_ARTIFACT_CACHE_VERSION: &str = "v1";
+const BINARY_ARTIFACT_CACHE_VERSION: &str = "v1";
+const COMPILED_PACKAGE_CACHE_VERSION: &str = "v1";
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RegistryIdentity {
+    Cran(Url),
+    Rrepo(Url),
 }
 
-pub(crate) fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
-    let path = cache_dir_path()
-        .join("build-temp")
-        .join(format!("{package}-{unique}"))
-        .join("library");
-    fs::create_dir_all(&path).expect("failed to create temporary build library");
-    path
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SourceArtifactIdentity {
+    Registry(RegistryIdentity),
+    Git {
+        remote: GitUrl,
+        commit: Oid,
+        subdirectory: Option<PathBuf>,
+    },
+    Local(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CompiledPackageCacheKey {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SourceArtifactCacheKey {
+    source: SourceArtifactIdentity,
     package: String,
-    version: String,
-    r_version: semver::Version,
-    platform: String,
+    version: Version,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct BinaryArtifactCacheKey {
+    repository: RegistryIdentity,
+    package: String,
+    version: Version,
+    target: Triple,
+    r_version: RVersion,
+}
+
+impl SourceArtifactCacheKey {
+    pub(crate) fn new(
+        source: SourceArtifactIdentity,
+        package: impl Into<String>,
+        version: Version,
+    ) -> Self {
+        Self {
+            source,
+            package: package.into(),
+            version,
+        }
+    }
+}
+
+impl BinaryArtifactCacheKey {
+    pub(crate) fn new(
+        repository: RegistryIdentity,
+        package: impl Into<String>,
+        version: Version,
+        target: Triple,
+        r_version: RVersion,
+    ) -> Self {
+        Self {
+            repository,
+            package: package.into(),
+            version,
+            target,
+            r_version,
+        }
+    }
+}
+
+fn cache_key_digest(key: &impl Hash) -> String {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub(crate) fn source_artifact_cache_path(key: &SourceArtifactCacheKey) -> PathBuf {
+    cache_dir_path()
+        .join("artifacts")
+        .join("source")
+        .join(SOURCE_ARTIFACT_CACHE_VERSION)
+        .join(&key.package)
+        .join(cache_key_digest(key))
+        .join("artifact.tar.gz")
+}
+
+pub(crate) fn binary_artifact_cache_path(key: &BinaryArtifactCacheKey) -> PathBuf {
+    let file_name = match key.target.operating_system {
+        OperatingSystem::Windows => "artifact.zip",
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => "artifact.tgz",
+        _ => "artifact.bin",
+    };
+    cache_dir_path()
+        .join("artifacts")
+        .join("binary")
+        .join(BINARY_ARTIFACT_CACHE_VERSION)
+        .join(&key.package)
+        .join(cache_key_digest(key))
+        .join(file_name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CompiledPackageCacheKey {
+    repository: RegistryIdentity,
+    package: String,
+    version: Version,
+    target: Triple,
+    r_version: RVersion,
 }
 
 impl CompiledPackageCacheKey {
-    pub fn new(package: &str, version: &str, r_version: &semver::Version) -> Self {
-        Self::with_platform(package, version, r_version, host_platform_key())
-    }
-
-    pub fn with_platform(
-        package: &str,
-        version: &str,
-        r_version: &semver::Version,
-        platform: impl Into<String>,
+    pub(crate) fn new(
+        repository: RegistryIdentity,
+        package: impl Into<String>,
+        version: Version,
+        target: Triple,
+        r_version: RVersion,
     ) -> Self {
         Self {
-            package: package.to_string(),
-            version: version.to_string(),
-            r_version: r_version.clone(),
-            platform: platform.into(),
+            repository,
+            package: package.into(),
+            version,
+            target,
+            r_version,
         }
     }
-
-    pub fn package(&self) -> &str {
-        &self.package
-    }
-
-    fn cache_dir_name(&self) -> String {
-        format!(
-            "{}-{}-{}-{}",
-            self.package,
-            self.version,
-            self.platform,
-            self.digest()
-        )
-    }
-
-    fn digest(&self) -> String {
-        let input = format!(
-            "{}\n{}\n{}\n{}",
-            self.package, self.version, self.r_version, self.platform
-        );
-        let mut hasher = DefaultHasher::new();
-        input.hash(&mut hasher);
-
-        format!("{:016x}", hasher.finish())
-    }
 }
 
-impl fmt::Display for CompiledPackageCacheKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.cache_dir_name())
-    }
-}
-
-pub async fn exists(key: &CompiledPackageCacheKey) -> bool {
-    package_cache_path(key).exists()
-}
-
-pub async fn restore(key: &CompiledPackageCacheKey, target_library: &Path) -> Result<(), String> {
-    let source = package_cache_path(key);
-    let target = target_library.join(key.package());
-
-    tokio::task::spawn_blocking(move || copy_package_dir(&source, &target))
-        .await
-        .map_err(|error| format!("failed to join cache restore task: {error}"))?
-}
-
-pub async fn store(key: &CompiledPackageCacheKey, package_dir: &Path) -> Result<(), String> {
-    let target = package_cache_path(key);
-    let package_dir = package_dir.to_path_buf();
-
-    tokio::task::spawn_blocking(move || copy_package_dir(&package_dir, &target))
-        .await
-        .map_err(|error| format!("failed to join cache store task: {error}"))?
-}
-
-fn host_platform_key() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
-}
-
-fn package_cache_path(key: &CompiledPackageCacheKey) -> PathBuf {
+pub(crate) fn compiled_package_cache_path(key: &CompiledPackageCacheKey) -> PathBuf {
     cache_dir_path()
         .join("builds")
-        .join(key.cache_dir_name())
+        .join(COMPILED_PACKAGE_CACHE_VERSION)
+        .join(&key.package)
+        .join(cache_key_digest(key))
         .join("package")
-}
-
-fn copy_package_dir(source: &Path, destination: &Path) -> Result<(), String> {
-    if !source.exists() {
-        return Err(format!(
-            "cached package directory is missing: {}",
-            source.display()
-        ));
-    }
-
-    if destination.exists() {
-        fs::remove_dir_all(destination)
-            .map_err(|error| format!("failed to replace package directory: {error}"))?;
-    }
-    fs::create_dir_all(destination)
-        .map_err(|error| format!("failed to create package directory: {error}"))?;
-
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("failed to read package directory: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("failed to read package entry: {error}"))?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("failed to inspect package entry: {error}"))?;
-
-        if file_type.is_dir() {
-            copy_package_dir(&source_path, &destination_path)?;
-        } else {
-            fs::copy(&source_path, &destination_path)
-                .map_err(|error| format!("failed to copy package file: {error}"))?;
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        fs,
+        path::Path,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
@@ -177,27 +172,154 @@ mod tests {
     }
 
     #[test]
-    fn artifact_cache_path_has_exact_layout_and_creates_only_parent() {
+    fn source_artifact_cache_path_is_versioned_and_has_no_side_effects() {
         let package = unique("artifact");
-        let root = cache_dir_path().join("artifacts").join(&package);
+        let root = cache_dir_path()
+            .join("artifacts")
+            .join("source")
+            .join(SOURCE_ARTIFACT_CACHE_VERSION)
+            .join(&package);
         remove_dir_if_present(&root);
-        let path = artifact_cache_path(&package, "1.2.3", "package.tar.gz");
-        assert_eq!(path, root.join("1.2.3").join("package.tar.gz"));
-        assert!(path.parent().expect("artifact should have parent").is_dir());
+        let key = SourceArtifactCacheKey::new(
+            SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
+                "https://example.test/cran".parse().unwrap(),
+            )),
+            &package,
+            "1.2.3".parse().unwrap(),
+        );
+        let path = source_artifact_cache_path(&key);
+        assert_eq!(
+            path.parent()
+                .and_then(Path::parent)
+                .expect("artifact should be nested below its package"),
+            root
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("artifact.tar.gz")
+        );
+        assert!(!root.exists());
         assert!(!path.exists());
-        remove_dir_if_present(&root);
     }
 
     #[test]
-    fn build_temp_library_path_has_exact_layout_and_creates_directory() {
-        let package = unique("build");
-        let root = cache_dir_path()
-            .join("build-temp")
-            .join(format!("{package}-unique"));
-        remove_dir_if_present(&root);
-        let path = build_temp_library_path(&package, "unique");
-        assert_eq!(path, root.join("library"));
-        assert!(path.is_dir());
-        remove_dir_if_present(&root);
+    fn source_artifact_key_uses_version_equivalence() {
+        let key = |version: &str| {
+            SourceArtifactCacheKey::new(
+                SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
+                    "https://example.test/cran".parse().unwrap(),
+                )),
+                "package",
+                version.parse().unwrap(),
+            )
+        };
+        let hyphen = key("2.5-1");
+        let trailing_zeroes = key("2.5.1.0");
+
+        assert_eq!(hyphen, trailing_zeroes);
+        assert_eq!(
+            source_artifact_cache_path(&hyphen),
+            source_artifact_cache_path(&trailing_zeroes)
+        );
+    }
+
+    #[test]
+    fn artifact_stores_use_distinct_compatibility_keys() {
+        let repository = || RegistryIdentity::Cran("https://example.test/cran".parse().unwrap());
+        let source = source_artifact_cache_path(&SourceArtifactCacheKey::new(
+            SourceArtifactIdentity::Registry(repository()),
+            "package",
+            "1.2.3".parse().unwrap(),
+        ));
+        let other_repository = source_artifact_cache_path(&SourceArtifactCacheKey::new(
+            SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
+                "https://mirror.example.test/cran".parse().unwrap(),
+            )),
+            "package",
+            "1.2.3".parse().unwrap(),
+        ));
+        let windows_430 = binary_artifact_cache_path(&BinaryArtifactCacheKey::new(
+            repository(),
+            "package",
+            "1.2.3".parse().unwrap(),
+            "x86_64-pc-windows-msvc".parse().unwrap(),
+            "4.3.0".parse().unwrap(),
+        ));
+        let windows_431 = binary_artifact_cache_path(&BinaryArtifactCacheKey::new(
+            repository(),
+            "package",
+            "1.2.3".parse().unwrap(),
+            "x86_64-pc-windows-msvc".parse().unwrap(),
+            "4.3.1".parse().unwrap(),
+        ));
+        let windows_arm = binary_artifact_cache_path(&BinaryArtifactCacheKey::new(
+            repository(),
+            "package",
+            "1.2.3".parse().unwrap(),
+            "aarch64-pc-windows-msvc".parse().unwrap(),
+            "4.3.0".parse().unwrap(),
+        ));
+
+        assert_ne!(source, other_repository);
+        assert_ne!(source, windows_430);
+        assert_ne!(windows_430, windows_431);
+        assert_ne!(windows_430, windows_arm);
+    }
+
+    #[test]
+    fn compiled_package_cache_uses_binary_compatibility_identity() {
+        let repository = || RegistryIdentity::Cran("https://example.test/cran".parse().unwrap());
+        let key = |repository, version: &str, target: &str, r_version: &str| {
+            CompiledPackageCacheKey::new(
+                repository,
+                "package",
+                version.parse().unwrap(),
+                target.parse().unwrap(),
+                r_version.parse().unwrap(),
+            )
+        };
+        let base = compiled_package_cache_path(&key(
+            repository(),
+            "1.2.3",
+            "x86_64-pc-windows-msvc",
+            "4.3.0",
+        ));
+
+        assert_ne!(
+            base,
+            compiled_package_cache_path(&key(
+                RegistryIdentity::Cran("https://mirror.example.test/cran".parse().unwrap()),
+                "1.2.3",
+                "x86_64-pc-windows-msvc",
+                "4.3.0",
+            ))
+        );
+        assert_ne!(
+            base,
+            compiled_package_cache_path(&key(
+                repository(),
+                "1.2.3",
+                "aarch64-pc-windows-msvc",
+                "4.3.0",
+            ))
+        );
+        assert_ne!(
+            base,
+            compiled_package_cache_path(&key(
+                repository(),
+                "1.2.3",
+                "x86_64-pc-windows-msvc",
+                "4.3.1",
+            ))
+        );
+        assert_eq!(
+            base,
+            compiled_package_cache_path(&key(
+                repository(),
+                "1.2.3.0",
+                "x86_64-pc-windows-msvc",
+                "4.3.0",
+            ))
+        );
     }
 }

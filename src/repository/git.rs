@@ -76,6 +76,11 @@ impl GitRepository {
             .map_err(|source| self.git_error(source))
     }
 
+    pub async fn checkout_path(&self) -> Result<PathBuf, RepositoryError> {
+        let commit = self.commit().await?;
+        Ok(git::checkout_path(&self.remote, commit))
+    }
+
     pub fn remote(&self) -> &GitUrl {
         &self.remote
     }

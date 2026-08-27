@@ -1,32 +1,36 @@
 use crate::{
-    cache::{self, CompiledPackageCacheKey, artifact_cache_path, build_temp_library_path},
-    description::{DescriptionParseError, root_package},
+    cache::{
+        BinaryArtifactCacheKey, CompiledPackageCacheKey, RegistryIdentity, SourceArtifactCacheKey,
+        SourceArtifactIdentity, binary_artifact_cache_path, compiled_package_cache_path,
+        source_artifact_cache_path,
+    },
+    description::{DescriptionParseError, required_dependencies, root_package},
     http,
     project::{
-        Project, ProjectLibraryError, ProjectResolution, RequiredPackages, ensure_project_library,
+        Project, ProjectLibraryError, ProjectResolution, RequiredPackages, cache_dir_path,
+        ensure_project_library,
     },
     r::{
-        self, BasePackagesError, base_packages, install_local_package, install_package_directory,
+        self, BasePackagesError, base_packages, build_package_archive, install_package_artifact,
         installed_packages, remove_packages_from_venv,
     },
-    repository::{CranRepository, GitRepository, LocalRepository, RrepoRepository},
+    repository::{
+        CranRepository, GitRepository, LocalRepository, RepositoryError, RrepoRepository,
+    },
     resolver::PackageVersion,
     ui::{progress_bar_style, progress_spinner_style},
 };
 use futures_util::StreamExt;
 use miette::Diagnostic;
-use r_description::RDescription;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use target_lexicon::{HOST, OperatingSystem};
 use thiserror::Error;
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, Semaphore, oneshot, watch},
-};
+use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
@@ -50,21 +54,30 @@ pub(crate) enum SyncError {
     #[error("failed to prepare source artifacts: {details}")]
     #[diagnostic(code(rpx::sync::download_failed))]
     DownloadArtifactsFailed { details: String },
+    #[error("failed to download artifact for {package} {version}: {source}")]
+    #[diagnostic(code(rpx::sync::package_artifact_download_failed))]
+    DownloadPackageArtifact {
+        package: String,
+        version: String,
+        #[source]
+        source: DownloadPackageArtifactError,
+    },
     #[error(transparent)]
     #[diagnostic(transparent)]
     PackageGraph(#[from] PackageGraphError),
-    #[error("failed to install project package: {source}")]
-    #[diagnostic(code(rpx::sync::project_install_failed))]
-    ProjectPackageInstall {
+    #[error("failed to build package {package}: {source}")]
+    #[diagnostic(code(rpx::sync::package_build_failed))]
+    PackageBuild {
+        package: String,
         #[source]
-        source: Box<r::PackageInstallError>,
+        source: Box<r::PackageBuildError>,
     },
     #[error("failed to install package {package}: {source}")]
     #[diagnostic(code(rpx::sync::package_install_failed))]
     PackageInstall {
         package: String,
         #[source]
-        source: Box<r::PackageInstallError>,
+        source: Box<InstallPackageError>,
     },
 }
 
@@ -126,15 +139,6 @@ pub(crate) async fn sync_resolved_project(
         })
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
-    let retained = installed
-        .iter()
-        .filter(|(name, installed_version)| {
-            required.get(*name).is_some_and(|(required_version, _)| {
-                !package_requires_install(required_version, Some(installed_version))
-            })
-        })
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
     let packages_to_install = required
         .into_iter()
         .filter(|(name, (required_version, _))| {
@@ -142,13 +146,7 @@ pub(crate) async fn sync_resolved_project(
         })
         .collect::<RequiredPackages>();
     remove_packages_from_venv(&project_library, &removed)?;
-    install_required_packages(
-        &project_library,
-        packages_to_install,
-        retained,
-        &resolution.r_version,
-    )
-    .await?;
+    install_required_packages(&project_library, packages_to_install, &resolution.r_version).await?;
 
     Ok(SyncReport { installed_before })
 }
@@ -162,23 +160,213 @@ fn package_requires_install(required: &PackageVersion, installed: Option<&Packag
         || installed != Some(required)
 }
 
-fn package_dependency_names(description: &RDescription) -> Result<BTreeSet<String>, String> {
-    let depends = description.depends().map_err(|error| error.to_string())?;
-    let imports = description.imports().map_err(|error| error.to_string())?;
-    let linking_to = description
-        .linking_to()
-        .map_err(|error| error.to_string())?;
+const SYNC_SHARED_WORKERS: usize = 50;
+const SYNC_CHECKOUT_WORKERS: usize = 1;
+const SYNC_R_WORKERS: usize = 8;
 
-    Ok(depends
-        .chain(imports)
-        .chain(linking_to)
-        .map(|relation| relation.package().to_string())
-        .filter(|package| package != "R")
+#[derive(Clone)]
+struct SyncTaskContext {
+    project_library: PathBuf,
+    r_version: Arc<semver::Version>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TaskKind {
+    Download,
+    Checkout,
+    Build,
+    Install,
+}
+
+type TaskId = (String, TaskKind);
+
+#[derive(Clone)]
+struct TaskRow {
+    blockers: usize,
+    task: TaskId,
+    version: PackageVersion,
+    dependents: BTreeSet<TaskId>,
+}
+
+impl Ord for TaskRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.blockers, &self.task).cmp(&(&other.blockers, &other.task))
+    }
+}
+
+impl PartialOrd for TaskRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TaskRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.blockers == other.blockers && self.task == other.task
+    }
+}
+
+impl Eq for TaskRow {}
+
+struct ResourcePool {
+    shared: usize,
+    checkout: usize,
+    r: usize,
+}
+
+impl ResourcePool {
+    fn new() -> Self {
+        Self {
+            shared: 0,
+            checkout: 0,
+            r: 0,
+        }
+    }
+
+    fn can_reserve(&self, kind: TaskKind) -> bool {
+        self.shared < SYNC_SHARED_WORKERS
+            && (kind != TaskKind::Checkout || self.checkout < SYNC_CHECKOUT_WORKERS)
+            && (!matches!(kind, TaskKind::Build | TaskKind::Install) || self.r < SYNC_R_WORKERS)
+    }
+
+    fn reserve(&mut self, kind: TaskKind) {
+        debug_assert!(self.can_reserve(kind));
+        self.shared += 1;
+        if kind == TaskKind::Checkout {
+            self.checkout += 1;
+        }
+        if matches!(kind, TaskKind::Build | TaskKind::Install) {
+            self.r += 1;
+        }
+    }
+
+    fn release(&mut self, kind: TaskKind) {
+        self.shared -= 1;
+        if kind == TaskKind::Checkout {
+            self.checkout -= 1;
+        }
+        if matches!(kind, TaskKind::Build | TaskKind::Install) {
+            self.r -= 1;
+        }
+    }
+}
+
+fn install_tasks(packages: RequiredPackages) -> Result<BTreeSet<TaskRow>, SyncError> {
+    let package_names = packages.keys().cloned().collect::<BTreeSet<_>>();
+    let packages = packages
+        .into_iter()
+        .map(|(package, (version, description))| {
+            let dependencies =
+                required_dependencies(format!("{package} {}", version.version()), &description)?
+                    .into_iter()
+                    .map(|relation| relation.package().to_string())
+                    .collect::<BTreeSet<_>>();
+            Ok((package, version, dependencies))
+        })
+        .collect::<Result<Vec<_>, SyncError>>()?;
+    Ok(packages
+        .iter()
+        .flat_map(|(package, package_version, dependencies)| {
+            let install = (package.clone(), TaskKind::Install);
+            let install_blockers = 1 + dependencies
+                .iter()
+                .filter(|dependency| package_names.contains(*dependency))
+                .count();
+            let install_dependents = packages
+                .iter()
+                .filter(|(_, _, dependencies)| dependencies.contains(package))
+                .map(|(dependent, _, _)| (dependent.clone(), TaskKind::Install))
+                .collect::<BTreeSet<_>>();
+            let repository = package_version.repository();
+
+            match (
+                repository.as_ref().downcast_ref::<LocalRepository>(),
+                repository.as_ref().downcast_ref::<GitRepository>(),
+            ) {
+                (Some(_), _) => vec![
+                    TaskRow {
+                        blockers: 0,
+                        task: (package.clone(), TaskKind::Build),
+                        version: package_version.clone(),
+                        dependents: BTreeSet::from([install.clone()]),
+                    },
+                    TaskRow {
+                        blockers: install_blockers,
+                        task: install,
+                        version: package_version.clone(),
+                        dependents: install_dependents,
+                    },
+                ],
+                (_, Some(_)) => {
+                    let build = (package.clone(), TaskKind::Build);
+                    vec![
+                        TaskRow {
+                            blockers: 0,
+                            task: (package.clone(), TaskKind::Checkout),
+                            version: package_version.clone(),
+                            dependents: BTreeSet::from([build.clone()]),
+                        },
+                        TaskRow {
+                            blockers: 1,
+                            task: build,
+                            version: package_version.clone(),
+                            dependents: BTreeSet::from([install.clone()]),
+                        },
+                        TaskRow {
+                            blockers: install_blockers,
+                            task: install,
+                            version: package_version.clone(),
+                            dependents: install_dependents,
+                        },
+                    ]
+                }
+                (None, None) => vec![
+                    TaskRow {
+                        blockers: 0,
+                        task: (package.clone(), TaskKind::Download),
+                        version: package_version.clone(),
+                        dependents: BTreeSet::from([install.clone()]),
+                    },
+                    TaskRow {
+                        blockers: install_blockers,
+                        task: install,
+                        version: package_version.clone(),
+                        dependents: install_dependents,
+                    },
+                ],
+            }
+        })
         .collect())
 }
 
-const SYNC_SHARED_WORKERS: usize = 50;
-const SYNC_INSTALL_WORKERS: usize = 8;
+fn pop_startable(tasks: &mut BTreeSet<TaskRow>, resources: &ResourcePool) -> Option<TaskRow> {
+    let task = tasks
+        .iter()
+        .take_while(|row| row.blockers == 0)
+        .find(|row| resources.can_reserve(row.task.1))?
+        .clone();
+    tasks.take(&task)
+}
+
+fn complete_task(tasks: &mut BTreeSet<TaskRow>, completed: TaskRow) {
+    for dependent in completed.dependents {
+        let mut row = tasks
+            .iter()
+            .find(|row| row.task == dependent)
+            .cloned()
+            .expect("dependent task should exist");
+        tasks.take(&row);
+        row.blockers -= 1;
+        tasks.insert(row);
+    }
+}
+
+fn pending_package_count(tasks: &BTreeSet<TaskRow>) -> usize {
+    tasks
+        .iter()
+        .filter(|row| row.task.1 == TaskKind::Install)
+        .count()
+}
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum PackageGraphError {
@@ -225,7 +413,6 @@ pub(crate) struct CycleBlockedPackage {
 async fn install_required_packages(
     project_library: &Path,
     packages: RequiredPackages,
-    retained: BTreeSet<String>,
     r_version: &semver::Version,
 ) -> Result<(), SyncError> {
     let total_packages = packages.len() as u64;
@@ -249,307 +436,260 @@ async fn install_required_packages(
         return Ok(());
     }
 
-    let project_library = project_library.to_path_buf();
-    let r_version = Arc::new(r_version.clone());
-    let required_names = Arc::new(
-        retained
-            .iter()
-            .cloned()
-            .chain(packages.keys().cloned())
-            .collect::<BTreeSet<_>>(),
-    );
-    let installed_packages = Arc::new(Mutex::new(retained));
-    let shared_pool = Arc::new(Semaphore::new(SYNC_SHARED_WORKERS));
-    let install_pool = Arc::new(Semaphore::new(SYNC_INSTALL_WORKERS));
-    let (installed_tx, installed_rx) = watch::channel(());
-    let mut prepare_tasks = tokio::task::JoinSet::new();
-    let mut install_tasks = tokio::task::JoinSet::new();
+    let context = SyncTaskContext {
+        project_library: project_library.to_path_buf(),
+        r_version: Arc::new(r_version.clone()),
+    };
+    let mut tasks = install_tasks(packages)?;
+    let mut resources = ResourcePool::new();
+    let mut running = tokio::task::JoinSet::<(TaskRow, Result<(), SyncError>)>::new();
     let mut completed = 0_u64;
 
-    for (package_name, (package_version, description)) in packages {
-        let dependencies = package_dependency_names(&description)
-            .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-        if let Some(repository) = package_version
-            .repository()
-            .as_ref()
-            .downcast_ref::<LocalRepository>()
-        {
-            let project_path = repository.path().to_path_buf();
-            let install_required_names = Arc::clone(&required_names);
-            let install_installed_packages = Arc::clone(&installed_packages);
-            let install_installed_rx = installed_rx.clone();
-            let install_installed_tx = installed_tx.clone();
-            let install_shared_pool = Arc::clone(&shared_pool);
-            let install_pool = Arc::clone(&install_pool);
-            let install_project_library = project_library.clone();
-            install_tasks.spawn(
+    let result = loop {
+        while let Some(row) = pop_startable(&mut tasks, &resources) {
+            resources.reserve(row.task.1);
+            let task = row.task.clone();
+            let version = row.version.clone();
+            let context = context.clone();
+            running.spawn(
                 async move {
-                    wait_for_package_dependencies(
-                        &package_name,
-                        &dependencies,
-                        install_required_names,
-                        Arc::clone(&install_installed_packages),
-                        install_installed_rx,
-                    )
-                    .await
-                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-
-                    let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
-                        SyncError::DownloadArtifactsFailed {
-                            details: "install pool closed before project installation".to_string(),
-                        }
-                    })?;
-                    let _shared_permit =
-                        install_shared_pool.acquire_owned().await.map_err(|_| {
-                            SyncError::DownloadArtifactsFailed {
-                                details: "sync work pool closed before project installation"
-                                    .to_string(),
-                            }
-                        })?;
-
-                    install_package_directory(
-                        &project_path,
-                        &install_project_library,
-                        "project package",
-                    )
-                    .await
-                    .map_err(|source| SyncError::ProjectPackageInstall {
-                        source: Box::new(source),
-                    })?;
-                    {
-                        let mut installed_packages = install_installed_packages.lock().await;
-                        installed_packages.insert(package_name.clone());
-                    }
-                    let _ = install_installed_tx.send(());
-
-                    Ok::<_, SyncError>(package_name)
+                    let result = run_sync_task(task, version, context).await;
+                    (row, result)
                 }
                 .instrument(sync_span.clone()),
             );
-            continue;
         }
 
-        if let Some(repository) = package_version
-            .repository()
-            .as_ref()
-            .downcast_ref::<GitRepository>()
+        sync_span.record("running", running.len() as u64);
+        sync_span.record("pending", pending_package_count(&tasks) as u64);
+
+        if running.is_empty() && tasks.is_empty() {
+            break Ok(());
+        }
+        if running.is_empty() {
+            break Err(SyncError::DownloadArtifactsFailed {
+                details: "package task graph stalled with no runnable tasks".to_string(),
+            });
+        }
+
+        match running
+            .join_next()
+            .await
+            .expect("running task set should not be empty")
         {
-            let repository = repository.clone();
-            let install_required_names = Arc::clone(&required_names);
-            let install_installed_packages = Arc::clone(&installed_packages);
-            let install_installed_rx = installed_rx.clone();
-            let install_installed_tx = installed_tx.clone();
-            let install_shared_pool = Arc::clone(&shared_pool);
-            let install_pool = Arc::clone(&install_pool);
-            let install_project_library = project_library.clone();
-            install_tasks.spawn(
-                async move {
-                    wait_for_package_dependencies(
-                        &package_name,
-                        &dependencies,
-                        install_required_names,
-                        Arc::clone(&install_installed_packages),
-                        install_installed_rx,
+            Ok((row, Ok(()))) => {
+                resources.release(row.task.1);
+                if row.task.1 == TaskKind::Install {
+                    completed += 1;
+                }
+                complete_task(&mut tasks, row);
+            }
+            Ok((row, Err(error))) => {
+                resources.release(row.task.1);
+                break Err(error);
+            }
+            Err(error) => {
+                break Err(SyncError::DownloadArtifactsFailed {
+                    details: format!("sync task failed to join: {error}"),
+                });
+            }
+        }
+
+        sync_span.record("completed", completed);
+        sync_span.record("running", running.len() as u64);
+        sync_span.record("pending", pending_package_count(&tasks) as u64);
+        sync_span.pb_set_position(completed);
+        sync_span.pb_set_message(&format!("sync packages {completed}/{total_packages}"));
+    };
+
+    if result.is_err() {
+        while running.join_next().await.is_some() {}
+    }
+
+    sync_span.record("completed", completed);
+    sync_span.record("running", 0_u64);
+    sync_span.record("pending", 0_u64);
+    sync_span.record("stage", "done");
+    sync_span.pb_set_finish_message(&format!("sync packages {completed}/{total_packages}"));
+    result
+}
+
+async fn run_sync_task(
+    (package, kind): TaskId,
+    package_version: PackageVersion,
+    context: SyncTaskContext,
+) -> Result<(), SyncError> {
+    match kind {
+        TaskKind::Download => {
+            let version = package_version.version().to_string();
+            download_package_artifact(package.clone(), package_version, context.r_version)
+                .await
+                .map_err(|source| SyncError::DownloadPackageArtifact {
+                    package,
+                    version,
+                    source,
+                })
+        }
+        TaskKind::Checkout => {
+            let repository = package_version
+                .repository()
+                .as_ref()
+                .downcast_ref::<GitRepository>()
+                .expect("checkout task should use a Git repository")
+                .clone();
+            repository
+                .checkout()
+                .await
+                .map_err(|error| SyncError::DownloadArtifactsFailed {
+                    details: format!("failed to checkout {package}: {error}"),
+                })?;
+            Ok(())
+        }
+        TaskKind::Build => {
+            let repository = package_version.repository().as_ref();
+            let (package_root, source) =
+                if let Some(repository) = repository.downcast_ref::<LocalRepository>() {
+                    (
+                        repository.path().to_path_buf(),
+                        SourceArtifactIdentity::Local(repository.path().to_path_buf()),
                     )
-                    .await
-                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-
-                    let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
+                } else {
+                    let repository = repository
+                        .downcast_ref::<GitRepository>()
+                        .expect("build task should use a local or Git repository");
+                    let checkout = repository.checkout_path().await.map_err(|error| {
                         SyncError::DownloadArtifactsFailed {
-                            details: "install pool closed before Git package installation"
-                                .to_string(),
-                        }
-                    })?;
-                    let _shared_permit =
-                        install_shared_pool.acquire_owned().await.map_err(|_| {
-                            SyncError::DownloadArtifactsFailed {
-                                details: "sync work pool closed before Git package installation"
-                                    .to_string(),
-                            }
-                        })?;
-
-                    let checkout = repository.checkout().await.map_err(|error| {
-                        SyncError::DownloadArtifactsFailed {
-                            details: format!("failed to checkout {package_name}: {error}"),
+                            details: format!("failed to locate checkout for {package}: {error}"),
                         }
                     })?;
                     let package_root = repository
                         .subdirectory()
                         .map_or(checkout.clone(), |subdirectory| checkout.join(subdirectory));
-                    install_package_directory(
-                        &package_root,
-                        &install_project_library,
-                        &format!("{package_name} from Git"),
-                    )
-                    .await
-                    .map_err(|source| SyncError::PackageInstall {
-                        package: package_name.clone(),
-                        source: Box::new(source),
+                    let commit = repository.commit().await.map_err(|error| {
+                        SyncError::DownloadArtifactsFailed {
+                            details: format!("failed to resolve Git commit for {package}: {error}"),
+                        }
                     })?;
-                    {
-                        let mut installed_packages = install_installed_packages.lock().await;
-                        installed_packages.insert(package_name.clone());
-                    }
-                    let _ = install_installed_tx.send(());
-
-                    Ok::<_, SyncError>(package_name)
-                }
-                .instrument(sync_span.clone()),
-            );
-            continue;
-        }
-
-        let cache_key = CompiledPackageCacheKey::new(
-            &package_name,
-            package_version.version().as_ref(),
-            r_version.as_ref(),
-        );
-        let (prepared_tx, prepared_rx) = oneshot::channel();
-
-        let prepare_package_name = package_name.clone();
-        let prepare_package_version = package_version.clone();
-        let prepare_cache_key = cache_key.clone();
-        let prepare_r_version = Arc::clone(&r_version);
-        let prepare_shared_pool = Arc::clone(&shared_pool);
-        prepare_tasks.spawn(
-            async move {
-                let prepared = match prepare_shared_pool.acquire_owned().await {
-                    Ok(_permit) => {
-                        prepare_locked_package_artifact(
-                            prepare_package_name,
-                            prepare_package_version,
-                            prepare_cache_key,
-                            prepare_r_version,
-                        )
-                        .await
-                    }
-                    Err(_) => Err("sync work pool closed before artifact preparation".to_string()),
+                    (
+                        package_root,
+                        SourceArtifactIdentity::Git {
+                            remote: repository.remote().clone(),
+                            commit,
+                            subdirectory: repository.subdirectory().map(Path::to_path_buf),
+                        },
+                    )
                 };
-
-                let _ = prepared_tx.send(prepared);
-            }
-            .instrument(sync_span.clone()),
-        );
-
-        let install_required_names = Arc::clone(&required_names);
-        let install_installed_packages = Arc::clone(&installed_packages);
-        let install_installed_rx = installed_rx.clone();
-        let install_installed_tx = installed_tx.clone();
-        let install_shared_pool = Arc::clone(&shared_pool);
-        let install_pool = Arc::clone(&install_pool);
-        let install_project_library = project_library.clone();
-        install_tasks.spawn(
-            async move {
-                let prepared_artifact = prepared_rx
-                    .await
-                    .map_err(|_| SyncError::DownloadArtifactsFailed {
-                        details: format!(
-                            "{package_name} artifact preparation task ended without a result"
-                        ),
-                    })?
-                    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-
-                // Keep package spans out of the progress UI while blocked on dependency installs.
-                wait_for_package_dependencies(
-                    &package_name,
-                    &dependencies,
-                    install_required_names,
-                    Arc::clone(&install_installed_packages),
-                    install_installed_rx,
-                )
-                .await
-                .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-
-                let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
-                    SyncError::DownloadArtifactsFailed {
-                        details: "install pool closed before package installation".to_string(),
-                    }
-                })?;
-                let _shared_permit = install_shared_pool.acquire_owned().await.map_err(|_| {
-                    SyncError::DownloadArtifactsFailed {
-                        details: "sync work pool closed before package installation".to_string(),
-                    }
-                })?;
-
-                let installed = install_prepared_package(
-                    install_project_library,
-                    package_name,
-                    package_version,
-                    cache_key,
-                    prepared_artifact,
-                )
-                .await
-                .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-                {
-                    let mut installed_packages = install_installed_packages.lock().await;
-                    installed_packages.insert(installed.clone());
-                }
-                let _ = install_installed_tx.send(());
-
-                Ok::<_, SyncError>(installed)
-            }
-            .instrument(sync_span.clone()),
-        );
-    }
-
-    sync_span.record("running", install_tasks.len() as u64);
-
-    while let Some(result) = install_tasks.join_next().await {
-        result.map_err(|error| SyncError::DownloadArtifactsFailed {
-            details: format!("install task failed to join: {error}"),
-        })??;
-        completed += 1;
-        sync_span.record("completed", completed);
-        sync_span.record("running", install_tasks.len() as u64);
-        sync_span.record("pending", total_packages.saturating_sub(completed));
-        sync_span.pb_set_position(completed);
-        sync_span.pb_set_message(&format!("sync packages {completed}/{total_packages}"));
-    }
-
-    drop(prepare_tasks);
-
-    sync_span.record("stage", "done");
-    sync_span.pb_set_finish_message(&format!("sync packages {completed}/{total_packages}"));
-    Ok(())
-}
-
-async fn wait_for_package_dependencies(
-    package: &str,
-    dependencies: &BTreeSet<String>,
-    required_names: Arc<BTreeSet<String>>,
-    installed_packages: Arc<Mutex<BTreeSet<String>>>,
-    mut installed_rx: watch::Receiver<()>,
-) -> Result<(), String> {
-    loop {
-        {
-            let installed_packages = installed_packages.lock().await;
-            if dependencies
-                .iter()
-                .filter(|dependency| required_names.contains(*dependency))
-                .all(|dependency| installed_packages.contains(dependency))
-            {
-                return Ok(());
-            }
-        }
-
-        installed_rx.changed().await.map_err(|_| {
-            format!(
-                "dependency notifier closed before {} dependencies were installed",
-                package
+            let archive = source_artifact_cache_path(&SourceArtifactCacheKey::new(
+                source,
+                &package,
+                package_version.version().clone(),
+            ));
+            build_package_archive(
+                &package_root,
+                &package,
+                package_version.version().as_ref(),
+                &archive,
             )
-        })?;
+            .await
+            .map_err(|source| SyncError::PackageBuild {
+                package,
+                source: Box::new(source),
+            })
+        }
+        TaskKind::Install => install_package(
+            &context.project_library,
+            &package,
+            &package_version,
+            context.r_version.as_ref(),
+        )
+        .await
+        .map_err(|source| SyncError::PackageInstall {
+            package,
+            source: Box::new(source),
+        }),
     }
 }
 
-async fn prepare_locked_package_artifact(
+#[derive(Debug, Error)]
+pub(crate) enum DownloadPackageArtifactError {
+    #[error("unsupported remote package repository")]
+    UnsupportedRepository,
+    #[error("failed to request binary artifact: {source}")]
+    BinaryRequest {
+        #[source]
+        source: http::BinaryArtifactRequestError,
+    },
+    #[error("failed to request {artifact} artifact: {source}")]
+    Request {
+        artifact: &'static str,
+        #[source]
+        source: reqwest_middleware::Error,
+    },
+    #[error("{artifact} artifact response failed: {source}")]
+    Response {
+        artifact: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("failed to create artifact cache directory {}: {source}", path.display())]
+    CreateCacheDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create temporary artifact in {}: {source}", path.display())]
+    CreateTemporaryArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to open temporary artifact {}: {source}", path.display())]
+    OpenTemporaryArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read artifact response: {source}")]
+    ReadResponse {
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("failed to write temporary artifact {}: {source}", path.display())]
+    WriteArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("artifact response was incomplete: expected {expected} bytes, received {actual}")]
+    ContentLengthMismatch { expected: u64, actual: u64 },
+    #[error("failed to flush temporary artifact {}: {source}", path.display())]
+    FlushArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to sync temporary artifact {}: {source}", path.display())]
+    SyncArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to publish artifact {}: {source}", path.display())]
+    PublishArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+async fn download_package_artifact(
     package: String,
     package_version: PackageVersion,
-    cache_key: CompiledPackageCacheKey,
     r_version: Arc<semver::Version>,
-) -> Result<Option<(PathBuf, String)>, String> {
+) -> Result<(), DownloadPackageArtifactError> {
     let version = package_version.version().to_string();
     let span = tracing::info_span!(
-        "prepare_package",
+        "download_package_artifact",
         package = %package,
         version = %version,
         repository = tracing::field::Empty,
@@ -560,152 +700,290 @@ async fn prepare_locked_package_artifact(
         indicatif.pb_show = true,
     );
     span.pb_set_style(&progress_spinner_style());
-    span.pb_set_message(&package_stage_message(&package, &version, "preparing"));
+    span.pb_set_message(&format!("{package} {version} preparing"));
     span.pb_start();
 
-    prepare_locked_package_artifact_inner(
-        package,
-        package_version,
-        &cache_key,
-        r_version.as_ref(),
-        span.clone(),
-    )
-    .instrument(span)
+    async {
+        let repository = package_version.repository();
+        let repository =
+            if let Some(repository) = repository.as_ref().downcast_ref::<RrepoRepository>() {
+                RegistryIdentity::Rrepo(repository.url().clone())
+            } else if let Some(repository) = repository.as_ref().downcast_ref::<CranRepository>() {
+                RegistryIdentity::Cran(repository.url().clone())
+            } else {
+                return Err(DownloadPackageArtifactError::UnsupportedRepository);
+            };
+        span.record(
+            "repository",
+            match &repository {
+                RegistryIdentity::Cran(url) | RegistryIdentity::Rrepo(url) => url.as_str(),
+            },
+        );
+        let compiled = compiled_package_cache_path(&CompiledPackageCacheKey::new(
+            repository.clone(),
+            &package,
+            package_version.version().clone(),
+            HOST.clone(),
+            r_version.as_ref().clone(),
+        ));
+        if compiled.is_dir() {
+            span.record("artifact_kind", "compiled-cache");
+            span.record("stage", "prepared");
+            span.pb_set_message(&format!("{package} {version} prepared"));
+            span.pb_tick();
+            return Ok(());
+        }
+
+        span.record("stage", "downloading binary");
+        span.pb_set_message(&format!("{package} {version} downloading binary"));
+        span.pb_tick();
+        let binary = async {
+            let key = BinaryArtifactCacheKey::new(
+                repository.clone(),
+                &package,
+                package_version.version().clone(),
+                HOST.clone(),
+                r_version.as_ref().clone(),
+            );
+            let path = binary_artifact_cache_path(&key);
+            if path.exists() {
+                return Ok(());
+            }
+
+            let response = match &repository {
+                RegistryIdentity::Rrepo(url) => http::rrepo_binary(
+                    url,
+                    &package,
+                    &version,
+                    &HOST,
+                    r_version.as_ref(),
+                )
+                .await,
+                RegistryIdentity::Cran(url) => http::cran_binary(
+                    url,
+                    &package,
+                    &version,
+                    &HOST,
+                    r_version.as_ref(),
+                )
+                .await,
+            }
+            .map_err(|source| DownloadPackageArtifactError::BinaryRequest { source })?
+            .error_for_status()
+            .map_err(|source| DownloadPackageArtifactError::Response {
+                artifact: "binary",
+                source,
+            })?;
+            span.record("artifact_kind", "binary");
+            publish_artifact_response(path, response, &span).await
+        }
+        .await;
+
+        let binary_error = match binary {
+            Ok(()) => {
+                span.record("stage", "prepared");
+                span.pb_set_message(&format!("{package} {version} prepared"));
+                span.pb_tick();
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        tracing::debug!(
+            package = %package,
+            version = %version,
+            error = %binary_error,
+            "binary artifact unavailable; falling back to source"
+        );
+
+        span.pb_set_style(&progress_spinner_style());
+        span.record("stage", "falling back to source");
+        span.pb_set_message(&format!("{package} {version} falling back to source"));
+        span.pb_tick();
+        span.record("stage", "downloading source");
+        span.pb_set_message(&format!("{package} {version} downloading source"));
+        span.pb_tick();
+        let key = SourceArtifactCacheKey::new(
+            SourceArtifactIdentity::Registry(repository.clone()),
+            &package,
+            package_version.version().clone(),
+        );
+        let path = source_artifact_cache_path(&key);
+        if path.exists() {
+            span.record("stage", "prepared");
+            span.pb_set_message(&format!("{package} {version} prepared"));
+            span.pb_tick();
+            return Ok(());
+        }
+
+        let response = match &repository {
+            RegistryIdentity::Rrepo(url) => http::rrepo_source_artifact(url, &package, &version)
+                .await
+                .map_err(|source| DownloadPackageArtifactError::Request {
+                    artifact: "source",
+                    source,
+                })?
+                .error_for_status()
+                .map_err(|source| DownloadPackageArtifactError::Response {
+                    artifact: "source",
+                    source,
+                })?,
+            RegistryIdentity::Cran(url) => {
+                let current = http::cran_current_source_tarball(url, &package, &version)
+                    .await
+                    .map_err(|source| DownloadPackageArtifactError::Request {
+                        artifact: "current source",
+                        source,
+                    })
+                    .and_then(|response| {
+                        response.error_for_status().map_err(|source| {
+                            DownloadPackageArtifactError::Response {
+                                artifact: "current source",
+                                source,
+                            }
+                        })
+                    });
+                match current {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::debug!(%error, "current source artifact unavailable; trying archive");
+                        http::cran_archive_source_tarball(url, &package, &version)
+                            .await
+                            .map_err(|source| DownloadPackageArtifactError::Request {
+                                artifact: "archived source",
+                                source,
+                            })?
+                            .error_for_status()
+                            .map_err(|source| DownloadPackageArtifactError::Response {
+                                artifact: "archived source",
+                                source,
+                            })?
+                    }
+                }
+            }
+        };
+        span.record("artifact_kind", "source");
+        publish_artifact_response(path, response, &span).await?;
+        span.record("stage", "prepared");
+        span.pb_set_message(&format!("{package} {version} prepared"));
+        span.pb_tick();
+        Ok(())
+    }
+    .instrument(span.clone())
     .await
 }
 
-async fn prepare_locked_package_artifact_inner(
-    package: String,
-    package_version: PackageVersion,
-    cache_key: &CompiledPackageCacheKey,
-    r_version: &semver::Version,
-    span: tracing::Span,
-) -> Result<Option<(PathBuf, String)>, String> {
-    fn response_for_status(response: reqwest::Response) -> Result<reqwest::Response, String> {
-        response
-            .error_for_status()
-            .map_err(|error| error.to_string())
-    }
-
-    let version = package_version.version().to_string();
-    record_package_stage(&span, &package, &version, "checking cache");
-    if cache::exists(cache_key).await {
-        record_package_stage(&span, &package, &version, "cached");
-        return Ok(None);
-    }
-
-    let repository = package_version.repository();
-    let (base_url, is_rrepo) =
-        if let Some(repository) = repository.as_ref().downcast_ref::<RrepoRepository>() {
-            (repository.url(), true)
-        } else if let Some(repository) = repository.as_ref().downcast_ref::<CranRepository>() {
-            (repository.url(), false)
-        } else {
-            return Err(format!(
-                "package {package} uses an unsupported remote repository"
-            ));
-        };
-    span.record("repository", base_url.as_str());
-
-    record_package_stage(&span, &package, &version, "downloading binary");
-
-    let binary = match (std::env::consts::OS, is_rrepo) {
-        ("windows", true) => http::rrepo_windows_binary(base_url, &package, &version, r_version)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(response_for_status)
-            .map(|response| (response, "zip", "win.binary".to_string())),
-
-        ("windows", false) => http::cran_windows_binary(base_url, r_version, &package, &version)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(response_for_status)
-            .map(|response| (response, "zip", "win.binary".to_string())),
-
-        ("macos", true) => {
-            let target = macos_binary_target()?;
-
-            http::rrepo_macos_binary(base_url, &package, &version, &target, r_version)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(response_for_status)
-                .map(|response| (response, "tgz", format!("mac.binary.{target}")))
-        }
-
-        ("macos", false) => {
-            let target = macos_binary_target()?;
-
-            http::cran_macos_binary(base_url, &target, r_version, &package, &version)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(response_for_status)
-                .map(|response| (response, "tgz", format!("mac.binary.{target}")))
-        }
-
-        _ => Err(format!(
-            "binary artifacts are not supported on {}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )),
-    };
-
-    let (response, extension, install_type) = match binary {
-        Ok(binary) => {
-            span.record("artifact_kind", binary.2.as_str());
-            binary
-        }
-
-        Err(error) => {
-            tracing::debug!(
-                package = %package,
-                version = %version,
-                error = %error,
-                "binary artifact unavailable; falling back to source"
-            );
-
-            record_package_stage(&span, &package, &version, "falling back to source");
-            record_package_stage(&span, &package, &version, "downloading source");
-
-            let response = if is_rrepo {
-                http::rrepo_source_artifact(base_url, &package, &version)
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(response_for_status)?
-            } else {
-                let current = http::cran_current_source_tarball(base_url, &package, &version)
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(response_for_status);
-                match current {
-                    Ok(response) => response,
-                    Err(_) => http::cran_archive_source_tarball(base_url, &package, &version)
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(response_for_status)?,
-                }
-            };
-
-            span.record("artifact_kind", "source");
-
-            (response, "tar.gz", "source".to_string())
-        }
-    };
-
-    let artifact_path =
-        write_artifact_response(&package, &version, extension, response, &span).await?;
-
-    record_package_stage(&span, &package, &version, "prepared");
-
-    Ok(Some((artifact_path, install_type)))
+#[derive(Debug, Error)]
+pub(crate) enum InstallPackageError {
+    #[error("unsupported package repository")]
+    UnsupportedRepository,
+    #[error("failed to resolve Git commit for {package}: {source}")]
+    GitCommit {
+        package: String,
+        #[source]
+        source: RepositoryError,
+    },
+    #[error("failed to determine the macOS binary package type: {source}")]
+    MacBinaryType {
+        #[source]
+        source: http::BinaryArtifactRequestError,
+    },
+    #[error("no installable artifact exists for {package} {version}")]
+    MissingArtifact { package: String, version: String },
+    #[error("failed to prepare package install workspace root at {}: {source}", path.display())]
+    WorkspaceRoot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create package install workspace in {}: {source}", path.display())]
+    Workspace {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create temporary package library at {}: {source}", path.display())]
+    TemporaryLibrary {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Command(#[from] r::PackageInstallError),
+    #[error("installed package directory is missing at {}", path.display())]
+    InstalledPackageMissing { path: PathBuf },
+    #[error("failed to inspect installed package directory at {}: {source}", path.display())]
+    InspectInstalledPackage {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to prepare compiled package cache directory at {}: {source}", path.display())]
+    CompiledCacheDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("compiled package cache path is not a directory: {}", path.display())]
+    InvalidCompiledCache { path: PathBuf },
+    #[error("failed to publish compiled package at {}: {source}", path.display())]
+    PublishCompiledPackage {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    PublishProject(#[from] PublishInstalledPackageError),
+    #[error("failed to clean package install workspace at {}: {source}", path.display())]
+    Cleanup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
-async fn install_prepared_package(
-    project_library: PathBuf,
-    package: String,
-    package_version: PackageVersion,
-    cache_key: CompiledPackageCacheKey,
-    prepared_artifact: Option<(PathBuf, String)>,
-) -> Result<String, String> {
+#[derive(Debug, Error)]
+pub(crate) enum PublishInstalledPackageError {
+    #[error("failed to publish package because the destination already exists: {}", path.display())]
+    DestinationExists { path: PathBuf },
+    #[error("failed to create package staging directory in {}: {source}", path.display())]
+    CreateStagingDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to stage installed package from {}: {source}", path.display())]
+    StagePackage {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("staged package metadata is missing at {}", path.display())]
+    MissingMetadata { path: PathBuf },
+    #[error("failed to publish installed package at {}: {source}", path.display())]
+    Publish {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to clean package staging directory at {}: {source}", path.display())]
+    Cleanup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to join package publication task: {source}")]
+    Join {
+        #[source]
+        source: tokio::task::JoinError,
+    },
+}
+
+async fn install_package(
+    project_library: &Path,
+    package: &str,
+    package_version: &PackageVersion,
+    r_version: &semver::Version,
+) -> Result<(), InstallPackageError> {
     let version = package_version.version().to_string();
     let span = tracing::info_span!(
         "install_package",
@@ -716,137 +994,313 @@ async fn install_prepared_package(
         indicatif.pb_show = true,
     );
     span.pb_set_style(&progress_spinner_style());
-    span.pb_set_message(&package_stage_message(&package, &version, "installing"));
+    span.pb_set_message(&format!("{package} {version} installing"));
     span.pb_start();
 
-    install_prepared_package_inner(
-        project_library,
-        package,
-        version,
-        cache_key,
-        prepared_artifact,
-        span.clone(),
-    )
-    .instrument(span)
-    .await
-}
-
-async fn install_prepared_package_inner(
-    project_library: PathBuf,
-    package: String,
-    version: String,
-    cache_key: CompiledPackageCacheKey,
-    prepared_artifact: Option<(PathBuf, String)>,
-    span: tracing::Span,
-) -> Result<String, String> {
-    match prepared_artifact {
-        None => {
-            span.record("artifact_kind", "compiled-cache");
-            record_package_stage(&span, &package, &version, "restoring from cache");
-            cache::restore(&cache_key, &project_library).await?;
-            record_package_stage(&span, &package, &version, "restored from cache");
-            Ok(package)
-        }
-
-        Some((artifact_path, install_type)) => {
-            span.record("artifact_kind", install_type.as_str());
-            install_downloaded_package(
+    async {
+        let repository = package_version.repository();
+        let repository = repository.as_ref();
+        let registry = if let Some(repository) = repository.downcast_ref::<RrepoRepository>() {
+            Some(RegistryIdentity::Rrepo(repository.url().clone()))
+        } else {
+            repository
+                .downcast_ref::<CranRepository>()
+                .map(|repository| RegistryIdentity::Cran(repository.url().clone()))
+        };
+        let compiled = registry.as_ref().map(|registry| {
+            compiled_package_cache_path(&CompiledPackageCacheKey::new(
+                registry.clone(),
                 package,
-                version,
-                cache_key,
-                artifact_path,
-                install_type,
-                project_library,
-                span,
+                package_version.version().clone(),
+                HOST.clone(),
+                r_version.clone(),
+            ))
+        });
+
+        if let Some(compiled) = &compiled
+            && compiled.is_dir()
+        {
+            span.record("artifact_kind", "compiled-cache");
+            span.record("stage", "restoring project library");
+            span.pb_set_message(&format!("{package} {version} restoring project library"));
+            span.pb_tick();
+            publish_installed_package(compiled, project_library, package).await?;
+            span.record("stage", "done");
+            span.pb_set_message(&format!("{package} {version} done"));
+            span.pb_tick();
+            return Ok(());
+        }
+
+        let (artifact, install_type) = if let Some(registry) = &registry {
+            let binary = match HOST.operating_system {
+                OperatingSystem::Windows => Some("win.binary".to_string()),
+                OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => Some(format!(
+                    "mac.binary.{}",
+                    http::r_macos_binary_target(&HOST)
+                        .map_err(|source| InstallPackageError::MacBinaryType { source })?
+                )),
+                _ => None,
+            }
+            .map(|install_type| {
+                let path = binary_artifact_cache_path(&BinaryArtifactCacheKey::new(
+                    registry.clone(),
+                    package,
+                    package_version.version().clone(),
+                    HOST.clone(),
+                    r_version.clone(),
+                ));
+                (path, install_type)
+            });
+            if let Some((path, install_type)) = binary
+                && path.is_file()
+            {
+                (path, install_type)
+            } else {
+                (
+                    source_artifact_cache_path(&SourceArtifactCacheKey::new(
+                        SourceArtifactIdentity::Registry(registry.clone()),
+                        package,
+                        package_version.version().clone(),
+                    )),
+                    "source".to_string(),
+                )
+            }
+        } else if let Some(repository) = repository.downcast_ref::<LocalRepository>() {
+            (
+                source_artifact_cache_path(&SourceArtifactCacheKey::new(
+                    SourceArtifactIdentity::Local(repository.path().to_path_buf()),
+                    package,
+                    package_version.version().clone(),
+                )),
+                "source".to_string(),
             )
+        } else if let Some(repository) = repository.downcast_ref::<GitRepository>() {
+            let commit = repository.commit().await.map_err(|source| {
+                InstallPackageError::GitCommit {
+                    package: package.to_string(),
+                    source,
+                }
+            })?;
+            (
+                source_artifact_cache_path(&SourceArtifactCacheKey::new(
+                    SourceArtifactIdentity::Git {
+                        remote: repository.remote().clone(),
+                        commit,
+                        subdirectory: repository.subdirectory().map(Path::to_path_buf),
+                    },
+                    package,
+                    package_version.version().clone(),
+                )),
+                "source".to_string(),
+            )
+        } else {
+            return Err(InstallPackageError::UnsupportedRepository);
+        };
+        if !artifact.is_file() {
+            return Err(InstallPackageError::MissingArtifact {
+                package: package.to_string(),
+                version,
+            });
+        }
+        span.record("artifact_kind", install_type.as_str());
+
+        let workspace_parent = cache_dir_path().join("build-temp");
+        tokio::fs::create_dir_all(&workspace_parent)
             .await
+            .map_err(|source| InstallPackageError::WorkspaceRoot {
+                path: workspace_parent.clone(),
+                source,
+            })?;
+        let workspace = tempfile::Builder::new()
+            .prefix("rpx-install-")
+            .tempdir_in(&workspace_parent)
+            .map_err(|source| InstallPackageError::Workspace {
+                path: workspace_parent,
+                source,
+            })?;
+        let workspace_path = workspace.path().to_path_buf();
+        let temporary_library = workspace.path().join("library");
+        tokio::fs::create_dir(&temporary_library)
+            .await
+            .map_err(|source| InstallPackageError::TemporaryLibrary {
+                path: temporary_library.clone(),
+                source,
+            })?;
+
+        let result = async {
+            span.record("stage", "installing");
+            span.pb_set_message(&format!("{package} {version} installing"));
+            span.pb_tick();
+            install_package_artifact(
+                project_library,
+                &artifact,
+                package,
+                &version,
+                &install_type,
+                &temporary_library,
+            )
+            .await?;
+
+            let installed = temporary_library.join(package);
+            match tokio::fs::metadata(&installed).await {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(InstallPackageError::InstalledPackageMissing { path: installed });
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(InstallPackageError::InstalledPackageMissing { path: installed });
+                }
+                Err(source) => {
+                    return Err(InstallPackageError::InspectInstalledPackage {
+                        path: installed,
+                        source,
+                    });
+                }
+            }
+
+            let installed = if let Some(compiled) = &compiled {
+                span.record("stage", "storing cache");
+                span.pb_set_message(&format!("{package} {version} storing cache"));
+                span.pb_tick();
+                let parent = compiled
+                    .parent()
+                    .expect("compiled package cache path should have a parent");
+                tokio::fs::create_dir_all(parent).await.map_err(|source| {
+                    InstallPackageError::CompiledCacheDirectory {
+                        path: parent.to_path_buf(),
+                        source,
+                    }
+                })?;
+                if compiled.exists() {
+                    if !compiled.is_dir() {
+                        return Err(InstallPackageError::InvalidCompiledCache {
+                            path: compiled.clone(),
+                        });
+                    }
+                } else {
+                    tokio::fs::rename(&installed, compiled).await.map_err(|source| {
+                        InstallPackageError::PublishCompiledPackage {
+                            path: compiled.clone(),
+                            source,
+                        }
+                    })?;
+                }
+                compiled.clone()
+            } else {
+                installed
+            };
+
+            span.record("stage", "restoring project library");
+            span.pb_set_message(&format!("{package} {version} restoring project library"));
+            span.pb_tick();
+            publish_installed_package(&installed, project_library, package).await?;
+            Ok(())
+        }
+        .await;
+
+        span.record("stage", "cleaning up");
+        span.pb_set_message(&format!("{package} {version} cleaning up"));
+        span.pb_tick();
+        let cleanup = tokio::task::spawn_blocking(move || workspace.close())
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|result| result);
+        if let Err(error) = &cleanup
+            && result.is_err()
+        {
+            tracing::warn!(%error, path = %workspace_path.display(), "failed to clean package install workspace");
+        }
+        result?;
+        cleanup.map_err(|source| InstallPackageError::Cleanup {
+            path: workspace_path,
+            source,
+        })?;
+
+        span.record("stage", "done");
+        span.pb_set_message(&format!("{package} {version} done"));
+        span.pb_tick();
+        Ok(())
+    }
+    .instrument(span.clone())
+    .await
+}
+
+async fn publish_installed_package(
+    source: &Path,
+    project_library: &Path,
+    package: &str,
+) -> Result<(), PublishInstalledPackageError> {
+    let source = source.to_path_buf();
+    let project_library = project_library.to_path_buf();
+    let package = package.to_string();
+    tokio::task::spawn_blocking(move || {
+        let destination = project_library.join(&package);
+        if destination.exists() {
+            return Err(PublishInstalledPackageError::DestinationExists { path: destination });
+        }
+        let staging = tempfile::Builder::new()
+            .prefix(".rpx-install-")
+            .tempdir_in(&project_library)
+            .map_err(
+                |source| PublishInstalledPackageError::CreateStagingDirectory {
+                    path: project_library.clone(),
+                    source,
+                },
+            )?;
+        let staging_path = staging.path().to_path_buf();
+        let staged_package = staging.path().join(&package);
+        copy_directory(&source, &staged_package).map_err(|error| {
+            PublishInstalledPackageError::StagePackage {
+                path: source,
+                source: error,
+            }
+        })?;
+        let metadata = staged_package.join("DESCRIPTION");
+        if !metadata.is_file() {
+            return Err(PublishInstalledPackageError::MissingMetadata { path: metadata });
+        }
+        if destination.exists() {
+            return Err(PublishInstalledPackageError::DestinationExists { path: destination });
+        }
+        fs::rename(&staged_package, &destination).map_err(|source| {
+            PublishInstalledPackageError::Publish {
+                path: destination,
+                source,
+            }
+        })?;
+        staging
+            .close()
+            .map_err(|source| PublishInstalledPackageError::Cleanup {
+                path: staging_path,
+                source,
+            })
+    })
+    .await
+    .map_err(|source| PublishInstalledPackageError::Join { source })?
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&source, &destination)?;
+        } else {
+            fs::copy(source, destination)?;
         }
     }
+    Ok(())
 }
 
-async fn install_downloaded_package(
-    package: String,
-    version: String,
-    key: CompiledPackageCacheKey,
-    artifact_path: PathBuf,
-    install_type: String,
-    project_library: PathBuf,
-    span: tracing::Span,
-) -> Result<String, String> {
-    record_package_stage(&span, &package, &version, "installing");
-
-    let temp_library = build_temp_library_path(&package, &unique_build_token());
-
-    install_local_package(
-        &project_library,
-        &artifact_path,
-        &package,
-        &version,
-        &install_type,
-        &temp_library,
-    )
-    .await
-    .map_err(|failure| failure.to_string())?;
-
-    let built_package_path = temp_library.join(&package);
-
-    record_package_stage(&span, &package, &version, "storing cache");
-    cache::store(&key, &built_package_path).await?;
-
-    record_package_stage(&span, &package, &version, "restoring project library");
-    cache::restore(&key, &project_library).await?;
-
-    record_package_stage(&span, &package, &version, "cleaning up");
-    if let Some(temp_root) = temp_library.parent() {
-        tokio::fs::remove_dir_all(temp_root)
-            .await
-            .map_err(|error| format!("failed to clean temporary build directory: {error}"))?;
-    }
-
-    record_package_stage(&span, &package, &version, "done");
-
-    Ok(package)
-}
-
-fn record_package_stage(span: &tracing::Span, package: &str, version: &str, stage: &'static str) {
-    span.record("stage", stage);
-    span.pb_set_style(&progress_spinner_style());
-    span.pb_set_message(&package_stage_message(package, version, stage));
-    span.pb_tick();
-}
-
-fn package_stage_message(package: &str, version: &str, stage: &str) -> String {
-    format!("{package} {version} {stage}")
-}
-
-async fn write_artifact_response(
-    package: &str,
-    version: &str,
-    extension: &str,
+async fn publish_artifact_response(
+    path: PathBuf,
     response: reqwest::Response,
     span: &tracing::Span,
-) -> Result<PathBuf, String> {
-    let file_name = format!("{package}_{version}.{extension}");
-    let path = artifact_cache_path(package, version, &file_name);
-
-    if path.exists() {
-        if let Ok(metadata) = path.metadata() {
-            span.record("bytes", metadata.len());
-            span.record("total_bytes", metadata.len());
-            span.pb_set_style(&progress_bar_style());
-            span.pb_set_length(metadata.len());
-            span.pb_set_position(metadata.len());
-            span.pb_set_message(&package_stage_message(
-                package,
-                version,
-                "using cached artifact",
-            ));
-        }
-
-        return Ok(path);
-    }
-
+) -> Result<(), DownloadPackageArtifactError> {
     let content_length = response.content_length();
+    let mut stream = response.bytes_stream();
 
     if let Some(total) = content_length {
         span.record("total_bytes", total);
@@ -855,28 +1309,52 @@ async fn write_artifact_response(
         span.pb_set_position(0);
     }
 
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            format!(
-                "failed to create artifact cache directory {}: {error}",
-                parent.display()
-            )
+    let parent = path
+        .parent()
+        .ok_or_else(|| DownloadPackageArtifactError::PublishArtifact {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact cache path has no parent",
+            ),
         })?;
-    }
-
-    let mut file = tokio::fs::File::create(&path)
+    tokio::fs::create_dir_all(parent).await.map_err(|source| {
+        DownloadPackageArtifactError::CreateCacheDirectory {
+            path: parent.to_path_buf(),
+            source,
+        }
+    })?;
+    let temporary_path = tempfile::Builder::new()
+        .prefix(".rpx-artifact-")
+        .tempfile_in(parent)
+        .map_err(
+            |source| DownloadPackageArtifactError::CreateTemporaryArtifact {
+                path: parent.to_path_buf(),
+                source,
+            },
+        )?
+        .into_temp_path();
+    let mut file = tokio::fs::File::create(&temporary_path)
         .await
-        .map_err(|error| format!("failed to create artifact file {}: {error}", path.display()))?;
+        .map_err(
+            |source| DownloadPackageArtifactError::OpenTemporaryArtifact {
+                path: temporary_path.to_path_buf(),
+                source,
+            },
+        )?;
 
-    let mut stream = response.bytes_stream();
     let mut written = 0_u64;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("failed to read artifact response: {error}"))?;
+        let chunk =
+            chunk.map_err(|source| DownloadPackageArtifactError::ReadResponse { source })?;
         let chunk_len = chunk.len() as u64;
 
-        file.write_all(&chunk).await.map_err(|error| {
-            format!("failed to write artifact file {}: {error}", path.display())
+        file.write_all(&chunk).await.map_err(|source| {
+            DownloadPackageArtifactError::WriteArtifact {
+                path: temporary_path.to_path_buf(),
+                source,
+            }
         })?;
 
         written += chunk_len;
@@ -890,29 +1368,36 @@ async fn write_artifact_response(
         }
     }
 
+    if let Some(expected) = content_length
+        && written != expected
+    {
+        return Err(DownloadPackageArtifactError::ContentLengthMismatch {
+            expected,
+            actual: written,
+        });
+    }
+
     file.flush()
         .await
-        .map_err(|error| format!("failed to flush artifact file {}: {error}", path.display()))?;
+        .map_err(|source| DownloadPackageArtifactError::FlushArtifact {
+            path: temporary_path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all()
+        .await
+        .map_err(|source| DownloadPackageArtifactError::SyncArtifact {
+            path: temporary_path.to_path_buf(),
+            source,
+        })?;
+    drop(file);
+    tokio::fs::rename(&temporary_path, &path)
+        .await
+        .map_err(|source| DownloadPackageArtifactError::PublishArtifact {
+            path: path.clone(),
+            source,
+        })?;
 
-    Ok(path)
-}
-
-fn macos_binary_target() -> Result<String, String> {
-    match std::env::consts::ARCH {
-        "aarch64" => Ok("big-sur-arm64".to_string()),
-        "x86_64" => Ok("big-sur-x86_64".to_string()),
-        arch => Err(format!(
-            "unsupported macOS architecture for binary packages: {arch}"
-        )),
-    }
-}
-
-fn unique_build_token() -> String {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    format!("{}-{unique}", std::process::id())
+    Ok(())
 }
 
 async fn validate_package_graph(packages: &RequiredPackages) -> Result<(), SyncError> {
@@ -929,17 +1414,17 @@ async fn validate_package_graph(packages: &RequiredPackages) -> Result<(), SyncE
 
     let dependencies = packages
         .iter()
-        .map(|(package, (_, description))| {
-            package_dependency_names(description)
+        .map(|(package, (version, description))| {
+            required_dependencies(format!("{package} {}", version.version()), description)
                 .map(|dependencies| {
                     dependencies
                         .into_iter()
-                        .map(|dependency| (package.clone(), dependency))
-                        .collect::<Vec<_>>()
+                        .map(|dependency| (package.clone(), dependency.package().to_string()))
+                        .collect::<BTreeSet<_>>()
                 })
-                .map_err(|details| PackageGraphError::InvalidDependencies {
+                .map_err(|error| PackageGraphError::InvalidDependencies {
                     package: package.clone(),
-                    details,
+                    details: error.to_string(),
                 })
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -1024,29 +1509,7 @@ async fn validate_package_graph(packages: &RequiredPackages) -> Result<(), SyncE
 mod tests {
     use super::*;
     use crate::repository::{PackageRepository, built_in_repository};
-    use r_description::Remote;
-
-    #[test]
-    fn package_dependency_names_uses_only_hard_dependencies() {
-        let description = RDescription::parse(
-            "Package: selected\nVersion: 1.0.0\nDepends: R, depends, duplicate\nImports: imports, duplicate\nLinkingTo: linking\nSuggests: suggested\n",
-        );
-        assert_eq!(
-            package_dependency_names(&description).unwrap(),
-            BTreeSet::from([
-                "depends".into(),
-                "duplicate".into(),
-                "imports".into(),
-                "linking".into()
-            ])
-        );
-        for field in ["Depends", "Imports", "LinkingTo"] {
-            let description = RDescription::parse(&format!(
-                "Package: selected\nVersion: 1.0.0\n{field}: broken (>= invalid)\n"
-            ));
-            assert!(package_dependency_names(&description).is_err());
-        }
-    }
+    use r_description::{RDescription, Remote};
 
     #[test]
     fn package_requires_install_respects_source_and_version() {
@@ -1092,12 +1555,134 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn install_tasks_release_by_kind_and_package_dependency() {
+        let packages =
+            required_packages(&[("dependency", ""), ("dependent", "Imports: dependency\n")]);
+        let mut tasks = install_tasks(packages).unwrap();
+        let resources = ResourcePool::new();
+
+        let dependency_download = pop_startable(&mut tasks, &resources).unwrap();
+        assert_eq!(dependency_download.task.0, "dependency");
+        assert_eq!(dependency_download.task.1, TaskKind::Download);
+        complete_task(&mut tasks, dependency_download);
+
+        let dependency_install = pop_startable(&mut tasks, &resources).unwrap();
+        assert_eq!(dependency_install.task.0, "dependency");
+        assert_eq!(dependency_install.task.1, TaskKind::Install);
+        complete_task(&mut tasks, dependency_install);
+
+        let dependent_download = pop_startable(&mut tasks, &resources).unwrap();
+        assert_eq!(dependent_download.task.0, "dependent");
+        assert_eq!(dependent_download.task.1, TaskKind::Download);
+        complete_task(&mut tasks, dependent_download);
+
+        let dependent_install = pop_startable(&mut tasks, &resources).unwrap();
+        assert_eq!(dependent_install.task.0, "dependent");
+        assert_eq!(dependent_install.task.1, TaskKind::Install);
+    }
+
+    #[test]
+    fn resource_pool_enforces_shared_and_subset_limits() {
+        let mut resources = ResourcePool::new();
+        resources.reserve(TaskKind::Checkout);
+        assert!(!resources.can_reserve(TaskKind::Checkout));
+        assert!(resources.can_reserve(TaskKind::Build));
+
+        resources.release(TaskKind::Checkout);
+        for _ in 0..SYNC_R_WORKERS {
+            resources.reserve(TaskKind::Build);
+        }
+        assert!(!resources.can_reserve(TaskKind::Install));
+        assert!(resources.can_reserve(TaskKind::Download));
+
+        for _ in SYNC_R_WORKERS..SYNC_SHARED_WORKERS {
+            resources.reserve(TaskKind::Download);
+        }
+        assert!(!resources.can_reserve(TaskKind::Download));
+    }
+
+    #[tokio::test]
+    async fn publishes_complete_installed_package() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("package");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("DESCRIPTION"),
+            "Package: package\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        fs::write(source.join("contents"), "complete").unwrap();
+        let project_library = tempfile::tempdir().unwrap();
+
+        publish_installed_package(&source, project_library.path(), "package")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project_library.path().join("package/contents")).unwrap(),
+            "complete"
+        );
+        assert!(fs::read_dir(project_library.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rpx-install-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn package_publication_does_not_replace_existing_destination() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("package");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("DESCRIPTION"),
+            "Package: package\nVersion: 2.0.0\n",
+        )
+        .unwrap();
+        let project_library = tempfile::tempdir().unwrap();
+        let existing = project_library.path().join("package");
+        fs::create_dir(&existing).unwrap();
+        fs::write(
+            existing.join("DESCRIPTION"),
+            "Package: package\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+
+        let error = publish_installed_package(&source, project_library.path(), "package")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PublishInstalledPackageError::DestinationExists { path } if path == existing
+        ));
+        assert_eq!(
+            fs::read_to_string(existing.join("DESCRIPTION")).unwrap(),
+            "Package: package\nVersion: 1.0.0\n"
+        );
+    }
+
     #[tokio::test]
     async fn package_graph_validation_accepts_complete_acyclic_graph() {
         let packages = required_packages(&[
             ("dependent", "Imports: dependency, testBasePackage\n"),
             ("dependency", ""),
             ("unrelated", ""),
+        ]);
+        validate_package_graph(&packages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn package_graph_validation_deduplicates_dependency_constraints() {
+        let packages = required_packages(&[
+            (
+                "dependent",
+                "Imports: dependency (>= 1.0.0), dependency (< 2.0.0)\n",
+            ),
+            ("dependency", ""),
         ]);
         validate_package_graph(&packages).await.unwrap();
     }
