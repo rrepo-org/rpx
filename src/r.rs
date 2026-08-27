@@ -153,24 +153,10 @@ pub enum RVersionError {
     },
 }
 
-pub(crate) trait RVirtualEnv {
-    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self;
-}
-
-impl RVirtualEnv for tokio::process::Command {
-    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self {
-        let mut command = tokio::process::Command::new(program.as_ref());
-        command.env("R_LIBS_USER", project_library);
-        command
-    }
-}
-
-impl RVirtualEnv for std::process::Command {
-    fn with_venv(program: impl AsRef<OsStr>, project_library: &Path) -> Self {
-        let mut command = std::process::Command::new(program.as_ref());
-        command.env("R_LIBS_USER", project_library);
-        command
-    }
+fn project_r_command(program: impl AsRef<OsStr>, project_library: &Path) -> Command {
+    let mut command = Command::new(program.as_ref());
+    command.env("R_LIBS_USER", project_library);
+    command
 }
 
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
@@ -209,7 +195,7 @@ pub async fn install_local_package(
     .replace("%PACKAGE%", &escape_r_string(package))
     .replace("%VERSION%", &escape_r_string(version));
 
-    let mut command = Command::with_venv("Rscript", project_library);
+    let mut command = project_r_command("Rscript", project_library);
     command.arg("-e").arg(expression);
     let output = run_subprocess(command, "Rscript").await;
 
@@ -221,7 +207,7 @@ pub async fn install_package_directory(
     target_library: &Path,
     target: &str,
 ) -> Result<(), PackageInstallError> {
-    let mut command = Command::with_venv("R", target_library);
+    let mut command = project_r_command("R", target_library);
     command
         .arg("CMD")
         .arg("INSTALL")
@@ -314,7 +300,7 @@ pub async fn installed_packages(
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let mut command = Command::with_venv("Rscript", project_library);
+    let mut command = project_r_command("Rscript", project_library);
     command.arg("-e").arg(expression);
     let output = run_subprocess(command, "Rscript")
         .await

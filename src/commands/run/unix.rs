@@ -1,4 +1,3 @@
-use crate::r::RVirtualEnv;
 use miette::Diagnostic;
 use std::{ffi::OsString, os::unix::process::CommandExt, path::Path};
 use thiserror::Error;
@@ -31,9 +30,10 @@ pub(super) fn execute_command(
     project_library: &Path,
     depth: u32,
 ) -> Result<(), Error> {
-    let mut command = std::process::Command::with_venv(program, project_library);
+    let mut command = std::process::Command::new(program);
     command
         .args(args)
+        .env("R_LIBS_USER", project_library)
         .env(RECURSION_DEPTH_ENV, depth.to_string());
     let source = command.exec();
     Err(classify_start_error(program, source))

@@ -1,4 +1,3 @@
-use crate::r::RVirtualEnv;
 use miette::Diagnostic;
 use std::{ffi::OsString, path::Path};
 use thiserror::Error;
@@ -11,7 +10,7 @@ pub(crate) enum Error {
     #[diagnostic(
         code(rpx::run::command_not_found),
         help(
-            "Check that the executable is on PATH and that script interpreters exist. Shell commands must be invoked explicitly, for example `rpx run sh -c 'command'`."
+            "Check that the executable is on PATH. Shell commands must be invoked explicitly, for example `rpx run cmd /C command` or `rpx run powershell -Command command`."
         )
     )]
     CommandNotFound { program: String },
@@ -40,9 +39,10 @@ pub(super) fn execute_command(
     depth: u32,
 ) -> Result<(), Error> {
     let display_program = program.to_string_lossy().into_owned();
-    let mut command = std::process::Command::with_venv(program, project_library);
+    let mut command = std::process::Command::new(program);
     command
         .args(args)
+        .env("R_LIBS_USER", project_library)
         .env(RECURSION_DEPTH_ENV, depth.to_string());
     let mut child = command
         .spawn()
