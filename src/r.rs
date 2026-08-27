@@ -37,10 +37,6 @@ pub enum RSubprocessError {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum PackageInstallError {
-    #[error("package installation path is not valid UTF-8: {}", path.display())]
-    #[diagnostic(code(rpx::install::invalid_path))]
-    InvalidPath { path: PathBuf },
-
     #[error("failed to install {target}: {source}")]
     #[diagnostic(code(rpx::install::command_failed))]
     Command {
@@ -176,33 +172,29 @@ pub async fn install_local_package(
     pkg_type: &str,
     target_library: &Path,
 ) -> Result<(), PackageInstallError> {
-    let artifact_path = artifact_path
-        .to_str()
-        .ok_or_else(|| PackageInstallError::InvalidPath {
-            path: artifact_path.to_path_buf(),
-        })?;
-    let target_library =
-        target_library
-            .to_str()
-            .ok_or_else(|| PackageInstallError::InvalidPath {
-                path: target_library.to_path_buf(),
-            })?;
-
-    let expression = concat!(
-        "install.packages('%ARTIFACT%', repos = NULL, type = '%TYPE%', lib = '%LIB%');",
-        "packages <- installed.packages(lib.loc = '%LIB%');",
-        "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
-        "installed_version <- packages['%PACKAGE%', 'Version'];",
-        "if (installed_version != '%VERSION%') warning(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
-    )
-    .replace("%ARTIFACT%", &escape_r_string(artifact_path))
-    .replace("%TYPE%", &escape_r_string(pkg_type))
-    .replace("%LIB%", &escape_r_string(target_library))
-    .replace("%PACKAGE%", &escape_r_string(package))
-    .replace("%VERSION%", &escape_r_string(version));
-
     let mut command = project_r_command("Rscript", project_library);
-    command.arg("-e").arg(expression);
+    command
+        .arg("-e")
+        .arg(concat!(
+            "args <- commandArgs(trailingOnly = TRUE);",
+            "artifact <- args[[1L]];",
+            "package_type <- args[[2L]];",
+            "target_library <- args[[3L]];",
+            "package_name <- args[[4L]];",
+            "expected_version <- args[[5L]];",
+            "utils::install.packages(artifact, repos = NULL, type = package_type, lib = target_library);",
+            "packages <- utils::installed.packages(lib.loc = target_library);",
+            "if (!(package_name %in% rownames(packages))) ",
+            "stop(sprintf('Expected package %s to be installed', package_name));",
+            "installed_version <- packages[package_name, 'Version'];",
+            "if (installed_version != expected_version) ",
+            "warning(sprintf('Installed %s version %s, expected %s', package_name, installed_version, expected_version))"
+        ))
+        .arg(artifact_path)
+        .arg(pkg_type)
+        .arg(target_library)
+        .arg(package)
+        .arg(version);
     let output = run_subprocess(command, "Rscript").await;
 
     install_command_result(output, format!("{package}@{version}"))
@@ -217,7 +209,8 @@ pub async fn install_package_directory(
     command
         .arg("CMD")
         .arg("INSTALL")
-        .arg(format!("--library={}", target_library.display()))
+        .arg("-l")
+        .arg(target_library)
         .arg(package_root);
     let output = run_subprocess(command, "R").await;
 
@@ -406,10 +399,6 @@ fn parse_installed_packages(
             ))
         })
         .collect()
-}
-
-fn escape_r_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
