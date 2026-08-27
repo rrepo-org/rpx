@@ -65,3 +65,13 @@ pub fn create_package_project(
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 }
+
+#[allow(dead_code)]
+pub fn lock_package_project(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    project_path: &str,
+) {
+    let command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}

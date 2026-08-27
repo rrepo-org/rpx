@@ -675,12 +675,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deb822-fast"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "114c474fa4cd5d6d24bb5e68b36fa4ef70f5b830e3cc14a9b66a12e71a15aeb9"
-
-[[package]]
 name = "deb822-lossless"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2476,7 +2470,7 @@ dependencies = [
  "bytes",
  "clap",
  "cliclack",
- "deb822-fast",
+ "deb822-lossless",
  "directories",
  "flate2",
  "futures-core",

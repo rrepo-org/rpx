@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Output,
@@ -37,10 +38,6 @@ pub enum RSubprocessError {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum PackageInstallError {
-    #[error("package installation path is not valid UTF-8: {}", path.display())]
-    #[diagnostic(code(rpx::install::invalid_path))]
-    InvalidPath { path: PathBuf },
-
     #[error("failed to {action} {target}: {source}")]
     #[diagnostic(code(rpx::install::command_failed))]
     Command {
@@ -168,16 +165,16 @@ pub enum RVersionError {
     },
 }
 
-pub(crate) trait RVirtualEnv {
-    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self;
+fn project_r_command(program: impl AsRef<OsStr>, project_library: &Path) -> Command {
+    let mut command = Command::new(program.as_ref());
+    command.env("R_LIBS_USER", project_library);
+    command
 }
 
-impl RVirtualEnv for tokio::process::Command {
-    fn with_venv(program: impl AsRef<str>, project_library: &Path) -> Self {
-        let mut command = tokio::process::Command::new(program.as_ref());
-        command.env("R_LIBS_USER", project_library);
-        command
-    }
+fn rscript_query() -> Command {
+    let mut command = Command::new("Rscript");
+    command.arg("--vanilla");
+    command
 }
 
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
@@ -191,33 +188,29 @@ pub async fn install_local_package(
     pkg_type: &str,
     target_library: &Path,
 ) -> Result<(), PackageInstallError> {
-    let artifact_path = artifact_path
-        .to_str()
-        .ok_or_else(|| PackageInstallError::InvalidPath {
-            path: artifact_path.to_path_buf(),
-        })?;
-    let target_library =
-        target_library
-            .to_str()
-            .ok_or_else(|| PackageInstallError::InvalidPath {
-                path: target_library.to_path_buf(),
-            })?;
-
-    let expression = concat!(
-        "install.packages('%ARTIFACT%', repos = NULL, type = '%TYPE%', lib = '%LIB%');",
-        "packages <- installed.packages(lib.loc = '%LIB%');",
-        "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
-        "installed_version <- packages['%PACKAGE%', 'Version'];",
-        "if (installed_version != '%VERSION%') warning(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
-    )
-    .replace("%ARTIFACT%", &escape_r_string(artifact_path))
-    .replace("%TYPE%", &escape_r_string(pkg_type))
-    .replace("%LIB%", &escape_r_string(target_library))
-    .replace("%PACKAGE%", &escape_r_string(package))
-    .replace("%VERSION%", &escape_r_string(version));
-
-    let mut command = Command::with_venv("Rscript", project_library);
-    command.arg("-e").arg(expression);
+    let mut command = project_r_command("Rscript", project_library);
+    command
+        .arg("-e")
+        .arg(concat!(
+            "args <- commandArgs(trailingOnly = TRUE);",
+            "artifact <- args[[1L]];",
+            "package_type <- args[[2L]];",
+            "target_library <- args[[3L]];",
+            "package_name <- args[[4L]];",
+            "expected_version <- args[[5L]];",
+            "utils::install.packages(artifact, repos = NULL, type = package_type, lib = target_library);",
+            "packages <- utils::installed.packages(lib.loc = target_library);",
+            "if (!(package_name %in% rownames(packages))) ",
+            "stop(sprintf('Expected package %s to be installed', package_name));",
+            "installed_version <- packages[package_name, 'Version'];",
+            "if (installed_version != expected_version) ",
+            "warning(sprintf('Installed %s version %s, expected %s', package_name, installed_version, expected_version))"
+        ))
+        .arg(artifact_path)
+        .arg(pkg_type)
+        .arg(target_library)
+        .arg(package)
+        .arg(version);
     let output = run_subprocess(command, "Rscript").await;
 
     package_command_result(output, "install", format!("{package}@{version}"))
@@ -236,7 +229,7 @@ pub async fn install_package_directory(
         .join(format!("{package}_{version}.tar.gz"));
 
     let result = async {
-        let mut build = Command::with_venv("R", target_library);
+        let mut build = project_r_command("R", target_library);
         build
             .arg("CMD")
             .arg("build")
@@ -270,11 +263,12 @@ pub async fn install_package_directory(
             }
         }
 
-        let mut install = Command::with_venv("R", target_library);
+        let mut install = project_r_command("R", target_library);
         install
             .arg("CMD")
             .arg("INSTALL")
-            .arg(format!("--library={}", target_library.display()))
+            .arg("-l")
+            .arg(target_library)
             .arg(&archive_path);
         install.kill_on_drop(true);
         let output = run_subprocess(install, "R").await;
@@ -415,14 +409,15 @@ pub async fn installed_packages(
     }
 
     let expression = concat!(
-        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
+        "args <- commandArgs(trailingOnly = TRUE);",
+        "packages <- utils::installed.packages(lib.loc = args[[1L]]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
-        "write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
+        "utils::write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let mut command = Command::with_venv("Rscript", project_library);
-    command.arg("-e").arg(expression);
+    let mut command = rscript_query();
+    command.arg("-e").arg(expression).arg(project_library);
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| InstalledPackagesError::Command { source })?;
@@ -522,24 +517,24 @@ fn parse_installed_packages(
         .collect()
 }
 
-fn escape_r_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
     R_VERSION.get_or_try_init(fetch_r_version).await.cloned()
 }
 
 async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
-    let mut command = tokio::process::Command::new("Rscript");
-    command.arg("-e").arg("cat(as.character(getRversion()))");
+    let mut command = Command::new("Rscript");
+    command.arg("--version");
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| RVersionError::Command { source })?;
 
-    let version =
+    let output =
         String::from_utf8(output.stdout).map_err(|source| RVersionError::InvalidUtf8 { source })?;
-    let version = version.trim();
+    let output = output.trim();
+    let version = output
+        .strip_prefix("Rscript (R) version ")
+        .and_then(|remainder| remainder.split_whitespace().next())
+        .unwrap_or(output);
 
     version
         .parse()
@@ -591,10 +586,10 @@ fn write_install_log(
 }
 
 async fn fetch_base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
-    let mut command = Command::new("Rscript");
+    let mut command = rscript_query();
     command
         .arg("-e")
-        .arg("writeLines(rownames(installed.packages(priority = 'base')))");
+        .arg("writeLines(rownames(utils::installed.packages(priority = 'base')))");
     let output = run_subprocess(command, "Rscript")
         .await
         .map_err(|source| BasePackagesError::Command { source })?;

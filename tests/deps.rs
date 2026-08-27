@@ -397,7 +397,13 @@ Imports: digest",
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert_package_state(&container, project_path, "digest", "FALSE");
+    let status_command = format!("cd {project_path} && rpx status");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("Required packages not installed") && stderr.contains("digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 
     let lockfile =
         serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
@@ -502,8 +508,7 @@ Maintainer: Test Author <test@example.com>
 Depends: R (>= 4.3), digest",
     );
 
-    let install_command =
-        format!("cd {project_path} && rpx run Rscript -e \"install.packages('digest')\"");
+    let install_command = format!("cd {project_path} && rpx lock && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &install_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
