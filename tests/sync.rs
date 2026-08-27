@@ -102,7 +102,7 @@ EOF
 cat > {wrapper_path}/Rscript <<'EOF'
 #!/bin/sh
 case "$*" in
-    *install.packages*digest_*)
+    *install.packages*digest*)
         if [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
             attempts=0
             while [ ! -f "$RPX_TEST_STATE/root-active" ] && [ "$attempts" -lt 100 ]; do
@@ -217,7 +217,7 @@ fn sync_installs_project_without_mutating_its_sources() {
     assert_package_state(&container, project_path, "testpkg", "TRUE");
 
     let assert_clean = format!(
-        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- {temp_path}/rpx-build-* && test ! -e \"$1\""
+        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_clean);
     assert_eq!(
@@ -277,7 +277,7 @@ Suggests: digest",
     );
 
     let completed_root_command = format!(
-        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- {temp_path}/rpx-build-* && test ! -e \"$1\""
+        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &completed_root_command);
     assert_eq!(
@@ -291,6 +291,11 @@ Suggests: digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "digest", "TRUE");
     assert_package_state(&container, project_path, "testpkg", "TRUE");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &completed_root_command);
+    assert_eq!(
+        exit_code, 0,
+        "retry left a temporary build workspace\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
 }
 
 #[test]
