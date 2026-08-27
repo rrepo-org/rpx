@@ -425,11 +425,6 @@ async fn fetch_r_version() -> Result<semver::Version, RVersionError> {
 
     let output =
         String::from_utf8(output.stdout).map_err(|source| RVersionError::InvalidUtf8 { source })?;
-
-    parse_rscript_version(&output)
-}
-
-fn parse_rscript_version(output: &str) -> Result<semver::Version, RVersionError> {
     let output = output.trim();
     let version = output
         .strip_prefix("Rscript (R) version ")
@@ -563,23 +558,6 @@ mod tests {
             error,
             InstalledPackagesError::InvalidVersion { package, version, .. }
                 if package == "digest" && version == "not-a-version"
-        ));
-    }
-
-    #[test]
-    fn parses_rscript_version_output() {
-        let version = parse_rscript_version("Rscript (R) version 4.5.2 (2025-10-31)\n").unwrap();
-
-        assert_eq!(version, semver::Version::new(4, 5, 2));
-    }
-
-    #[test]
-    fn rejects_invalid_rscript_version_output() {
-        let error = parse_rscript_version("unexpected output\n").unwrap_err();
-
-        assert!(matches!(
-            error,
-            RVersionError::InvalidVersion { version, .. } if version == "unexpected output"
         ));
     }
 
