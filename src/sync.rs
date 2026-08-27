@@ -19,7 +19,10 @@ use r_description::RDescription;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -259,6 +262,7 @@ async fn install_required_packages(
             .collect::<BTreeSet<_>>(),
     );
     let installed_packages = Arc::new(Mutex::new(retained));
+    let install_failed = Arc::new(AtomicBool::new(false));
     let shared_pool = Arc::new(Semaphore::new(SYNC_SHARED_WORKERS));
     let install_pool = Arc::new(Semaphore::new(SYNC_INSTALL_WORKERS));
     let (installed_tx, installed_rx) = watch::channel(());
@@ -277,6 +281,7 @@ async fn install_required_packages(
             let project_path = repository.path().to_path_buf();
             let install_required_names = Arc::clone(&required_names);
             let install_installed_packages = Arc::clone(&installed_packages);
+            let install_install_failed = Arc::clone(&install_failed);
             let install_installed_rx = installed_rx.clone();
             let install_installed_tx = installed_tx.clone();
             let install_shared_pool = Arc::clone(&shared_pool);
@@ -289,6 +294,7 @@ async fn install_required_packages(
                         &dependencies,
                         install_required_names,
                         Arc::clone(&install_installed_packages),
+                        install_install_failed,
                         install_installed_rx,
                     )
                     .await
@@ -339,6 +345,7 @@ async fn install_required_packages(
             let repository = repository.clone();
             let install_required_names = Arc::clone(&required_names);
             let install_installed_packages = Arc::clone(&installed_packages);
+            let install_install_failed = Arc::clone(&install_failed);
             let install_installed_rx = installed_rx.clone();
             let install_installed_tx = installed_tx.clone();
             let install_shared_pool = Arc::clone(&shared_pool);
@@ -351,6 +358,7 @@ async fn install_required_packages(
                         &dependencies,
                         install_required_names,
                         Arc::clone(&install_installed_packages),
+                        install_install_failed,
                         install_installed_rx,
                     )
                     .await
@@ -437,6 +445,7 @@ async fn install_required_packages(
 
         let install_required_names = Arc::clone(&required_names);
         let install_installed_packages = Arc::clone(&installed_packages);
+        let install_install_failed = Arc::clone(&install_failed);
         let install_installed_rx = installed_rx.clone();
         let install_installed_tx = installed_tx.clone();
         let install_shared_pool = Arc::clone(&shared_pool);
@@ -459,6 +468,7 @@ async fn install_required_packages(
                     &dependencies,
                     install_required_names,
                     Arc::clone(&install_installed_packages),
+                    install_install_failed,
                     install_installed_rx,
                 )
                 .await
@@ -498,11 +508,27 @@ async fn install_required_packages(
 
     sync_span.record("running", install_tasks.len() as u64);
 
+    let mut first_error = None;
     while let Some(result) = install_tasks.join_next().await {
-        result.map_err(|error| SyncError::DownloadArtifactsFailed {
-            details: format!("install task failed to join: {error}"),
-        })??;
-        completed += 1;
+        let result = result
+            .map_err(|error| SyncError::DownloadArtifactsFailed {
+                details: format!("install task failed to join: {error}"),
+            })
+            .and_then(|result| result);
+
+        match result {
+            Ok(_) => completed += 1,
+            Err(error) if first_error.is_none() => {
+                first_error = Some(error);
+                install_failed.store(true, Ordering::Relaxed);
+                install_pool.close();
+                shared_pool.close();
+                prepare_tasks.abort_all();
+                let _ = installed_tx.send(());
+            }
+            Err(_) => {}
+        }
+
         sync_span.record("completed", completed);
         sync_span.record("running", install_tasks.len() as u64);
         sync_span.record("pending", total_packages.saturating_sub(completed));
@@ -514,7 +540,7 @@ async fn install_required_packages(
 
     sync_span.record("stage", "done");
     sync_span.pb_set_finish_message(&format!("sync packages {completed}/{total_packages}"));
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn wait_for_package_dependencies(
@@ -522,9 +548,16 @@ async fn wait_for_package_dependencies(
     dependencies: &BTreeSet<String>,
     required_names: Arc<BTreeSet<String>>,
     installed_packages: Arc<Mutex<BTreeSet<String>>>,
+    install_failed: Arc<AtomicBool>,
     mut installed_rx: watch::Receiver<()>,
 ) -> Result<(), String> {
     loop {
+        if install_failed.load(Ordering::Relaxed) {
+            return Err(format!(
+                "stopped waiting for {package} dependencies after an installation failed"
+            ));
+        }
+
         {
             let installed_packages = installed_packages.lock().await;
             if dependencies
@@ -1029,6 +1062,34 @@ mod tests {
     use super::*;
     use crate::repository::{PackageRepository, built_in_repository};
     use r_description::Remote;
+
+    #[tokio::test]
+    async fn dependency_wait_stops_after_install_failure() {
+        let install_failed = Arc::new(AtomicBool::new(false));
+        let (installed_tx, installed_rx) = watch::channel(());
+        let wait_install_failed = Arc::clone(&install_failed);
+        let waiter = tokio::spawn(async move {
+            wait_for_package_dependencies(
+                "dependent",
+                &BTreeSet::from(["dependency".to_string()]),
+                Arc::new(BTreeSet::from(["dependency".to_string()])),
+                Arc::new(Mutex::new(BTreeSet::new())),
+                wait_install_failed,
+                installed_rx,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        install_failed.store(true, Ordering::Relaxed);
+        let _ = installed_tx.send(());
+
+        let error = waiter
+            .await
+            .expect("dependency waiter should join")
+            .expect_err("dependency waiter should stop");
+        assert!(error.contains("after an installation failed"));
+    }
 
     #[test]
     fn package_dependency_names_uses_only_hard_dependencies() {

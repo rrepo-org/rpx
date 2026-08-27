@@ -4,7 +4,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Output,
-    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -223,7 +222,8 @@ pub async fn install_package_directory(
     version: &str,
     target: &str,
 ) -> Result<(), PackageInstallError> {
-    let build_directory = TemporaryBuildDirectory::create()?;
+    let build_directory = temporary_build_directory()?;
+    let build_directory_path = build_directory.path().to_path_buf();
     let archive_path = build_directory
         .path()
         .join(format!("{package}_{version}.tar.gz"));
@@ -277,16 +277,16 @@ pub async fn install_package_directory(
     }
     .await;
 
-    if let Err(source) = build_directory.remove().await {
+    if let Err(source) = close_temporary_build_directory(build_directory).await {
         if result.is_ok() {
             return Err(PackageInstallError::TemporaryBuildDirectory {
                 operation: "remove",
-                path: build_directory.path().to_path_buf(),
+                path: build_directory_path,
                 source,
             });
         }
         tracing::warn!(
-            path = %build_directory.path().display(),
+            path = %build_directory_path.display(),
             error = %source,
             "failed to remove temporary package build directory"
         );
@@ -322,36 +322,23 @@ fn package_command_result(
     }
 }
 
-struct TemporaryBuildDirectory {
-    path: PathBuf,
-}
-
-impl TemporaryBuildDirectory {
-    fn create() -> Result<Self, PackageInstallError> {
-        let path = temporary_build_directory_path();
-        fs::create_dir(&path).map_err(|source| PackageInstallError::TemporaryBuildDirectory {
+fn temporary_build_directory() -> Result<tempfile::TempDir, PackageInstallError> {
+    tempfile::Builder::new()
+        .prefix("rpx-build-")
+        .tempdir()
+        .map_err(|source| PackageInstallError::TemporaryBuildDirectory {
             operation: "create",
-            path: path.clone(),
+            path: std::env::temp_dir(),
             source,
-        })?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    async fn remove(&self) -> Result<(), std::io::Error> {
-        tokio::fs::remove_dir_all(&self.path).await
-    }
+        })
 }
 
-impl Drop for TemporaryBuildDirectory {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
+async fn close_temporary_build_directory(
+    directory: tempfile::TempDir,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || directory.close())
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 pub async fn base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
@@ -639,20 +626,6 @@ fn install_log_path() -> PathBuf {
     std::env::temp_dir().join(format!("rpx-install-{}-{unique}.log", std::process::id()))
 }
 
-fn temporary_build_directory_path() -> PathBuf {
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "rpx-build-{}-{unique}-{sequence}",
-        std::process::id()
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -678,6 +651,50 @@ mod tests {
             InstalledPackagesError::InvalidVersion { package, version, .. }
                 if package == "digest" && version == "not-a-version"
         ));
+    }
+
+    #[test]
+    fn temporary_build_directories_are_unique_and_removed_on_drop() {
+        let first = temporary_build_directory().expect("first temporary directory should exist");
+        let second = temporary_build_directory().expect("second temporary directory should exist");
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_dir());
+        assert!(second_path.is_dir());
+
+        drop(first);
+        drop(second);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[tokio::test]
+    async fn aborting_task_removes_owned_temporary_build_directory() {
+        let directory = temporary_build_directory().expect("temporary directory should exist");
+        let path = directory.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            let _directory = directory;
+            std::future::pending::<()>().await;
+        });
+
+        task.abort();
+        let _ = task.await;
+
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn explicitly_closes_temporary_build_directory() {
+        let directory = temporary_build_directory().expect("temporary directory should exist");
+        let path = directory.path().to_path_buf();
+
+        close_temporary_build_directory(directory)
+            .await
+            .expect("temporary directory should close");
+
+        assert!(!path.exists());
     }
 
     #[tokio::test]

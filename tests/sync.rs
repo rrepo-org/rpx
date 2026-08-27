@@ -66,6 +66,71 @@ fn assert_package_version(
     );
 }
 
+fn install_sync_failure_wrappers(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    project_path: &str,
+    wrapper_path: &str,
+    state_path: &str,
+) -> String {
+    let command = format!(
+        r#"mkdir -p {wrapper_path}/real {state_path}
+ln -s "$(command -v R)" {wrapper_path}/real/R
+ln -s "$(command -v Rscript)" {wrapper_path}/real/Rscript
+cat > {wrapper_path}/R <<'EOF'
+#!/bin/sh
+case "$*" in
+    *CMD*build*"$RPX_TEST_PROJECT"*)
+        if [ "${{RPX_TEST_ROOT_DELAY:-}}" = 1 ] && [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
+            rm -f "$RPX_TEST_STATE/root-cleaned" "$RPX_TEST_STATE/digest-failed"
+            touch "$RPX_TEST_STATE/root-active"
+            attempts=0
+            while [ ! -f "$RPX_TEST_STATE/digest-failed" ] && [ "$attempts" -lt 1200 ]; do
+                sleep 0.05
+                attempts=$((attempts + 1))
+            done
+            sleep 1
+            {wrapper_path}/real/R "$@"
+            status=$?
+            rm -f "$RPX_TEST_STATE/root-active"
+            touch "$RPX_TEST_STATE/root-cleaned"
+            exit "$status"
+        fi
+        ;;
+esac
+exec {wrapper_path}/real/R "$@"
+EOF
+cat > {wrapper_path}/Rscript <<'EOF'
+#!/bin/sh
+case "$*" in
+    *install.packages*digest_*)
+        if [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
+            attempts=0
+            while [ ! -f "$RPX_TEST_STATE/root-active" ] && [ "$attempts" -lt 100 ]; do
+                sleep 0.05
+                attempts=$((attempts + 1))
+            done
+            if [ ! -f "$RPX_TEST_STATE/root-active" ]; then
+                echo "digest install did not overlap the root build" >&2
+                exit 98
+            fi
+            touch "$RPX_TEST_STATE/digest-failed"
+            echo "injected digest install failure" >&2
+            exit 97
+        fi
+        ;;
+esac
+exec {wrapper_path}/real/Rscript "$@"
+EOF
+chmod +x {wrapper_path}/R {wrapper_path}/Rscript"#
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    format!(
+        "PATH={wrapper_path}:$PATH RPX_TEST_PROJECT={project_path} RPX_TEST_STATE={state_path} RPX_TEST_ROOT_DELAY=1"
+    )
+}
+
 #[test]
 fn runs_rpx_lock_from_current_library() {
     let container = start_container();
@@ -134,9 +199,10 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
 fn sync_installs_project_without_mutating_its_sources() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-clean-sources";
+    let temp_path = "/tmp/rpx-project-sync-clean-sources-tmp";
     create_package_project(&container, project_path);
     let add_build_sources = format!(
-        "cd {project_path} && mkdir src && cat > configure <<'EOF'\n#!/bin/sh\ntouch configured-during-install\nEOF\nchmod +x configure && cat > src/native.c <<'EOF'\nvoid native(void) {{}}\nEOF"
+        "mkdir -p {temp_path} && cd {project_path} && mkdir src && cat > configure <<'EOF'\n#!/bin/sh\ntouch configured-during-install\nEOF\nchmod +x configure && cat > src/native.c <<'EOF'\nvoid native(void) {{}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_build_sources);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -145,13 +211,13 @@ fn sync_installs_project_without_mutating_its_sources() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let sync_command = format!("cd {project_path} && rpx sync");
+    let sync_command = format!("cd {project_path} && TMPDIR={temp_path} rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "testpkg", "TRUE");
 
     let assert_clean = format!(
-        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- /tmp/rpx-build-* && test ! -e \"$1\""
+        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- {temp_path}/rpx-build-* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_clean);
     assert_eq!(
@@ -172,6 +238,59 @@ fn sync_installs_project_without_mutating_its_sources() {
         exit_code, 0,
         "failed installation left project sources or temporary build files behind\nstdout was: {stdout}\nstderr was: {stderr}"
     );
+}
+
+#[test]
+fn failed_sync_drains_active_source_builds() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-drain-installs";
+    let wrapper_path = "/tmp/rpx-sync-drain-wrappers";
+    let state_path = "/tmp/rpx-sync-drain-state";
+    let temp_path = "/tmp/rpx-sync-drain-temp";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Suggests: digest",
+    );
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let wrapped_environment =
+        install_sync_failure_wrappers(&container, project_path, wrapper_path, state_path);
+    let sync_command = format!(
+        "mkdir -p {temp_path} && cd {project_path} && {wrapped_environment} TMPDIR={temp_path} RPX_TEST_FAIL_DIGEST=1 rpx sync"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("code Some(97)") && stderr.contains("injected digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let completed_root_command = format!(
+        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- {temp_path}/rpx-build-* && test ! -e \"$1\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &completed_root_command);
+    assert_eq!(
+        exit_code, 0,
+        "sync returned before the root build cleaned up\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let retry_command =
+        format!("cd {project_path} && {wrapped_environment} TMPDIR={temp_path} rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &retry_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
 }
 
 #[test]
