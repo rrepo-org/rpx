@@ -5,16 +5,18 @@ use crate::{
         ensure_project_library, library_mismatches, load_project, load_project_resolution,
         project_library_path,
     },
-    r::{
-        BasePackagesError, InstalledPackagesError, RVirtualEnv, base_packages, installed_packages,
-    },
+    r::{BasePackagesError, InstalledPackagesError, base_packages, installed_packages},
 };
 use miette::Diagnostic;
-use std::{collections::BTreeMap, ffi::OsString};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
+#[cfg_attr(unix, path = "run/unix.rs")]
+#[cfg_attr(windows, path = "run/windows.rs")]
+mod platform;
+
 const RECURSION_DEPTH_ENV: &str = "RPX_RUN_RECURSION_DEPTH";
-const MAX_RECURSION_DEPTH: u32 = 8;
+const MAX_RECURSION_DEPTH: u32 = 100;
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
@@ -58,31 +60,9 @@ pub(crate) enum Error {
     )]
     RecursionLimit,
 
-    #[error("command not found: {program}")]
-    #[diagnostic(
-        code(rpx::run::command_not_found),
-        help(
-            "Check that the executable is on PATH and that script interpreters exist. Shell commands must be invoked explicitly, for example `rpx run sh -c 'command'`."
-        )
-    )]
-    CommandNotFound { program: String },
-
-    #[error("failed to start {program}")]
-    #[diagnostic(code(rpx::run::command_start_failed))]
-    CommandStartFailed {
-        program: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[cfg(windows)]
-    #[error("failed while waiting for {program}")]
-    #[diagnostic(code(rpx::run::command_wait_failed))]
-    CommandWaitFailed {
-        program: String,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Command(#[from] platform::Error),
 }
 
 pub(crate) async fn run(args: RunArgs) -> Result<(), Error> {
@@ -123,11 +103,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<(), Error> {
         .command
         .split_first()
         .expect("run command requires at least one argument");
-    #[cfg(unix)]
-    return execute_command(program, command_args, &project_library, depth + 1);
-
-    #[cfg(windows)]
-    execute_command(program, command_args, &project_library, depth + 1).await
+    platform::execute_command(program, command_args, &project_library, depth + 1)?;
+    Ok(())
 }
 
 fn recursion_depth() -> Result<u32, Error> {
@@ -147,62 +124,4 @@ fn recursion_depth() -> Result<u32, Error> {
         return Err(Error::RecursionLimit);
     }
     Ok(depth)
-}
-
-#[cfg(unix)]
-fn execute_command(
-    program: &OsString,
-    args: &[OsString],
-    project_library: &std::path::Path,
-    depth: u32,
-) -> Result<(), Error> {
-    use std::os::unix::process::CommandExt;
-
-    let mut command = std::process::Command::with_venv(program, project_library);
-    command
-        .args(args)
-        .env(RECURSION_DEPTH_ENV, depth.to_string());
-    let source = command.exec();
-    Err(classify_start_error(&program.to_string_lossy(), source))
-}
-
-#[cfg(windows)]
-async fn execute_command(
-    program: &OsString,
-    args: &[OsString],
-    project_library: &std::path::Path,
-    depth: u32,
-) -> Result<(), Error> {
-    let display_program = program.to_string_lossy().into_owned();
-    let mut command = tokio::process::Command::with_venv(program, project_library);
-    command
-        .args(args)
-        .env(RECURSION_DEPTH_ENV, depth.to_string());
-    let mut child = command
-        .spawn()
-        .map_err(|source| classify_start_error(&display_program, source))?;
-    let status = child
-        .wait()
-        .await
-        .map_err(|source| Error::CommandWaitFailed {
-            program: display_program,
-            source,
-        })?;
-    if status.code() != Some(0) {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
-}
-
-fn classify_start_error(program: &str, source: std::io::Error) -> Error {
-    if source.kind() == std::io::ErrorKind::NotFound {
-        Error::CommandNotFound {
-            program: program.to_string(),
-        }
-    } else {
-        Error::CommandStartFailed {
-            program: program.to_string(),
-            source,
-        }
-    }
 }
