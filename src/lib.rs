@@ -37,7 +37,7 @@ use ui::progress_spinner_style;
 /// # Errors
 ///
 /// Returns an error when command execution or diagnostic rendering fails.
-pub async fn run() -> miette::Result<Outcome> {
+pub async fn run() -> miette::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
@@ -46,7 +46,7 @@ pub async fn run() -> miette::Result<Outcome> {
         Commands::Init(args) => init::run(args).await?,
         Commands::Add(args) => add::run(args).await?,
         Commands::Remove(args) => remove::run(args).await?,
-        Commands::Run(args) => return Ok(Outcome::run(run_command::run(args).await?)),
+        Commands::Run(args) => run_command::run(args).await?,
         Commands::Lock {} => lock::run().await?,
         Commands::Status => status_command::run().await?,
         Commands::Sync(args) => sync_command::run(args).await?,
@@ -54,55 +54,7 @@ pub async fn run() -> miette::Result<Outcome> {
         Commands::Repo { command } => repo::run(command).await?,
     }
 
-    Ok(Outcome::complete())
-}
-
-/// Work that must finish after the asynchronous runtime has been dropped.
-pub struct Outcome {
-    inner: OutcomeKind,
-}
-
-enum OutcomeKind {
-    Complete,
-    #[cfg(unix)]
-    Exec(Box<run_command::PreparedCommand>),
-    #[cfg(windows)]
-    Exit(Option<i32>),
-}
-
-impl Outcome {
-    fn complete() -> Self {
-        Self {
-            inner: OutcomeKind::Complete,
-        }
-    }
-
-    fn run(outcome: run_command::RunOutcome) -> Self {
-        let inner = match outcome {
-            #[cfg(unix)]
-            run_command::RunOutcome::Exec(command) => OutcomeKind::Exec(Box::new(command)),
-            #[cfg(windows)]
-            run_command::RunOutcome::Exit(code) => OutcomeKind::Exit(code),
-        };
-        Self { inner }
-    }
-
-    /// Completes deferred process handling.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a prepared command cannot be started.
-    pub fn finish(self) -> miette::Result<()> {
-        match self.inner {
-            OutcomeKind::Complete => Ok(()),
-            #[cfg(unix)]
-            OutcomeKind::Exec(command) => run_command::exec(*command).map_err(Into::into),
-            #[cfg(windows)]
-            OutcomeKind::Exit(Some(0)) => Ok(()),
-            #[cfg(windows)]
-            OutcomeKind::Exit(code) => std::process::exit(code.unwrap_or(1)),
-        }
-    }
+    Ok(())
 }
 
 fn init_tracing() {

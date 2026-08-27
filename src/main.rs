@@ -1,9 +1,4 @@
-fn main() -> miette::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Tokio runtime should initialize");
-    let outcome = runtime.block_on(rpx::run())?;
-    drop(runtime);
-    outcome.finish()
+#[tokio::main]
+async fn main() -> miette::Result<()> {
+    rpx::run().await
 }

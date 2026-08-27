@@ -85,20 +85,7 @@ pub(crate) enum Error {
     },
 }
 
-pub(crate) enum RunOutcome {
-    #[cfg(unix)]
-    Exec(PreparedCommand),
-    #[cfg(windows)]
-    Exit(Option<i32>),
-}
-
-#[cfg(unix)]
-pub(crate) struct PreparedCommand {
-    command: std::process::Command,
-    program: String,
-}
-
-pub(crate) async fn run(args: RunArgs) -> Result<RunOutcome, Error> {
+pub(crate) async fn run(args: RunArgs) -> Result<(), Error> {
     let depth = recursion_depth()?;
     let project = load_project()?;
     let project_library = project_library_path(&project.root);
@@ -137,10 +124,10 @@ pub(crate) async fn run(args: RunArgs) -> Result<RunOutcome, Error> {
         .split_first()
         .expect("run command requires at least one argument");
     #[cfg(unix)]
-    return prepare_command(program, command_args, &project_library, depth + 1);
+    return execute_command(program, command_args, &project_library, depth + 1);
 
     #[cfg(windows)]
-    prepare_command(program, command_args, &project_library, depth + 1).await
+    execute_command(program, command_args, &project_library, depth + 1).await
 }
 
 fn recursion_depth() -> Result<u32, Error> {
@@ -163,29 +150,29 @@ fn recursion_depth() -> Result<u32, Error> {
 }
 
 #[cfg(unix)]
-fn prepare_command(
+fn execute_command(
     program: &OsString,
     args: &[OsString],
     project_library: &std::path::Path,
     depth: u32,
-) -> Result<RunOutcome, Error> {
+) -> Result<(), Error> {
+    use std::os::unix::process::CommandExt;
+
     let mut command = std::process::Command::with_venv(program, project_library);
     command
         .args(args)
         .env(RECURSION_DEPTH_ENV, depth.to_string());
-    Ok(RunOutcome::Exec(PreparedCommand {
-        command,
-        program: program.to_string_lossy().into_owned(),
-    }))
+    let source = command.exec();
+    Err(classify_start_error(&program.to_string_lossy(), source))
 }
 
 #[cfg(windows)]
-async fn prepare_command(
+async fn execute_command(
     program: &OsString,
     args: &[OsString],
     project_library: &std::path::Path,
     depth: u32,
-) -> Result<RunOutcome, Error> {
+) -> Result<(), Error> {
     let display_program = program.to_string_lossy().into_owned();
     let mut command = tokio::process::Command::with_venv(program, project_library);
     command
@@ -201,7 +188,10 @@ async fn prepare_command(
             program: display_program,
             source,
         })?;
-    Ok(RunOutcome::Exit(status.code()))
+    if status.code() != Some(0) {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 fn classify_start_error(program: &str, source: std::io::Error) -> Error {
@@ -215,13 +205,4 @@ fn classify_start_error(program: &str, source: std::io::Error) -> Error {
             source,
         }
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn exec(prepared: PreparedCommand) -> Result<(), Error> {
-    use std::os::unix::process::CommandExt;
-
-    let mut prepared = prepared;
-    let source = prepared.command.exec();
-    Err(classify_start_error(&prepared.program, source))
 }
