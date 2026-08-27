@@ -14,7 +14,7 @@ async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }
 bytes = "1"
 cliclack = "0.5.6"
-deb822-fast = "0.2.3"
+deb822-lossless = "0.5.18"
 directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
@@ -37,6 +37,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4.44"
+target-lexicon = "0.13.3"
+tempfile = "3"
 thiserror = "2.0.17"
 time = "0.3.53"
 tokio = { version = "1.51.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync"] }

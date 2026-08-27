@@ -19,6 +19,7 @@ fn runs_rpx_run_with_isolated_library() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-run";
     create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
     let command = format!(
         "mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"cat(.libPaths()[1])\""
     );
@@ -32,11 +33,27 @@ fn runs_rpx_run_with_isolated_library() {
 }
 
 #[test]
+fn run_ignores_r_profiles_during_environment_validation() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-profile";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+    let command = format!(
+        "cd {project_path} && printf '%s\n' \"cat('profile-noise')\" \".libPaths(rev(.libPaths()))\" > .Rprofile && rpx run sh -c 'printf command-ran'"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stdout, "command-ran");
+}
+
+#[test]
 fn run_from_subdirectory_uses_project_library_and_preserves_working_directory() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-run-subdirectory";
     let working_path = "/tmp/rpx-project-run-subdirectory/scripts/nested";
     create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
 
     let command = format!(
         "mkdir -p {working_path} && cd {working_path} && rpx run Rscript -e \"cat(getwd(), '\\n', .libPaths()[1], sep = '')\""
@@ -50,6 +67,194 @@ fn run_from_subdirectory_uses_project_library_and_preserves_working_directory() 
     assert!(
         library.contains("/libraries/") && library.ends_with("/library"),
         "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn run_reports_missing_command() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-missing-command";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run command-that-does-not-exist");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::run::command_not_found"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("command not found: command-that-does-not-exist"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No such file or directory"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn run_preserves_command_errors_and_exit_code() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-command-error";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run sh -c 'echo command-error >&2; exit 42'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 42, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stderr.trim(), "command-error");
+}
+
+#[test]
+fn run_preserves_literal_command_arguments() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-literal-arguments";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+
+    let command = format!(
+        "cd {project_path} && rpx run sh -c 'printf \"<%s>\\n\" \"$@\"' marker '*' '$HOME' '' '-n'"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stdout, "<*>\n<$HOME>\n<>\n<-n>\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_preserves_non_utf8_command_arguments() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-non-utf8-arguments";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+
+    let command = format!(
+        "cd {project_path} && rpx run sh -c 'printf %s \"$1\" | od -An -tu1' marker \"$(printf '\\377')\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(stdout.trim(), "255");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_preserves_signal_exit_status() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-signal";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run sh -c 'kill -TERM $$'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 143, "stdout was: {stdout}\nstderr was: {stderr}");
+}
+
+#[test]
+fn run_requires_a_lockfile_before_starting_the_command() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-lockfile-required";
+    create_package_project(&container, project_path);
+
+    let command = format!("cd {project_path} && rpx run sh -c 'touch command-started'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::project::lockfile_read_failed"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(
+        &container,
+        &format!("test ! -e {project_path}/command-started"),
+    );
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}
+
+#[test]
+fn run_rejects_a_missing_locked_package_before_starting_the_command() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-library-drift";
+    create_package_project(&container, project_path);
+    let setup = format!(
+        "cd {project_path} && rpx add digest && rpx run Rscript -e \"unlink(file.path(.libPaths()[1], 'digest'), recursive = TRUE)\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let command = format!("cd {project_path} && rpx run sh -c 'touch command-started'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::run::library_out_of_sync") && stderr.contains("digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(
+        &container,
+        &format!("test ! -e {project_path}/command-started"),
+    );
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}
+
+#[test]
+fn run_rejects_dependency_drift_before_starting_the_command() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-description-drift";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+    let mutate = format!("cd {project_path} && printf '\\nImports: digest\\n' >> DESCRIPTION");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let command = format!("cd {project_path} && rpx run sh -c 'touch command-started'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::project::requirements_changed"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(
+        &container,
+        &format!("test ! -e {project_path}/command-started"),
+    );
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_replaces_its_process_on_unix() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-exec";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+    let command = format!(
+        "cd {project_path} && rm -f command-pid && rpx run sh -c 'echo $$ > command-pid' & rpx_pid=$!; wait $rpx_pid; test \"$(cat {project_path}/command-pid)\" = \"$rpx_pid\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_stops_recursive_shebangs() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run-recursion";
+    create_package_project(&container, project_path);
+    lock_package_project(&container, project_path);
+    let command = format!(
+        "cd {project_path} && printf '#!/usr/local/bin/rpx run\\n' > recursive && chmod +x recursive && rpx run ./recursive"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::run::recursion_limit"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 

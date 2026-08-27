@@ -1,17 +1,20 @@
 use async_trait::async_trait;
+use deb822_lossless::{Entry as DcfEntry, Paragraph, PositionedParseError};
 use http::Extensions;
 use keyring::Entry;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
-use r_description::{Relation, Version};
+use r_description::{PositionedRelationParseError, Relation, Version, VersionParseError};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
     ReqwestOtelSpanBackend, TracingMiddleware, default_on_request_end, reqwest_otel_span,
 };
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{Cursor, IsTerminal};
+use std::io::IsTerminal;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use target_lexicon::{Aarch64Architecture, Architecture, OperatingSystem, Triple};
 use thiserror::Error;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -298,7 +301,7 @@ impl ReqwestOtelSpanBackend for RpxHttpProgressTrace {
         let span = reqwest_otel_span!(
             name = "http_request",
             req,
-            url.full = %remove_credentials(req.url()),
+            url.full = %display_safe_url(req.url()),
             indicatif.pb_show = true,
         );
         span.pb_set_message(&message);
@@ -319,10 +322,12 @@ fn request_progress_message(req: &reqwest::Request) -> String {
     format!("{} {}", req.method(), req.url().path())
 }
 
-fn remove_credentials(url: &reqwest::Url) -> reqwest::Url {
+pub(crate) fn display_safe_url(url: &reqwest::Url) -> reqwest::Url {
     let mut url = url.clone();
     let _ = url.set_username("");
     let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
     url
 }
 
@@ -331,63 +336,293 @@ pub struct CranPackagesIndex {
     pub packages: Vec<CranPackageIndexEntry>,
 }
 
+#[derive(Clone, Debug, Error, Diagnostic)]
+#[error("failed to parse CRAN PACKAGES index ({count} errors)")]
+#[diagnostic(
+    code(rpx::repository::cran_packages_parse_failed),
+    help(
+        "The repository returned invalid metadata. Try another mirror or contact the repository maintainer."
+    )
+)]
+pub struct CranPackagesParseError {
+    count: usize,
+
+    #[source_code]
+    source_code: NamedSource<String>,
+
+    #[related]
+    issues: Vec<CranPackagesParseIssue>,
+}
+
+impl CranPackagesParseError {
+    fn new(
+        source_name: impl Into<String>,
+        source: String,
+        issues: Vec<CranPackagesParseIssue>,
+    ) -> Self {
+        let source_name = source_name.into();
+        Self {
+            count: issues.len(),
+            source_code: NamedSource::new(source_name, source),
+            issues,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, Diagnostic)]
+pub enum CranPackagesParseIssue {
+    #[error("{error}")]
+    Syntax {
+        error: PositionedParseError,
+        #[label("{error}")]
+        span: SourceSpan,
+    },
+
+    #[error("required {field} field is missing")]
+    MissingField {
+        field: &'static str,
+        #[label("{field} is required in this package record")]
+        span: SourceSpan,
+    },
+
+    #[error("{field} field is empty")]
+    EmptyField {
+        field: &'static str,
+        #[label("{field} must not be empty")]
+        span: SourceSpan,
+    },
+
+    #[error("{field} field is declared multiple times")]
+    DuplicateField {
+        field: &'static str,
+        #[label("duplicate {field} field")]
+        span: SourceSpan,
+    },
+
+    #[error("invalid Version field: {source}")]
+    InvalidVersion {
+        #[source]
+        source: VersionParseError,
+        #[label("{source}")]
+        span: SourceSpan,
+    },
+
+    #[error("failed to parse {field}: {source}")]
+    InvalidRelation {
+        field: &'static str,
+        #[source]
+        source: PositionedRelationParseError,
+        #[label("{source}")]
+        span: SourceSpan,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CranPackageIndexEntry {
     pub package: String,
-    pub version: String,
+    pub version: Version,
     pub depends: Vec<Relation>,
     pub imports: Vec<Relation>,
     pub suggests: Vec<Relation>,
     pub linking_to: Vec<Relation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CranArchiveRootListing {
-    pub packages: Vec<String>,
+impl CranPackagesIndex {
+    pub fn parse(
+        source_name: impl Into<String>,
+        source: String,
+    ) -> Result<Self, CranPackagesParseError> {
+        let parsed = deb822_lossless::Deb822::parse(&source);
+        let syntax_issues = parsed
+            .positioned_errors()
+            .iter()
+            .map(|error| {
+                let start = usize::from(error.range.start());
+                let end = usize::from(error.range.end());
+                CranPackagesParseIssue::Syntax {
+                    error: error.clone(),
+                    span: (start..end).into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if !syntax_issues.is_empty() {
+            return Err(CranPackagesParseError::new(
+                source_name,
+                source,
+                syntax_issues,
+            ));
+        }
+
+        let document = parsed.tree();
+        let (packages, issues): (Vec<_>, Vec<_>) = document
+            .paragraphs()
+            .map(|paragraph| cran_package_index_entry_from_paragraph(&paragraph))
+            .partition(Result::is_ok);
+        let packages = packages.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        let issues = issues
+            .into_iter()
+            .flat_map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+
+        if !issues.is_empty() {
+            return Err(CranPackagesParseError::new(source_name, source, issues));
+        }
+
+        Ok(Self { packages })
+    }
+}
+
+fn cran_package_index_entry_from_paragraph(
+    paragraph: &Paragraph,
+) -> Result<CranPackageIndexEntry, Vec<CranPackagesParseIssue>> {
+    let package = parse_required_packages_field(paragraph, "Package", |value, _entry| {
+        Ok::<_, CranPackagesParseIssue>(value.to_string())
+    });
+    let version = parse_required_packages_field(paragraph, "Version", |value, entry| {
+        value
+            .parse::<Version>()
+            .map_err(|source| CranPackagesParseIssue::InvalidVersion {
+                source,
+                span: packages_field_span(entry),
+            })
+    });
+    let depends = parse_packages_relations_field(paragraph, "Depends");
+    let imports = parse_packages_relations_field(paragraph, "Imports");
+    let suggests = parse_packages_relations_field(paragraph, "Suggests");
+    let linking_to = parse_packages_relations_field(paragraph, "LinkingTo");
+
+    match (package, version, depends, imports, suggests, linking_to) {
+        (Ok(package), Ok(version), Ok(depends), Ok(imports), Ok(suggests), Ok(linking_to)) => {
+            Ok(CranPackageIndexEntry {
+                package,
+                version,
+                depends,
+                imports,
+                suggests,
+                linking_to,
+            })
+        }
+        (package, version, depends, imports, suggests, linking_to) => Err([
+            package.err(),
+            version.err(),
+            depends.err(),
+            imports.err(),
+            suggests.err(),
+            linking_to.err(),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()),
+    }
+}
+
+fn parse_required_packages_field<T>(
+    paragraph: &Paragraph,
+    field: &'static str,
+    parse: impl FnOnce(&str, &DcfEntry) -> Result<T, CranPackagesParseIssue>,
+) -> Result<T, Vec<CranPackagesParseIssue>> {
+    let entry = unique_packages_field(paragraph, field)?.ok_or_else(|| {
+        vec![CranPackagesParseIssue::MissingField {
+            field,
+            span: text_range_span(paragraph.text_range()),
+        }]
+    })?;
+    let value = entry.value();
+    let value = value.trim();
+
+    if value.is_empty() {
+        Err(vec![CranPackagesParseIssue::EmptyField {
+            field,
+            span: packages_field_span(&entry),
+        }])
+    } else {
+        parse(value, &entry).map_err(|issue| vec![issue])
+    }
+}
+
+fn unique_packages_field(
+    paragraph: &Paragraph,
+    field: &'static str,
+) -> Result<Option<DcfEntry>, Vec<CranPackagesParseIssue>> {
+    let entries = paragraph
+        .entries()
+        .filter(|entry| {
+            entry
+                .key()
+                .is_some_and(|key| key.eq_ignore_ascii_case(field))
+        })
+        .collect::<Vec<_>>();
+
+    match entries.len() {
+        0 => Ok(None),
+        1 => Ok(entries.into_iter().next()),
+        _ => Err(entries
+            .iter()
+            .map(|entry| CranPackagesParseIssue::DuplicateField {
+                field,
+                span: packages_field_span(entry),
+            })
+            .collect()),
+    }
+}
+
+fn parse_packages_relations_field(
+    paragraph: &Paragraph,
+    field: &'static str,
+) -> Result<Vec<Relation>, Vec<CranPackagesParseIssue>> {
+    let Some(entry) = unique_packages_field(paragraph, field)? else {
+        return Ok(Vec::new());
+    };
+    let value = entry.value();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value = value.strip_suffix(',').unwrap_or(value);
+    let (relations, issues): (Vec<_>, Vec<_>) = value
+        .split(',')
+        .map(str::trim)
+        .map(|relation| {
+            relation
+                .parse()
+                .map_err(|source| CranPackagesParseIssue::InvalidRelation {
+                    field,
+                    source,
+                    span: packages_field_span(&entry),
+                })
+        })
+        .partition(Result::is_ok);
+    let relations = relations
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let issues = issues
+        .into_iter()
+        .map(Result::unwrap_err)
+        .collect::<Vec<_>>();
+
+    if issues.is_empty() {
+        Ok(relations)
+    } else {
+        Err(issues)
+    }
+}
+
+fn packages_field_span(entry: &DcfEntry) -> SourceSpan {
+    text_range_span(entry.value_range().unwrap_or_else(|| entry.text_range()))
+}
+
+fn text_range_span(range: deb822_lossless::TextRange) -> SourceSpan {
+    let start = usize::from(range.start());
+    let end = usize::from(range.end());
+    (start..end).into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CranPackageArchiveListing {
     pub versions: Vec<Version>,
-}
-
-impl FromStr for CranPackagesIndex {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let reader = Cursor::new(input);
-        let packages = deb822_fast::ParagraphReader::new(reader)
-            .map(|paragraph| {
-                paragraph
-                    .map_err(|error| error.to_string())
-                    .and_then(|paragraph| cran_package_index_entry_from_paragraph(&paragraph))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-
-        Ok(Self { packages })
-    }
-}
-
-impl FromStr for CranArchiveRootListing {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut packages = Vec::new();
-        for part in archive_listing_parts(input) {
-            if part.starts_with('/') || !part.ends_with('/') || part.contains('?') {
-                continue;
-            }
-
-            let package = part.trim_end_matches('/');
-            if package.is_empty() || packages.iter().any(|seen| seen == package) {
-                continue;
-            }
-
-            packages.push(html_unescape_minimal(package));
-        }
-
-        Ok(Self { packages })
-    }
 }
 
 impl FromStr for CranPackageArchiveListing {
@@ -467,55 +702,6 @@ fn html_unescape_minimal(value: &str) -> String {
         .replace("&quot;", "\"")
 }
 
-fn cran_package_index_entry_from_paragraph(
-    paragraph: &deb822_fast::Paragraph,
-) -> Result<CranPackageIndexEntry, String> {
-    let package = required_packages_field(paragraph, "Package")?;
-    let version = required_packages_field(paragraph, "Version")?;
-
-    Ok(CranPackageIndexEntry {
-        package,
-        version,
-        depends: parse_packages_relations_field(paragraph, "Depends")?,
-        imports: parse_packages_relations_field(paragraph, "Imports")?,
-        suggests: parse_packages_relations_field(paragraph, "Suggests")?,
-        linking_to: parse_packages_relations_field(paragraph, "LinkingTo")?,
-    })
-}
-
-fn required_packages_field(
-    paragraph: &deb822_fast::Paragraph,
-    field: &'static str,
-) -> Result<String, String> {
-    paragraph
-        .get(field)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| format!("missing required field {field}"))
-}
-
-fn parse_packages_relations_field(
-    paragraph: &deb822_fast::Paragraph,
-    field: &'static str,
-) -> Result<Vec<Relation>, String> {
-    let Some(value) = paragraph.get(field).map(str::trim) else {
-        return Ok(Vec::new());
-    };
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    value
-        .split(',')
-        .map(|relation| {
-            relation
-                .parse()
-                .map_err(|details| format!("failed to parse {field}: {details}"))
-        })
-        .collect()
-}
-
 pub async fn rrepo_repository_packages(
     base_url: &reqwest::Url,
 ) -> Result<reqwest::Response, reqwest_middleware::Error> {
@@ -569,52 +755,61 @@ pub async fn rrepo_source_artifact(
     client().get(url).send().await
 }
 
-pub async fn rrepo_windows_binary(
-    base_url: &reqwest::Url,
-    package: &str,
-    version: &str,
-    r_version: &semver::Version,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "packages",
-            package,
-            "versions",
-            version,
-            "binaries",
-            "windows",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-        ]);
-
-    client().get(url).send().await
+#[derive(Debug, Error)]
+pub enum BinaryArtifactRequestError {
+    #[error("binary artifacts are not supported for target {target}")]
+    UnsupportedTarget { target: Triple },
+    #[error(transparent)]
+    Request(#[from] reqwest_middleware::Error),
 }
 
-pub async fn rrepo_macos_binary(
+pub(crate) fn r_macos_binary_target(
+    target: &Triple,
+) -> Result<&'static str, BinaryArtifactRequestError> {
+    match (target.operating_system, target.architecture) {
+        (
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_),
+            Architecture::Aarch64(Aarch64Architecture::Aarch64),
+        ) => Ok("big-sur-arm64"),
+        (OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_), Architecture::X86_64) => {
+            Ok("big-sur-x86_64")
+        }
+        _ => Err(BinaryArtifactRequestError::UnsupportedTarget {
+            target: target.clone(),
+        }),
+    }
+}
+
+pub async fn rrepo_binary(
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
-    target: &str,
+    target: &Triple,
     r_version: &semver::Version,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
+) -> Result<reqwest::Response, BinaryArtifactRequestError> {
     let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
+    let r_version = format!("{}.{}", r_version.major, r_version.minor);
+    let target_path = match target.operating_system {
+        OperatingSystem::Windows => vec!["windows", r_version.as_str()],
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+            vec!["macos", r_macos_binary_target(target)?, r_version.as_str()]
+        }
+        _ => {
+            return Err(BinaryArtifactRequestError::UnsupportedTarget {
+                target: target.clone(),
+            });
+        }
+    };
+    let mut segments = url
+        .path_segments_mut()
+        .expect("repository base URL should support path segments");
+    segments
         .pop_if_empty()
-        .extend([
-            "packages",
-            package,
-            "versions",
-            version,
-            "binaries",
-            "macos",
-            target,
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-        ]);
+        .extend(["packages", package, "versions", version, "binaries"]);
+    segments.extend(target_path);
+    drop(segments);
 
-    client().get(url).send().await
+    Ok(client().get(url).send().await?)
 }
 
 pub async fn cran_packages(
@@ -698,48 +893,186 @@ pub async fn cran_latest_package_description(
     client().get(url).send().await
 }
 
-pub async fn cran_windows_binary(
+pub async fn cran_binary(
     base_url: &reqwest::Url,
-    r_version: &semver::Version,
     package: &str,
     version: &str,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let file_name = format!("{package}_{version}.zip");
+    target: &Triple,
+    r_version: &semver::Version,
+) -> Result<reqwest::Response, BinaryArtifactRequestError> {
+    let r_version = format!("{}.{}", r_version.major, r_version.minor);
+    let file_name;
+    let target_path = match target.operating_system {
+        OperatingSystem::Windows => {
+            file_name = format!("{package}_{version}.zip");
+            vec!["windows", "contrib", r_version.as_str(), file_name.as_str()]
+        }
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+            file_name = format!("{package}_{version}.tgz");
+            vec![
+                "macosx",
+                r_macos_binary_target(target)?,
+                "contrib",
+                r_version.as_str(),
+                file_name.as_str(),
+            ]
+        }
+        _ => {
+            return Err(BinaryArtifactRequestError::UnsupportedTarget {
+                target: target.clone(),
+            });
+        }
+    };
     let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "bin",
-            "windows",
-            "contrib",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-            &file_name,
-        ]);
+    let mut segments = url
+        .path_segments_mut()
+        .expect("repository base URL should support path segments");
+    segments.pop_if_empty().extend(["bin"]);
+    segments.extend(target_path);
+    drop(segments);
 
-    client().get(url).send().await
+    Ok(client().get(url).send().await?)
 }
 
-pub async fn cran_macos_binary(
-    base_url: &reqwest::Url,
-    target: &str,
-    r_version: &semver::Version,
-    package: &str,
-    version: &str,
-) -> Result<reqwest::Response, reqwest_middleware::Error> {
-    let file_name = format!("{package}_{version}.tgz");
-    let mut url = base_url.clone();
-    url.path_segments_mut()
-        .expect("repository base URL should support path segments")
-        .pop_if_empty()
-        .extend([
-            "bin",
-            "macosx",
-            target,
-            "contrib",
-            format!("{}.{}", r_version.major, r_version.minor).as_str(),
-            &file_name,
-        ]);
+#[cfg(test)]
+mod tests {
+    use super::{
+        BinaryArtifactRequestError, CranPackagesIndex, CranPackagesParseError,
+        CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
+    };
 
-    client().get(url).send().await
+    fn parse_packages_index(input: &str) -> Result<CranPackagesIndex, CranPackagesParseError> {
+        CranPackagesIndex::parse("CRAN PACKAGES fixture", input.to_string())
+    }
+
+    #[test]
+    fn display_safe_url_removes_credentials_query_and_fragment() {
+        let url = reqwest::Url::parse(
+            "https://user:password@example.test/repository/src/contrib/PACKAGES?token=secret#part",
+        )
+        .expect("URL fixture should parse");
+
+        assert_eq!(
+            display_safe_url(&url).as_str(),
+            "https://example.test/repository/src/contrib/PACKAGES"
+        );
+    }
+
+    #[test]
+    fn derives_r_macos_binary_targets_from_target_lexicon() {
+        let arm = "aarch64-apple-darwin".parse().unwrap();
+        let x86 = "x86_64-apple-darwin".parse().unwrap();
+        let linux = "x86_64-unknown-linux-gnu".parse().unwrap();
+
+        assert_eq!(r_macos_binary_target(&arm).unwrap(), "big-sur-arm64");
+        assert_eq!(r_macos_binary_target(&x86).unwrap(), "big-sur-x86_64");
+        assert!(matches!(
+            r_macos_binary_target(&linux),
+            Err(BinaryArtifactRequestError::UnsupportedTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_trailing_commas_in_cran_package_relations() {
+        let index = "Package: first\nVersion: 1.0.0\nDepends: R (>= 4.0.0),\nImports: cli, digest,\nSuggests: testthat,\nLinkingTo: cpp11,\n\nPackage: second\nVersion: 2.0.0\nImports: first\n";
+
+        let index = parse_packages_index(index).expect("trailing commas should be accepted");
+
+        assert_eq!(index.packages.len(), 2);
+        let first = &index.packages[0];
+        assert_eq!(first.depends.len(), 1);
+        assert_eq!(first.imports.len(), 2);
+        assert_eq!(first.suggests.len(), 1);
+        assert_eq!(first.linking_to.len(), 1);
+        assert_eq!(index.packages[1].package, "second");
+    }
+
+    #[test]
+    fn rejects_malformed_nonempty_cran_package_relations() {
+        let error =
+            parse_packages_index("Package: example\nVersion: 1.0.0\nImports: cli (>= invalid),\n")
+                .expect_err("malformed nonempty relations should be rejected");
+
+        assert!(matches!(
+            error.issues.as_slice(),
+            [CranPackagesParseIssue::InvalidRelation {
+                field: "Imports",
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_relations_except_for_one_trailing_comma() {
+        let error = parse_packages_index(
+            "Package: first\nVersion: 1.0.0\nImports: cli,,digest\n\nPackage: second\nVersion: 2.0.0\nImports: cli,,\n",
+        )
+            .expect_err("internal and repeated empty relations should be rejected");
+
+        assert_eq!(
+            error
+                .issues
+                .iter()
+                .filter(|issue| matches!(
+                    issue,
+                    CranPackagesParseIssue::InvalidRelation {
+                        field: "Imports",
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn aggregates_invalid_fields_across_package_records() {
+        let error = parse_packages_index(
+            "Version: invalid\nImports: cli,,digest\nSuggests: testthat\nSuggests: knitr\n\nPackage: valid\nVersion: 2.0.0\n",
+        )
+            .expect_err("every invalid package field should be reported");
+
+        assert_eq!(error.count, 5);
+        assert_eq!(error.issues.len(), 5);
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::MissingField {
+                field: "Package",
+                ..
+            }
+        )));
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, CranPackagesParseIssue::InvalidVersion { .. }))
+        );
+        assert_eq!(
+            error
+                .issues
+                .iter()
+                .filter(|issue| matches!(
+                    issue,
+                    CranPackagesParseIssue::DuplicateField {
+                        field: "Suggests",
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_structurally_invalid_packages_before_reading_records() {
+        let error = parse_packages_index("Package example\nVersion: 1.0.0\n")
+            .expect_err("invalid DCF syntax should reject the complete index");
+
+        assert!(
+            error
+                .issues
+                .iter()
+                .all(|issue| matches!(issue, CranPackagesParseIssue::Syntax { .. }))
+        );
+    }
 }
