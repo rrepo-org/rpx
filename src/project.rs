@@ -1102,10 +1102,11 @@ pub(crate) fn ensure_project_library(path: &Path) -> Result<PathBuf, ProjectLibr
 
 pub fn project_library_root_path(path: &Path) -> PathBuf {
     let project_key = hash_path(path);
-    project_dirs()
-        .data_dir()
-        .join("libraries")
-        .join(project_key)
+    libraries_dir_path().join(project_key)
+}
+
+pub fn libraries_dir_path() -> PathBuf {
+    project_dirs().data_dir().join("libraries")
 }
 
 pub fn cache_dir_path() -> PathBuf {
@@ -1747,7 +1748,7 @@ mod tests {
         let first = project_library_root_path(&first_path);
         assert_eq!(first, project_library_root_path(&first_path));
         assert_ne!(first, project_library_root_path(&second_path));
-        let libraries = project_dirs().data_dir().join("libraries");
+        let libraries = libraries_dir_path();
         assert_eq!(first.parent(), Some(libraries.as_path()));
         let key = first
             .file_name()

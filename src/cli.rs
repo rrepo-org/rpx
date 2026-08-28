@@ -60,8 +60,8 @@ pub enum Commands {
     Sync(SyncArgs),
 
     #[command(
-        about = "Remove project library and caches",
-        long_about = "Remove this project's isolated library and wipe rpx cache directories so the next sync or add starts from a clean local state."
+        about = "Remove all project libraries and caches",
+        long_about = "Remove all isolated project libraries and wipe rpx cache directories so the next sync or add starts from a clean local state."
     )]
     Clean,
 

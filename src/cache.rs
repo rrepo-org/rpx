@@ -97,9 +97,11 @@ pub(crate) fn source_artifact_cache_path(key: &SourceArtifactCacheKey) -> PathBu
 
 pub(crate) fn binary_artifact_cache_path(key: &BinaryArtifactCacheKey) -> PathBuf {
     let file_name = match key.target.operating_system {
-        OperatingSystem::Windows => "artifact.zip",
-        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => "artifact.tgz",
-        _ => "artifact.bin",
+        OperatingSystem::Windows => format!("{}_{}.zip", key.package, key.version),
+        OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+            format!("{}_{}.tgz", key.package, key.version)
+        }
+        _ => "artifact.bin".to_string(),
     };
     cache_dir_path()
         .join("artifacts")
