@@ -136,12 +136,7 @@ impl PackageRepository for CranRepository {
                         .map_err(|source| RepositoryError::Response {
                             source: Arc::new(source),
                         })?;
-                    let listing =
-                        text.parse::<http::CranPackageArchiveListing>()
-                            .map_err(|source| RepositoryError::InvalidData {
-                                resource: "CRAN package archive listing".to_string(),
-                                details: source.to_string(),
-                            })?;
+                    let listing = http::CranPackageArchiveListing::parse(package, &text);
 
                     Ok::<BTreeSet<Version>, RepositoryError>(listing.versions.into_iter().collect())
                 })
