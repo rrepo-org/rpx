@@ -10,9 +10,9 @@ use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
     ReqwestOtelSpanBackend, TracingMiddleware, default_on_request_end, reqwest_otel_span,
 };
+use scraper::{Html, Selector};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::IsTerminal;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use target_lexicon::{Aarch64Architecture, Architecture, OperatingSystem, Triple};
 use thiserror::Error;
@@ -625,37 +625,45 @@ pub struct CranPackageArchiveListing {
     pub versions: Vec<Version>,
 }
 
-impl FromStr for CranPackageArchiveListing {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
+impl CranPackageArchiveListing {
+    pub fn parse(package: &str, input: &str) -> Self {
+        let document = Html::parse_document(input);
+        let anchors = Selector::parse("a").expect("anchor selector should be valid");
         let mut versions = Vec::new();
-        for part in archive_listing_parts(input) {
-            let file_name = part.rsplit('/').next().unwrap_or(part);
-            if !file_name.ends_with(".tar.gz") || !file_name.contains('_') {
-                continue;
+
+        for anchor in document.select(&anchors) {
+            if let Some(href) = anchor.value().attr("href") {
+                push_archive_version(&mut versions, package, href);
             }
 
-            let file_name = html_unescape_minimal(file_name);
-            let stem = file_name
-                .strip_suffix(".tar.gz")
-                .expect("archive file name was checked for tar.gz suffix");
-            let Some((package, version)) = stem.rsplit_once('_') else {
-                continue;
-            };
-            if package.is_empty() || version.is_empty() {
-                continue;
-            }
-
-            let version = version
-                .parse::<Version>()
-                .map_err(|error| error.to_string())?;
-            if !versions.iter().any(|seen| seen == &version) {
-                versions.push(version);
+            for text in anchor.text() {
+                for candidate in text.split_ascii_whitespace() {
+                    push_archive_version(&mut versions, package, candidate);
+                }
             }
         }
 
-        Ok(Self { versions })
+        Self { versions }
+    }
+}
+
+fn push_archive_version(versions: &mut Vec<Version>, package: &str, candidate: &str) {
+    let candidate = candidate.split(['?', '#']).next().unwrap_or(candidate);
+    let file_name = candidate.rsplit('/').next().unwrap_or(candidate);
+    let Some(stem) = file_name.strip_suffix(".tar.gz") else {
+        return;
+    };
+    let Some((candidate_package, version)) = stem.rsplit_once('_') else {
+        return;
+    };
+    if candidate_package != package || version.is_empty() {
+        return;
+    }
+
+    if let Ok(version) = version.parse::<Version>()
+        && !versions.iter().any(|seen| seen == &version)
+    {
+        versions.push(version);
     }
 }
 
@@ -688,18 +696,6 @@ pub struct RrepoVersionSummary {
     pub version: String,
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
-}
-
-fn archive_listing_parts(listing: &str) -> impl Iterator<Item = &str> {
-    listing.split(['"', '\'', '<', '>', ' ', '\n', '\r', '\t'])
-}
-
-fn html_unescape_minimal(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
 }
 
 pub async fn rrepo_repository_packages(
@@ -937,8 +933,8 @@ pub async fn cran_binary(
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryArtifactRequestError, CranPackagesIndex, CranPackagesParseError,
-        CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
+        BinaryArtifactRequestError, CranPackageArchiveListing, CranPackagesIndex,
+        CranPackagesParseError, CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
     };
 
     fn parse_packages_index(input: &str) -> Result<CranPackagesIndex, CranPackagesParseError> {
@@ -970,6 +966,72 @@ mod tests {
             r_macos_binary_target(&linux),
             Err(BinaryArtifactRequestError::UnsupportedTarget { .. })
         ));
+    }
+
+    #[test]
+    fn parses_cran_archive_versions_from_audited_listing_shapes() {
+        let listing = CranPackageArchiveListing::parse(
+            "cli",
+            r#"
+                <table>
+                    <tr><td><a href="cli_1.0.0.tar.gz">cli_1.0.0.tar.gz</a></td></tr>
+                </table>
+                <pre><a href="/src/contrib/Archive/cli/cli_2.0.0.tar.gz">cli_2.0.0.tar.gz</a></pre>
+                <ul><li><a href="./cli_3.0.0.tar.gz">&rtrif; cli_3.0.0.tar.gz</a></li></ul>
+            "#,
+        );
+
+        assert_eq!(
+            listing
+                .versions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["1.0.0", "2.0.0", "3.0.0"]
+        );
+    }
+
+    #[test]
+    fn tolerates_malformed_and_unrelated_archive_entries() {
+        let listing = CranPackageArchiveListing::parse(
+            "cli",
+            r#"
+                <a href="cli_1.0.0.tar.gz">cli_1.0.0.tar.gz</a>
+                <a href="cli_not-a-version.tar.gz">cli_not-a-version.tar.gz</a>
+                <a href="other_2.0.0.tar.gz">other_2.0.0.tar.gz</a>
+                <a href="cli_3.0.0.tar.gz?download=1#archive">cli_3.0.0.tar.gz</a>
+            "#,
+        );
+
+        assert_eq!(
+            listing
+                .versions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["1.0.0", "3.0.0"]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_anchor_text_and_deduplicates_versions() {
+        let listing = CranPackageArchiveListing::parse(
+            "cli",
+            r#"
+                <a href="invalid.tar.gz">cli_1.0.0.tar.gz</a>
+                <a>cli_2.0.0.tar.gz</a>
+                <a href="cli_2.0.0.tar.gz">cli_2.0.0.tar.gz</a>
+            "#,
+        );
+
+        assert_eq!(
+            listing
+                .versions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["1.0.0", "2.0.0"]
+        );
     }
 
     #[test]
