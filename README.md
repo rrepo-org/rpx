@@ -189,7 +189,7 @@ shell syntax such as pipes, redirects, or variable expansion:
 rpx run sh -c 'Rscript scripts/check.R | tee check.log'
 ```
 
-If local package state becomes confusing, remove the project library and caches:
+If local package state becomes confusing, remove all project libraries and caches:
 
 ```bash
 rpx clean

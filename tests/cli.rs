@@ -431,38 +431,25 @@ fn init_creates_project_that_can_add_dependencies() {
 }
 
 #[test]
-fn clean_removes_project_library_and_cache_directories() {
+fn clean_removes_all_project_libraries_and_cache_directories_without_a_project() {
     let container = start_container();
-    let project_path = "/tmp/rpx-clean";
-    let setup_command =
-        format!("mkdir -p {project_path} && cd {project_path} && rpx init && rpx add digest");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
-
-    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-
-    let library_path_command =
-        format!("cd {project_path} && rpx run Rscript -e \"cat(.libPaths()[1])\"");
-    let (exit_code, library_path, stderr) = run_shell_command(&container, &library_path_command);
-    assert_eq!(
-        exit_code, 0,
-        "stdout was: {library_path}\nstderr was: {stderr}"
+    let working_path = "/tmp/rpx-clean";
+    let libraries_path = "/root/.local/share/rpx/libraries";
+    let setup_command = format!(
+        "mkdir -p {working_path} {libraries_path}/current/library {libraries_path}/orphaned/library /root/.cache/rpx/artifacts"
     );
-
-    let library_path = library_path.trim();
-    let check_before_command = format!("test -d '{library_path}' && test -d /root/.cache/rpx");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &check_before_command);
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let working_path = "/tmp/rpx-clean/nested";
-    let clean_command = format!("mkdir -p {working_path} && cd {working_path} && rpx clean");
+    let clean_command = format!("cd {working_path} && rpx clean");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &clean_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Removed project library and cache directories"),
+        stdout.contains("Removed all project libraries and cache directories"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 
-    let check_after_command = format!("test ! -d '{library_path}' && test ! -d /root/.cache/rpx");
+    let check_after_command = format!("test ! -d {libraries_path} && test ! -d /root/.cache/rpx");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &check_after_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 }
