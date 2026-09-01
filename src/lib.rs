@@ -92,7 +92,8 @@ mod tests {
     };
     use miette::Diagnostic;
     use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
-    use r_description::{RDescription, Relation, Version};
+    use r_description::Description;
+    use r_metadata::{Relation, Version};
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::PathBuf,
@@ -112,7 +113,7 @@ mod tests {
             .iter()
             .map(|(name, fields)| {
                 let description =
-                    RDescription::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
+                    Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
                 (
                     (*name).to_string(),
                     (
@@ -272,7 +273,7 @@ mod tests {
             "selected".into(),
             (
                 PackageVersion::new(version("1.0.0"), local),
-                Arc::new(RDescription::parse("Package: selected\nVersion: 1.0.0\n")),
+                Arc::new(Description::parse("Package: selected\nVersion: 1.0.0\n")),
             ),
         )]);
         assert!(matches!(

@@ -24,7 +24,7 @@ pub struct Lockfile {
     pub r: semver::Version,
     pub repos: Vec<Repository>,
     #[serde(with = "relation_set")]
-    pub requirements: BTreeSet<r_description::Relation>,
+    pub requirements: BTreeSet<r_metadata::Relation>,
     pub packages: BTreeMap<String, Package>,
 }
 
@@ -77,15 +77,15 @@ pub enum GitReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Package {
     #[serde(with = "package_version")]
-    pub version: r_description::Version,
+    pub version: r_metadata::Version,
     #[serde(with = "repository_url")]
     pub repository: url::Url,
     #[serde(with = "relation_set")]
-    pub dependencies: BTreeSet<r_description::Relation>,
+    pub dependencies: BTreeSet<r_metadata::Relation>,
 }
 
 mod relation_set {
-    use r_description::Relation;
+    use r_metadata::Relation;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
     use std::collections::BTreeSet;
 
@@ -149,7 +149,7 @@ mod git_oid {
 }
 
 mod package_version {
-    use r_description::Version;
+    use r_metadata::Version;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S>(version: &Version, serializer: S) -> Result<S::Ok, S::Error>
@@ -273,11 +273,11 @@ mod tests {
         value.parse().expect("URL should parse")
     }
 
-    fn relation(value: &str) -> r_description::Relation {
+    fn relation(value: &str) -> r_metadata::Relation {
         value.parse().expect("relation should parse")
     }
 
-    fn package_version(value: &str) -> r_description::Version {
+    fn package_version(value: &str) -> r_metadata::Version {
         value.parse().expect("package version should parse")
     }
 

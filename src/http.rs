@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use deb822_lossless::{Entry as DcfEntry, Paragraph, PositionedParseError};
 use http::Extensions;
 use keyring::Entry;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
-use r_description::{PositionedRelationParseError, Relation, Version, VersionParseError};
+use r_metadata::{Relation, Version};
+use r_packages::{Finding, Packages};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
@@ -371,48 +371,10 @@ impl CranPackagesParseError {
 
 #[derive(Clone, Debug, Error, Diagnostic)]
 pub enum CranPackagesParseIssue {
-    #[error("{error}")]
-    Syntax {
-        error: PositionedParseError,
-        #[label("{error}")]
-        span: SourceSpan,
-    },
-
-    #[error("required {field} field is missing")]
-    MissingField {
-        field: &'static str,
-        #[label("{field} is required in this package record")]
-        span: SourceSpan,
-    },
-
-    #[error("{field} field is empty")]
-    EmptyField {
-        field: &'static str,
-        #[label("{field} must not be empty")]
-        span: SourceSpan,
-    },
-
-    #[error("{field} field is declared multiple times")]
-    DuplicateField {
-        field: &'static str,
-        #[label("duplicate {field} field")]
-        span: SourceSpan,
-    },
-
-    #[error("invalid Version field: {source}")]
-    InvalidVersion {
-        #[source]
-        source: VersionParseError,
-        #[label("{source}")]
-        span: SourceSpan,
-    },
-
-    #[error("failed to parse {field}: {source}")]
-    InvalidRelation {
-        field: &'static str,
-        #[source]
-        source: PositionedRelationParseError,
-        #[label("{source}")]
+    #[error("{finding}")]
+    Finding {
+        finding: Finding,
+        #[label("{finding}")]
         span: SourceSpan,
     },
 }
@@ -432,192 +394,52 @@ impl CranPackagesIndex {
         source_name: impl Into<String>,
         source: String,
     ) -> Result<Self, CranPackagesParseError> {
-        let parsed = deb822_lossless::Deb822::parse(&source);
-        let syntax_issues = parsed
-            .positioned_errors()
-            .iter()
-            .map(|error| {
-                let start = usize::from(error.range.start());
-                let end = usize::from(error.range.end());
-                CranPackagesParseIssue::Syntax {
-                    error: error.clone(),
-                    span: (start..end).into(),
+        let parsed = Packages::parse(&source);
+        let issues = parsed
+            .validate()
+            .into_iter()
+            .map(|finding| {
+                let range = finding.span();
+                CranPackagesParseIssue::Finding {
+                    span: (range.start..range.end).into(),
+                    finding,
                 }
             })
-            .collect::<Vec<_>>();
-        if !syntax_issues.is_empty() {
-            return Err(CranPackagesParseError::new(
-                source_name,
-                source,
-                syntax_issues,
-            ));
-        }
-
-        let document = parsed.tree();
-        let (packages, issues): (Vec<_>, Vec<_>) = document
-            .paragraphs()
-            .map(|paragraph| cran_package_index_entry_from_paragraph(&paragraph))
-            .partition(Result::is_ok);
-        let packages = packages.into_iter().map(Result::unwrap).collect::<Vec<_>>();
-        let issues = issues
-            .into_iter()
-            .flat_map(Result::unwrap_err)
             .collect::<Vec<_>>();
 
         if !issues.is_empty() {
             return Err(CranPackagesParseError::new(source_name, source, issues));
         }
 
+        let packages = parsed
+            .records()
+            .filter_map(|record| cran_package_index_entry_from_validated_record(&record))
+            .collect();
         Ok(Self { packages })
     }
 }
 
-fn cran_package_index_entry_from_paragraph(
-    paragraph: &Paragraph,
-) -> Result<CranPackageIndexEntry, Vec<CranPackagesParseIssue>> {
-    let package = parse_required_packages_field(paragraph, "Package", |value, _entry| {
-        Ok::<_, CranPackagesParseIssue>(value.to_string())
-    });
-    let version = parse_required_packages_field(paragraph, "Version", |value, entry| {
-        value
-            .parse::<Version>()
-            .map_err(|source| CranPackagesParseIssue::InvalidVersion {
-                source,
-                span: packages_field_span(entry),
-            })
-    });
-    let depends = parse_packages_relations_field(paragraph, "Depends");
-    let imports = parse_packages_relations_field(paragraph, "Imports");
-    let suggests = parse_packages_relations_field(paragraph, "Suggests");
-    let linking_to = parse_packages_relations_field(paragraph, "LinkingTo");
-
-    match (package, version, depends, imports, suggests, linking_to) {
-        (Ok(package), Ok(version), Ok(depends), Ok(imports), Ok(suggests), Ok(linking_to)) => {
-            Ok(CranPackageIndexEntry {
-                package,
-                version,
-                depends,
-                imports,
-                suggests,
-                linking_to,
-            })
-        }
-        (package, version, depends, imports, suggests, linking_to) => Err([
-            package.err(),
-            version.err(),
-            depends.err(),
-            imports.err(),
-            suggests.err(),
-            linking_to.err(),
-        ]
-        .into_iter()
-        .flatten()
-        .flatten()
-        .collect()),
-    }
+fn cran_package_index_entry_from_validated_record(
+    record: &r_packages::PackageRecord,
+) -> Option<CranPackageIndexEntry> {
+    Some(CranPackageIndexEntry {
+        package: record.package()?.as_str().to_owned(),
+        version: record.parsed_version()?.ok()?,
+        depends: relation_values(record.parsed_depends()),
+        imports: relation_values(record.parsed_imports()),
+        suggests: relation_values(record.parsed_suggests()),
+        linking_to: relation_values(record.parsed_linking_to()),
+    })
 }
 
-fn parse_required_packages_field<T>(
-    paragraph: &Paragraph,
-    field: &'static str,
-    parse: impl FnOnce(&str, &DcfEntry) -> Result<T, CranPackagesParseIssue>,
-) -> Result<T, Vec<CranPackagesParseIssue>> {
-    let entry = unique_packages_field(paragraph, field)?.ok_or_else(|| {
-        vec![CranPackagesParseIssue::MissingField {
-            field,
-            span: text_range_span(paragraph.text_range()),
-        }]
-    })?;
-    let value = entry.value();
-    let value = value.trim();
-
-    if value.is_empty() {
-        Err(vec![CranPackagesParseIssue::EmptyField {
-            field,
-            span: packages_field_span(&entry),
-        }])
-    } else {
-        parse(value, &entry).map_err(|issue| vec![issue])
-    }
-}
-
-fn unique_packages_field(
-    paragraph: &Paragraph,
-    field: &'static str,
-) -> Result<Option<DcfEntry>, Vec<CranPackagesParseIssue>> {
-    let entries = paragraph
-        .entries()
-        .filter(|entry| {
-            entry
-                .key()
-                .is_some_and(|key| key.eq_ignore_ascii_case(field))
-        })
-        .collect::<Vec<_>>();
-
-    match entries.len() {
-        0 => Ok(None),
-        1 => Ok(entries.into_iter().next()),
-        _ => Err(entries
+fn relation_values(relations: Option<r_metadata::RelationList>) -> Vec<Relation> {
+    relations.map_or_else(Vec::new, |relations| {
+        relations
+            .entries()
             .iter()
-            .map(|entry| CranPackagesParseIssue::DuplicateField {
-                field,
-                span: packages_field_span(entry),
-            })
-            .collect()),
-    }
-}
-
-fn parse_packages_relations_field(
-    paragraph: &Paragraph,
-    field: &'static str,
-) -> Result<Vec<Relation>, Vec<CranPackagesParseIssue>> {
-    let Some(entry) = unique_packages_field(paragraph, field)? else {
-        return Ok(Vec::new());
-    };
-    let value = entry.value();
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let value = value.strip_suffix(',').unwrap_or(value);
-    let (relations, issues): (Vec<_>, Vec<_>) = value
-        .split(',')
-        .map(str::trim)
-        .map(|relation| {
-            relation
-                .parse()
-                .map_err(|source| CranPackagesParseIssue::InvalidRelation {
-                    field,
-                    source,
-                    span: packages_field_span(&entry),
-                })
-        })
-        .partition(Result::is_ok);
-    let relations = relations
-        .into_iter()
-        .map(Result::unwrap)
-        .collect::<Vec<_>>();
-    let issues = issues
-        .into_iter()
-        .map(Result::unwrap_err)
-        .collect::<Vec<_>>();
-
-    if issues.is_empty() {
-        Ok(relations)
-    } else {
-        Err(issues)
-    }
-}
-
-fn packages_field_span(entry: &DcfEntry) -> SourceSpan {
-    text_range_span(entry.value_range().unwrap_or_else(|| entry.text_range()))
-}
-
-fn text_range_span(range: deb822_lossless::TextRange) -> SourceSpan {
-    let start = usize::from(range.start());
-    let end = usize::from(range.end());
-    (start..end).into()
+            .map(|entry| entry.value.clone())
+            .collect()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,6 +758,8 @@ pub async fn cran_binary(
 
 #[cfg(test)]
 mod tests {
+    use miette::SourceSpan;
+
     use super::{
         BinaryArtifactRequestError, CranPackagesIndex, CranPackagesParseError,
         CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
@@ -973,32 +797,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_trailing_commas_in_cran_package_relations() {
-        let index = "Package: first\nVersion: 1.0.0\nDepends: R (>= 4.0.0),\nImports: cli, digest,\nSuggests: testthat,\nLinkingTo: cpp11,\n\nPackage: second\nVersion: 2.0.0\nImports: first\n";
+    fn parses_azurestor_trailing_depends_comma() {
+        let index = "Package: AzureStor\nVersion: 3.7.1\nDepends: R (>= 3.3),\n";
 
         let index = parse_packages_index(index).expect("trailing commas should be accepted");
 
-        assert_eq!(index.packages.len(), 2);
-        let first = &index.packages[0];
-        assert_eq!(first.depends.len(), 1);
-        assert_eq!(first.imports.len(), 2);
-        assert_eq!(first.suggests.len(), 1);
-        assert_eq!(first.linking_to.len(), 1);
-        assert_eq!(index.packages[1].package, "second");
+        assert_eq!(index.packages.len(), 1);
+        assert_eq!(index.packages[0].package, "AzureStor");
+        assert_eq!(index.packages[0].depends[0].to_string(), "R (>= 3.3)");
     }
 
     #[test]
-    fn rejects_malformed_nonempty_cran_package_relations() {
+    fn packages_fields_are_case_sensitive_and_last_relation_field_wins() {
+        let index = parse_packages_index(
+            "package: ignored\nPackage: first\nVersion: 2.0.0\nImports: old\nImports: current\n",
+        )
+        .expect("the final exact-case fields should be selected");
+
+        assert_eq!(index.packages[0].package, "first");
+        assert_eq!(index.packages[0].version.to_string(), "2.0.0");
+        assert_eq!(index.packages[0].imports[0].package(), "current");
+
+        let error = parse_packages_index("package: wrong-case\nVersion: 1.0.0\n")
+            .expect_err("wrong-case Package should remain missing");
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::Finding { finding, .. }
+                if finding.kind() == r_packages::FindingKind::MissingPackage
+        )));
+    }
+
+    #[test]
+    fn rejects_duplicate_scalar_fields() {
+        let error = parse_packages_index("Package: example\nVersion: 1.0.0\nVersion: 2.0.0\n")
+            .expect_err("duplicate scalar fields should be rejected");
+
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::Finding { finding, .. }
+                if finding.kind() == r_packages::FindingKind::DuplicateScalarField
+        )));
+    }
+
+    #[test]
+    fn surfaces_malformed_nonempty_cran_package_relations() {
         let error =
             parse_packages_index("Package: example\nVersion: 1.0.0\nImports: cli (>= invalid),\n")
                 .expect_err("malformed nonempty relations should be rejected");
 
         assert!(matches!(
             error.issues.as_slice(),
-            [CranPackagesParseIssue::InvalidRelation {
-                field: "Imports",
-                ..
-            }]
+            [CranPackagesParseIssue::Finding { finding, .. }]
+                if finding.kind() == r_packages::FindingKind::InvalidRelation
+                    && finding.field_name() == Some("Imports")
         ));
     }
 
@@ -1015,10 +866,9 @@ mod tests {
                 .iter()
                 .filter(|issue| matches!(
                     issue,
-                    CranPackagesParseIssue::InvalidRelation {
-                        field: "Imports",
-                        ..
-                    }
+                    CranPackagesParseIssue::Finding { finding, .. }
+                        if finding.kind() == r_packages::FindingKind::InvalidRelation
+                            && finding.field_name() == Some("Imports")
                 ))
                 .count(),
             2
@@ -1032,35 +882,49 @@ mod tests {
         )
             .expect_err("every invalid package field should be reported");
 
-        assert_eq!(error.count, 5);
-        assert_eq!(error.issues.len(), 5);
+        assert_eq!(error.count, 3);
+        assert_eq!(error.issues.len(), 3);
         assert!(error.issues.iter().any(|issue| matches!(
             issue,
-            CranPackagesParseIssue::MissingField {
-                field: "Package",
-                ..
-            }
+            CranPackagesParseIssue::Finding { finding, .. }
+                if finding.kind() == r_packages::FindingKind::MissingPackage
         )));
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| matches!(issue, CranPackagesParseIssue::InvalidVersion { .. }))
-        );
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::Finding { finding, .. }
+                if finding.kind() == r_packages::FindingKind::InvalidVersion
+        )));
         assert_eq!(
             error
                 .issues
                 .iter()
                 .filter(|issue| matches!(
                     issue,
-                    CranPackagesParseIssue::DuplicateField {
-                        field: "Suggests",
-                        ..
-                    }
+                    CranPackagesParseIssue::Finding { finding, .. }
+                        if finding.kind() == r_packages::FindingKind::InvalidRelation
                 ))
                 .count(),
-            2
+            1
         );
+    }
+
+    #[test]
+    fn surfaces_invalid_package_and_version_with_source_spans() {
+        let error = parse_packages_index("Package: _bad\nVersion: nope\n")
+            .expect_err("invalid package identity metadata should be rejected");
+
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::Finding { finding, span }
+                if finding.kind() == r_packages::FindingKind::InvalidPackageName
+                    && *span == SourceSpan::from(8..13)
+        )));
+        assert!(error.issues.iter().any(|issue| matches!(
+            issue,
+            CranPackagesParseIssue::Finding { finding, span }
+                if finding.kind() == r_packages::FindingKind::InvalidVersion
+                    && *span == SourceSpan::from(22..27)
+        )));
     }
 
     #[test]
@@ -1072,7 +936,7 @@ mod tests {
             error
                 .issues
                 .iter()
-                .all(|issue| matches!(issue, CranPackagesParseIssue::Syntax { .. }))
+                .any(|issue| matches!(issue, CranPackagesParseIssue::Finding { .. }))
         );
     }
 }

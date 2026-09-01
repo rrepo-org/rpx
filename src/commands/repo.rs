@@ -20,7 +20,8 @@ use crate::{
     repository::{RepositoryError, built_in_repository_url, parse_repository_url},
 };
 use miette::Diagnostic;
-use r_description::{FieldMutationError, PositionedRemoteParseError, RDescription, Remote, Url};
+use r_description::{Description, EditError};
+use r_metadata::{PositionedRemoteParseError, Remote, Url};
 use std::path::Path;
 use thiserror::Error;
 
@@ -42,7 +43,7 @@ pub(crate) enum Error {
     #[diagnostic(code(rpx::repo::description_update_failed))]
     BaseMutation {
         #[source]
-        source: FieldMutationError,
+        source: EditError,
     },
 
     #[error(transparent)]
@@ -271,7 +272,7 @@ fn list(args: RepoListArgs) -> Result<(), Error> {
     Ok(())
 }
 
-async fn relock_and_write(path: &Path, description: &RDescription) -> Result<(), Error> {
+async fn relock_and_write(path: &Path, description: &Description) -> Result<(), Error> {
     let project = Project {
         root: path.to_path_buf(),
         description: description.clone(),

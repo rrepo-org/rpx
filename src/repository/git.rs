@@ -6,7 +6,8 @@ use crate::{
 use async_trait::async_trait;
 use git2::Oid;
 use moka::future::Cache;
-use r_description::{RDescription, Remote, RemoteSource, Version};
+use r_description::Description;
+use r_metadata::{Remote, RemoteSource, Version};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -23,7 +24,7 @@ pub struct GitRepository {
     reference: Option<String>,
     subdirectory: Option<PathBuf>,
     commit: Arc<OnceCell<Oid>>,
-    descriptions: Cache<Oid, Arc<RDescription>>,
+    descriptions: Cache<Oid, Arc<Description>>,
 }
 
 impl GitRepository {
@@ -93,7 +94,7 @@ impl GitRepository {
         self.subdirectory.as_deref()
     }
 
-    async fn repository_description(&self) -> Result<Arc<RDescription>, RepositoryError> {
+    async fn repository_description(&self) -> Result<Arc<Description>, RepositoryError> {
         let commit = self.commit().await?;
         self.descriptions
             .try_get_with(commit, async {
@@ -112,9 +113,9 @@ impl GitRepository {
                         source: Arc::new(source),
                     }
                 })?;
-                let description = RDescription::parse(&contents);
+                let description = Description::parse(&contents);
 
-                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
+                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -125,15 +126,21 @@ impl GitRepository {
         let location = format!("from {self}");
         let package = description
             .package()
-            .map_err(|source| RepositoryError::PackageField {
+            .filter(|value| !value.as_str().is_empty())
+            .map(|value| value.as_str().to_owned())
+            .ok_or_else(|| RepositoryError::PackageField {
                 location: location.clone(),
-                source: Arc::new(source),
+                details: "Package field is missing or empty".to_string(),
             })?;
         let version = description
-            .version()
+            .version_parsed()
+            .ok_or_else(|| RepositoryError::VersionField {
+                location: location.clone(),
+                details: "Version field is missing".to_string(),
+            })?
             .map_err(|source| RepositoryError::VersionField {
                 location,
-                source: Arc::new(source),
+                details: source.to_string(),
             })?;
         let repository: Arc<dyn PackageRepository> = self.clone();
 
@@ -211,23 +218,27 @@ impl PackageRepository for GitRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError> {
+    ) -> Result<Arc<Description>, RepositoryError> {
         let description = self.repository_description().await?;
         let location = format!("from {self}");
-        let repository_package =
-            description
-                .package()
-                .map_err(|source| RepositoryError::PackageField {
-                    location: location.clone(),
-                    source: Arc::new(source),
-                })?;
-        let repository_version =
-            description
-                .version()
-                .map_err(|source| RepositoryError::VersionField {
-                    location,
-                    source: Arc::new(source),
-                })?;
+        let repository_package = description
+            .package()
+            .filter(|value| !value.as_str().is_empty())
+            .map(|value| value.as_str().to_owned())
+            .ok_or_else(|| RepositoryError::PackageField {
+                location: location.clone(),
+                details: "Package field is missing or empty".to_string(),
+            })?;
+        let repository_version = description
+            .version_parsed()
+            .ok_or_else(|| RepositoryError::VersionField {
+                location: location.clone(),
+                details: "Version field is missing".to_string(),
+            })?
+            .map_err(|source| RepositoryError::VersionField {
+                location,
+                details: source.to_string(),
+            })?;
         if package != repository_package || version != &repository_version {
             return Err(RepositoryError::RepositoryPackageVersionNotFound {
                 repository: self.to_string(),

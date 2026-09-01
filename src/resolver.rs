@@ -2,7 +2,8 @@ use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
     PubGrubError, Ranges, resolve,
 };
-use r_description::{RDescription, Relation, Version, VersionRequirement};
+use r_description::Description;
+use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -377,7 +378,7 @@ async fn choose_repository_version(
 
 fn dependencies_from_description(
     source_name: impl Into<String>,
-    description: &RDescription,
+    description: &Description,
     base_packages: &BTreeSet<String>,
 ) -> Dependencies<String, Ranges<PackageVersion>, String> {
     match required_dependencies(source_name, description) {
@@ -392,16 +393,35 @@ fn dependencies_from_description(
 }
 
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
+    fn numeric_version(operand: &RequirementVersion) -> Option<&Version> {
+        match operand {
+            RequirementVersion::Version(version) => Some(version),
+            RequirementVersion::Revision(_) => None,
+        }
+    }
+
     let bound = |version: &Version| PackageVersion::new(version.clone(), built_in_repository());
 
     match relation.requirement() {
         VersionRequirement::Any => Ranges::full(),
-        VersionRequirement::Equal(version) => Ranges::singleton(bound(version)),
-        VersionRequirement::GreaterThan(version) => Ranges::strictly_higher_than(bound(version)),
-        VersionRequirement::GreaterThanEqual(version) => Ranges::higher_than(bound(version)),
-        VersionRequirement::LessThan(version) => Ranges::strictly_lower_than(bound(version)),
-        VersionRequirement::LessThanEqual(version) => Ranges::lower_than(bound(version)),
-        VersionRequirement::NotEqual(version) => Ranges::singleton(bound(version)).complement(),
+        VersionRequirement::Equal(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| Ranges::singleton(bound(value))),
+        VersionRequirement::GreaterThan(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| {
+                Ranges::strictly_higher_than(bound(value))
+            }),
+        VersionRequirement::GreaterThanEqual(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| Ranges::higher_than(bound(value))),
+        VersionRequirement::LessThan(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| {
+                Ranges::strictly_lower_than(bound(value))
+            }),
+        VersionRequirement::LessThanEqual(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| Ranges::lower_than(bound(value))),
+        VersionRequirement::NotEqual(value) => numeric_version(value)
+            .map_or_else(Ranges::full, |value| {
+                Ranges::singleton(bound(value)).complement()
+            }),
     }
 }
 
@@ -497,7 +517,7 @@ mod tests {
         name: &'static str,
         packages: BTreeMap<String, PackageVersion>,
         versions: BTreeMap<String, BTreeSet<PackageVersion>>,
-        descriptions: BTreeMap<(String, Version), Arc<RDescription>>,
+        descriptions: BTreeMap<(String, Version), Arc<Description>>,
         package_queries: AtomicUsize,
         version_queries: Mutex<Vec<String>>,
         description_queries: Mutex<Vec<String>>,
@@ -555,7 +575,7 @@ mod tests {
             &self,
             package: &str,
             version: &Version,
-        ) -> Result<Arc<RDescription>, RepositoryError> {
+        ) -> Result<Arc<Description>, RepositoryError> {
             self.description_queries
                 .lock()
                 .expect("description query lock should not be poisoned")
@@ -578,7 +598,7 @@ mod tests {
     }
 
     fn local_repository(package: &str, version: &str) -> Arc<LocalRepository> {
-        let description = RDescription::parse(&format!("Package: {package}\nVersion: {version}\n"));
+        let description = Description::parse(&format!("Package: {package}\nVersion: {version}\n"));
         Arc::new(
             LocalRepository::new(std::path::PathBuf::from("unused")).with_description(description),
         )
@@ -586,7 +606,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_hard_dependency_metadata() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: example\nVersion: 1.0.0\nImports: cli (>= invalid)\nSuggests: also-invalid (>= invalid)\n",
         );
 
@@ -607,7 +627,7 @@ mod tests {
                 "example".to_string(),
                 Version::from_str("2.0.0").expect("valid test version"),
             ),
-            Arc::new(RDescription::parse(
+            Arc::new(Description::parse(
                 "Package: example\nVersion: 2.0.0\nImports: cli (>= invalid)\n",
             )),
         );
@@ -616,7 +636,7 @@ mod tests {
                 "example".to_string(),
                 Version::from_str("1.0.0").expect("valid test version"),
             ),
-            Arc::new(RDescription::parse("Package: example\nVersion: 1.0.0\n")),
+            Arc::new(Description::parse("Package: example\nVersion: 1.0.0\n")),
         );
         let metadata: Arc<dyn PackageRepository> = Arc::new(metadata_repository);
         let latest = version("2.0.0", Arc::clone(&metadata));
@@ -644,7 +664,7 @@ mod tests {
 
     #[test]
     fn ignores_unconsumed_malformed_suggests_metadata() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: example\nVersion: 1.0.0\nImports: cli\nSuggests: also-invalid (>= invalid)\n",
         );
 
@@ -658,7 +678,7 @@ mod tests {
 
     #[test]
     fn intersects_transitive_constraints_across_dependency_fields() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: example\nVersion: 1.0.0\nDepends: cli (>= 1.0.0)\nImports: cli (< 2.0.0)\n",
         );
 
@@ -894,7 +914,7 @@ mod tests {
         let suggested_version = Version::from_str("2.0.0").expect("valid test version");
         let suggested = Relation::new(
             "suggested",
-            VersionRequirement::GreaterThanEqual(suggested_version),
+            VersionRequirement::GreaterThanEqual(RequirementVersion::Version(suggested_version)),
         )
         .expect("valid suggested relation");
         let roots = BTreeSet::from([suggested]);
@@ -923,6 +943,23 @@ mod tests {
         let local_repository: Arc<dyn PackageRepository> = local_repository;
         assert!(!range.contains(&version("1.9.9", Arc::clone(&local_repository))));
         assert!(range.contains(&version("2.0.0", local_repository)));
+    }
+
+    #[test]
+    fn revision_constraints_are_unconstrained_for_pubgrub() {
+        let relation = "example (>= r123)"
+            .parse()
+            .expect("revision relation should parse");
+        let range = package_version_range_from_relation(&relation);
+
+        assert!(range.contains(&PackageVersion::new(
+            "0.1.0".parse().unwrap(),
+            built_in_repository(),
+        )));
+        assert!(range.contains(&PackageVersion::new(
+            "999.0.0".parse().unwrap(),
+            built_in_repository(),
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -978,7 +1015,7 @@ mod tests {
                 "testthat".to_string(),
                 Version::from_str("3.2.0").expect("valid test version"),
             ),
-            Arc::new(RDescription::parse(
+            Arc::new(Description::parse(
                 "Package: testthat\nVersion: 3.2.0\nTitle: Testthat\nDescription: Test package.\nLicense: MIT\nDepends: project (>= 1.1.0)\n",
             )),
         );
@@ -987,7 +1024,7 @@ mod tests {
                 "testthat".to_string(),
                 Version::from_str("3.0.0").expect("valid test version"),
             ),
-            Arc::new(RDescription::parse(
+            Arc::new(Description::parse(
                 "Package: testthat\nVersion: 3.0.0\nTitle: Testthat\nDescription: Test package.\nLicense: MIT\nDepends: project (>= 1.0.0)\n",
             )),
         );
@@ -1017,9 +1054,9 @@ mod tests {
             local_repository,
             BTreeSet::from([Relation::new(
                 "testthat",
-                VersionRequirement::GreaterThanEqual(
+                VersionRequirement::GreaterThanEqual(RequirementVersion::Version(
                     Version::from_str("3.0.0").expect("valid test version"),
-                ),
+                )),
             )
             .expect("valid testthat relation")]),
             BTreeMap::new(),

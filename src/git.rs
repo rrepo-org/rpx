@@ -4,7 +4,7 @@ use git2::{
     Odb, Oid, ProxyOptions, Reference, RemoteCallbacks, RemoteRedirect, Repository,
     build::CheckoutBuilder,
 };
-use r_description::{HostedGitRemote, Remote, RemoteSource};
+use r_metadata::{HostedGitRemote, Remote, RemoteSource};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{self, Write as _},

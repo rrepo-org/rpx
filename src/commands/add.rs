@@ -9,7 +9,7 @@ use crate::{
     sync::{SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
-use r_description::{Relation, Version, VersionRequirement};
+use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -169,6 +169,7 @@ fn parse_add_packages(packages: &[String]) -> Result<BTreeSet<Relation>, AddPack
                     details: source.to_string(),
                 })
             })?;
+            let version = RequirementVersion::Version(version);
             let requirement = match operator {
                 ">=" => VersionRequirement::GreaterThanEqual(version),
                 "<=" => VersionRequirement::LessThanEqual(version),

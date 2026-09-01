@@ -7,7 +7,8 @@ use crate::http;
 use crate::resolver::PackageVersion;
 use async_trait::async_trait;
 use miette::Diagnostic;
-use r_description::{PackageError, RDescription, Version, VersionError};
+use r_description::Description;
+use r_metadata::Version;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -80,19 +81,11 @@ pub enum RepositoryError {
         source: Arc<std::io::Error>,
     },
 
-    #[error("failed to read Package from DESCRIPTION {location}: {source}")]
-    PackageField {
-        location: String,
-        #[source]
-        source: Arc<PackageError>,
-    },
+    #[error("failed to read Package from DESCRIPTION {location}: {details}")]
+    PackageField { location: String, details: String },
 
-    #[error("failed to read Version from DESCRIPTION {location}: {source}")]
-    VersionField {
-        location: String,
-        #[source]
-        source: Arc<VersionError>,
-    },
+    #[error("failed to read Version from DESCRIPTION {location}: {details}")]
+    VersionField { location: String, details: String },
 
     #[error("invalid {resource}: {details}")]
     InvalidData { resource: String, details: String },
@@ -148,7 +141,7 @@ pub trait PackageRepository: Any + Debug + Display + Send + Sync {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError>;
+    ) -> Result<Arc<Description>, RepositoryError>;
 }
 
 impl dyn PackageRepository {

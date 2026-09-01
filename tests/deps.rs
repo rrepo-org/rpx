@@ -1,7 +1,8 @@
 mod common;
 
 use common::*;
-use r_description::{RDescription, Relation};
+use r_description::Description;
+use r_metadata::Relation;
 use serde_json::{Value, json};
 
 fn write_description(
@@ -48,13 +49,15 @@ fn assert_package_state(
     );
 }
 
-fn parsed_description(contents: &str) -> RDescription {
-    RDescription::parse(contents)
+fn parsed_description(contents: &str) -> Description {
+    Description::parse(contents)
 }
 
-fn relation_names(relations: impl Iterator<Item = Relation>) -> Vec<String> {
+fn relation_names<E>(relations: r_description::CollectionResult<Relation, E>) -> Vec<String> {
     relations
-        .map(|relation| relation.package().to_string())
+        .entries()
+        .iter()
+        .map(|entry| entry.value.package().to_string())
         .collect()
 }
 
@@ -163,21 +166,18 @@ fn constrained_add_replaces_default_dependency_bounds() {
     let description =
         parsed_description(&read_project_file(&container, project_path, "DESCRIPTION"));
     let digest_relations = description
-        .imports()
-        .expect("Imports should parse")
-        .filter(|relation| relation.package() == "digest")
-        .map(|relation| relation.to_string())
+        .imports_parsed()
+        .entries()
+        .iter()
+        .filter(|entry| entry.value.package() == "digest")
+        .map(|entry| entry.value.to_string())
         .collect::<Vec<_>>();
     assert_eq!(digest_relations, vec!["digest (>= 0.6.37)"]);
     assert!(
-        !relation_names(description.depends().expect("Depends should parse"))
-            .contains(&"digest".to_string())
-            && !relation_names(description.linking_to().expect("LinkingTo should parse"))
-                .contains(&"digest".to_string())
-            && !relation_names(description.suggests().expect("Suggests should parse"))
-                .contains(&"digest".to_string())
-            && !relation_names(description.enhances().expect("Enhances should parse"))
-                .contains(&"digest".to_string()),
+        !relation_names(description.depends_parsed()).contains(&"digest".to_string())
+            && !relation_names(description.linking_to_parsed()).contains(&"digest".to_string())
+            && !relation_names(description.suggests_parsed()).contains(&"digest".to_string())
+            && !relation_names(description.enhances_parsed()).contains(&"digest".to_string()),
         "DESCRIPTION was: {}",
         read_project_file(&container, project_path, "DESCRIPTION")
     );
@@ -453,29 +453,28 @@ Enhances: digest",
         let description = read_project_file(&container, project_path, "DESCRIPTION");
         let parsed = parsed_description(&description);
         let managed_fields = [
-            relation_names(parsed.depends().expect("Depends should parse")),
-            relation_names(parsed.imports().expect("Imports should parse")),
-            relation_names(parsed.linking_to().expect("LinkingTo should parse")),
-            relation_names(parsed.suggests().expect("Suggests should parse")),
+            relation_names(parsed.depends_parsed()),
+            relation_names(parsed.imports_parsed()),
+            relation_names(parsed.linking_to_parsed()),
+            relation_names(parsed.suggests_parsed()),
         ];
         assert!(managed_fields.iter().enumerate().all(|(index, relations)| {
             relations.contains(&"digest".to_string()) == (index == selected_index)
         }));
         assert!(managed_fields[0].contains(&"R".to_string()));
-        assert!(
-            relation_names(parsed.enhances().expect("Enhances should parse"))
-                .contains(&"digest".to_string())
-        );
+        assert!(relation_names(parsed.enhances_parsed()).contains(&"digest".to_string()));
 
         let selected_relations = match selected_index {
-            0 => parsed.depends().expect("Depends should parse"),
-            1 => parsed.imports().expect("Imports should parse"),
-            2 => parsed.linking_to().expect("LinkingTo should parse"),
-            3 => parsed.suggests().expect("Suggests should parse"),
+            0 => parsed.depends_parsed(),
+            1 => parsed.imports_parsed(),
+            2 => parsed.linking_to_parsed(),
+            3 => parsed.suggests_parsed(),
             _ => unreachable!(),
         }
-        .filter(|relation| relation.package() == "digest")
-        .map(|relation| relation.to_string())
+        .entries()
+        .iter()
+        .filter(|entry| entry.value.package() == "digest")
+        .map(|entry| entry.value.to_string())
         .collect::<Vec<_>>();
         assert_eq!(selected_relations.len(), 2);
         assert!(
@@ -518,7 +517,7 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     let parsed = parsed_description(&description);
-    let depends = relation_names(parsed.depends().expect("Depends should parse"));
+    let depends = relation_names(parsed.depends_parsed());
     assert!(
         depends == vec!["R".to_string()],
         "DESCRIPTION was: {description}"

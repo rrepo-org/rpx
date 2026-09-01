@@ -675,17 +675,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deb822-lossless"
-version = "0.5.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31505d7661ac33d7848f1fb6ba82bd269b853d01fb44a1bfd9451ffad10c0005"
-dependencies = [
- "regex",
- "rowan",
- "serde",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1666,6 +1655,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2204,15 +2202,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "r-description-scalerail"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f006966a03fb5d072d8bf4355aa28349624047b6520e8172c4dc553a8a0c233"
+name = "r-dcf-syntax"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
 dependencies = [
- "deb822-lossless",
  "rowan",
  "thiserror",
- "url",
+]
+
+[[package]]
+name = "r-description"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+dependencies = [
+ "r-dcf-syntax",
+ "r-metadata",
+ "thiserror",
 ]
 
 [[package]]
@@ -2226,6 +2231,25 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "r-metadata"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+dependencies = [
+ "thiserror",
+ "url",
+]
+
+[[package]]
+name = "r-packages"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+dependencies = [
+ "r-dcf-syntax",
+ "r-metadata",
+ "thiserror",
+]
 
 [[package]]
 name = "rand"
@@ -2447,12 +2471,13 @@ dependencies = [
 
 [[package]]
 name = "rowan"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "417a3a9f582e349834051b8a10c8d71ca88da4211e4093528e36b9845f6b5f21"
+checksum = "14b574c58582fa59fa43a2feb6608b8744184659f08a2e0117e4b8224d95ed61"
 dependencies = [
  "countme",
  "hashbrown 0.14.5",
+ "memoffset",
  "rustc-hash 1.1.0",
  "text-size",
 ]
@@ -2476,7 +2501,6 @@ dependencies = [
  "bytes",
  "clap",
  "cliclack",
- "deb822-lossless",
  "directories",
  "flate2",
  "futures-core",
@@ -2491,7 +2515,9 @@ dependencies = [
  "pathdiff",
  "petname",
  "pubgrub",
- "r-description-scalerail",
+ "r-description",
+ "r-metadata",
+ "r-packages",
  "relative-path",
  "reqwest",
  "reqwest-middleware",

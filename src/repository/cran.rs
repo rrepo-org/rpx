@@ -3,7 +3,8 @@ use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use moka::future::Cache;
-use r_description::{RDescription, Version};
+use r_description::{Description, LogicalValue};
+use r_metadata::Version;
 use reqwest::Url;
 use std::{
     any::Any,
@@ -18,7 +19,7 @@ pub struct CranRepository {
     archives: ArchiveSupport,
     packages: Cache<(), Arc<http::CranPackagesIndex>>,
     archive_versions: Cache<String, BTreeSet<Version>>,
-    descriptions: Cache<(String, Version), Arc<RDescription>>,
+    descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
 impl std::fmt::Display for CranRepository {
@@ -168,7 +169,7 @@ impl PackageRepository for CranRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError> {
+    ) -> Result<Arc<Description>, RepositoryError> {
         let key = (package.to_string(), version.clone());
 
         self.descriptions
@@ -179,7 +180,7 @@ impl PackageRepository for CranRepository {
                     .iter()
                     .find(|entry| entry.package == package && &entry.version == version)
                 {
-                    packages_entry_to_description(entry)?
+                    packages_entry_to_description(entry)
                 } else {
                     let version_string = version.to_string();
                     let response =
@@ -203,49 +204,50 @@ impl PackageRepository for CranRepository {
                     "fetched package description"
                 );
 
-                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
+                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
     }
 }
 
-fn packages_entry_to_description(
-    entry: &http::CranPackageIndexEntry,
-) -> Result<RDescription, RepositoryError> {
-    let mut description = RDescription::parse("");
-
-    description
-        .set_package(&entry.package)
-        .map_err(|source| RepositoryError::InvalidData {
-            resource: "Package in CRAN PACKAGES index".to_string(),
-            details: source.to_string(),
-        })?;
-    description.set_version(&entry.version);
-
+fn packages_entry_to_description(entry: &http::CranPackageIndexEntry) -> Description {
+    let value =
+        |value: String| LogicalValue::new(value).expect("parsed metadata is a valid DCF value");
+    let relations = |values: &[r_metadata::Relation]| {
+        value(
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    let mut builder = Description::builder()
+        .package(value(entry.package.clone()))
+        .version(value(entry.version.to_string()));
     if !entry.depends.is_empty() {
-        description.set_depends(entry.depends.clone());
+        builder = builder.depends(relations(&entry.depends));
     }
-
     if !entry.imports.is_empty() {
-        description.set_imports(entry.imports.clone());
+        builder = builder.imports(relations(&entry.imports));
     }
-
     if !entry.suggests.is_empty() {
-        description.set_suggests(entry.suggests.clone());
+        builder = builder.suggests(relations(&entry.suggests));
     }
-
     if !entry.linking_to.is_empty() {
-        description.set_linking_to(entry.linking_to.clone());
+        builder = builder.field(
+            r_description::FieldName::new("LinkingTo").expect("constant field name is valid"),
+            relations(&entry.linking_to),
+        );
     }
-
-    Ok(description)
+    builder.build()
 }
 
 async fn description_from_source_tarball_response(
     response: reqwest::Response,
     package: &str,
-) -> Result<RDescription, RepositoryError> {
+) -> Result<Description, RepositoryError> {
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -294,7 +296,7 @@ async fn description_from_source_tarball_response(
                 source: Arc::new(source),
             })?;
 
-        return Ok(RDescription::parse(&body));
+        return Ok(Description::parse(&body));
     }
 
     Err(RepositoryError::DescriptionNotFound {

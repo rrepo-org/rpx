@@ -1,7 +1,8 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
 use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
-use r_description::{RDescription, Relation, Version, VersionRequirement};
+use r_description::Description;
+use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
@@ -19,7 +20,7 @@ use crate::{
     description::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
         DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
-        configured_repositories, project_dependencies, read_description,
+        configured_repositories, hard_dependencies, project_dependencies, read_description,
         repositories_from_description,
     },
     git,
@@ -29,7 +30,7 @@ use crate::{
     resolver::{PackageVersion, ProviderError, ResolutionError, resolve_from_registry},
 };
 
-pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<RDescription>)>;
+pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<Description>)>;
 
 static NEXT_STAGED_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -211,7 +212,7 @@ pub fn find_project_root() -> Result<PathBuf, ProjectDiscoveryError> {
 #[derive(Debug)]
 pub(crate) struct Project {
     pub(crate) root: PathBuf,
-    pub(crate) description: RDescription,
+    pub(crate) description: Description,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -339,7 +340,7 @@ pub enum LockedResolutionFailure {
 
 pub fn validate_locked_resolution(
     project_path: &PathBuf,
-    description: &RDescription,
+    description: &Description,
     r_version: &semver::Version,
     lockfile: &Lockfile,
 ) -> Result<(), LockedResolutionError> {
@@ -760,7 +761,7 @@ impl Drop for PreparedProjectFile {
 
 pub(crate) fn write_project_files(
     root: &Path,
-    description: Option<&RDescription>,
+    description: Option<&Description>,
     lockfile: &Lockfile,
 ) -> Result<(), ProjectWriteError> {
     let mut lockfile_contents = serde_json::to_vec_pretty(lockfile)
@@ -953,10 +954,10 @@ pub(crate) fn pin_unconstrained_dependencies(
 fn pin_dependency_to_resolved_major(
     relations: &mut BTreeSet<Relation>,
     package: &str,
-    version: &r_description::Version,
+    version: &Version,
 ) {
     let next_major = format!("{}.0.0", version.major() + 1)
-        .parse::<r_description::Version>()
+        .parse::<Version>()
         .expect("next major version should be valid");
 
     relations.retain(|relation| {
@@ -965,13 +966,16 @@ fn pin_dependency_to_resolved_major(
     relations.insert(
         Relation::new(
             package,
-            VersionRequirement::GreaterThanEqual(version.clone()),
+            VersionRequirement::GreaterThanEqual(RequirementVersion::Version(version.clone())),
         )
         .expect("previously parsed package name should remain valid"),
     );
     relations.insert(
-        Relation::new(package, VersionRequirement::LessThan(next_major))
-            .expect("previously parsed package name should remain valid"),
+        Relation::new(
+            package,
+            VersionRequirement::LessThan(RequirementVersion::Version(next_major)),
+        )
+        .expect("previously parsed package name should remain valid"),
     );
 }
 
@@ -1003,7 +1007,7 @@ pub(crate) async fn hydrate_resolved_packages(
 }
 
 pub(crate) async fn lockfile_from_resolution(
-    requirements: BTreeSet<r_description::Relation>,
+    requirements: BTreeSet<Relation>,
     resolved_packages: &RequiredPackages,
     repositories: &[Arc<dyn PackageRepository>],
     r_version: &semver::Version,
@@ -1030,25 +1034,12 @@ pub(crate) async fn lockfile_from_resolution(
                     repository: version.repository().to_string(),
                 })?;
 
-            let depends = description.depends().map_err(|source| {
+            let dependencies = hard_dependencies(name, description).map_err(|source| {
                 LockfileBuildError::InvalidPackageRequirements {
                     package: name.clone(),
                     details: source.to_string(),
                 }
             })?;
-            let imports = description.imports().map_err(|source| {
-                LockfileBuildError::InvalidPackageRequirements {
-                    package: name.clone(),
-                    details: source.to_string(),
-                }
-            })?;
-            let linking_to = description.linking_to().map_err(|source| {
-                LockfileBuildError::InvalidPackageRequirements {
-                    package: name.clone(),
-                    details: source.to_string(),
-                }
-            })?;
-            let dependencies = depends.chain(imports).chain(linking_to).collect();
 
             Ok((
                 name.clone(),
@@ -1074,17 +1065,31 @@ pub(crate) async fn lockfile_from_resolution(
 fn locked_package_description(
     name: &str,
     package: &lockfile::Package,
-) -> Result<RDescription, LockedPackagesError> {
-    let mut description = RDescription::parse("");
-    description.set_package(name).map_err(|source| {
-        LockedPackagesError::InvalidLockedDescription {
-            package: name.to_string(),
-            details: source.to_string(),
-        }
+) -> Result<Description, LockedPackagesError> {
+    Relation::any(name).map_err(|source| LockedPackagesError::InvalidLockedDescription {
+        package: name.to_string(),
+        details: source.to_string(),
     })?;
-    description.set_version(&package.version);
-    description.set_depends(package.dependencies.iter().cloned());
-    Ok(description)
+    let value = |value: String| {
+        r_description::LogicalValue::new(value).map_err(|source| {
+            LockedPackagesError::InvalidLockedDescription {
+                package: name.to_string(),
+                details: source.to_string(),
+            }
+        })
+    };
+    Ok(Description::builder()
+        .package(value(name.to_string())?)
+        .version(value(package.version.to_string())?)
+        .depends(value(
+            package
+                .dependencies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        )?)
+        .build())
 }
 
 pub fn project_library_path(path: &Path) -> PathBuf {
@@ -1133,7 +1138,7 @@ mod tests {
         },
         repository::{ArchiveSupport, CranRepository, RrepoRepository, built_in_repository},
     };
-    use r_description::{Relation, Version};
+    use r_metadata::{Relation, Version};
     use std::{
         collections::BTreeSet,
         sync::atomic::{AtomicU64, Ordering},
@@ -1295,9 +1300,9 @@ mod tests {
         }
     }
 
-    fn validation_fixture() -> (PathBuf, RDescription, semver::Version, Lockfile) {
+    fn validation_fixture() -> (PathBuf, Description, semver::Version, Lockfile) {
         let path = synthetic_path("validation");
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://configured.example/base\nRemotes: bitbucket::owner/repository/subdirectory@main\nAdditional_repositories: https://additional.example/cran\nImports: cli (>= 3.0.0)\nSuggests: testthat\n",
         );
         let configured = configured_repositories(&path, &description)
@@ -1348,7 +1353,7 @@ mod tests {
 
     fn failures(
         path: &PathBuf,
-        description: &RDescription,
+        description: &Description,
         r_version: &semver::Version,
         lockfile: &Lockfile,
     ) -> Vec<LockedResolutionFailure> {
@@ -1399,7 +1404,7 @@ mod tests {
     fn prepares_and_writes_project_files_without_consistency_validation() {
         let directory = TestProject::new("write-metadata");
         let description =
-            RDescription::parse("Package: changed\nVersion: 2.0.0\nImports: dependency\n");
+            Description::parse("Package: changed\nVersion: 2.0.0\nImports: dependency\n");
         let expected = lockfile();
 
         write_project_files(&directory.0, Some(&description), &expected)
@@ -1407,7 +1412,10 @@ mod tests {
 
         let description = read_description(&directory.0).expect("DESCRIPTION should be readable");
         assert_eq!(
-            description.package().expect("Package should be valid"),
+            description
+                .package()
+                .expect("Package should be valid")
+                .as_str(),
             "changed"
         );
         assert_eq!(
@@ -1446,7 +1454,7 @@ mod tests {
         let directory = TestProject::new("partial-project-write");
         let lockfile_path = directory.0.join(LOCKFILE_NAME);
         fs::create_dir(&lockfile_path).expect("lockfile destination should block replacement");
-        let description = RDescription::parse("Package: changed\nVersion: 2.0.0\n");
+        let description = Description::parse("Package: changed\nVersion: 2.0.0\n");
 
         let error = write_project_files(&directory.0, Some(&description), &lockfile())
             .expect_err("lockfile replacement should fail");
@@ -1460,7 +1468,8 @@ mod tests {
             read_description(&directory.0)
                 .expect("updated DESCRIPTION should be readable")
                 .package()
-                .expect("updated package name should be valid"),
+                .expect("updated package name should be valid")
+                .as_str(),
             "changed"
         );
     }
@@ -1553,17 +1562,25 @@ mod tests {
             let (package, description) = &packages[name];
             assert_eq!(package.version(), &version(expected_version));
             assert_eq!(
-                description.package().expect("Package should be valid"),
+                description
+                    .package()
+                    .expect("Package should be valid")
+                    .as_str(),
                 name
             );
             assert_eq!(
-                description.version().expect("Version should be valid"),
+                description
+                    .version_parsed()
+                    .expect("Version should exist")
+                    .expect("Version should be valid"),
                 version(expected_version)
             );
             assert_eq!(
                 description
-                    .depends()
-                    .expect("Depends should be valid")
+                    .depends_parsed()
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.value.clone())
                     .collect::<BTreeSet<_>>(),
                 dependencies
                     .iter()

@@ -1,9 +1,6 @@
 use miette::{Diagnostic, NamedSource, SourceSpan};
-use r_description::{
-    AdditionalRepositoriesError, DependsError, FieldMutationError, ImportsError, LinkingToError,
-    PackageError, RDescription, Relation, Remote, RemoteMutationError, RemoteSource, RemotesError,
-    SuggestsError, Url, UrlMutationError, Version, VersionError,
-};
+use r_description::{Description, EditError, FieldName, LogicalValue};
+use r_metadata::{Relation, Remote, RemoteSource, Url, Version};
 use std::{
     collections::BTreeSet,
     fs,
@@ -119,21 +116,21 @@ pub enum DescriptionReadError {
     Parse(#[from] DescriptionParseError),
 }
 
-pub fn read_description(path: &PathBuf) -> Result<RDescription, DescriptionReadError> {
+pub fn read_description(path: &PathBuf) -> Result<Description, DescriptionReadError> {
     let path = path.join(DESCRIPTION_NAME);
     let contents = fs::read_to_string(&path).map_err(|source| DescriptionReadError::Read {
         path: path.clone(),
         source,
     })?;
-    let description = RDescription::parse(&contents);
+    let description = Description::parse(&contents);
     let issues = description
-        .syntax_issues()
+        .diagnostics()
         .iter()
         .cloned()
         .map(|issue| {
-            let start = usize::from(issue.range.start());
-            let end = usize::from(issue.range.end());
-            DescriptionParseIssue::positioned(issue, start..end)
+            let start = issue.span().start;
+            let end = issue.span().end;
+            DescriptionParseIssue::positioned(std::io::Error::other(issue.message()), start..end)
         })
         .collect::<Vec<_>>();
     if !issues.is_empty() {
@@ -171,255 +168,120 @@ pub fn write_namespace_if_missing(path: &Path) -> Result<(), NamespaceWriteError
 
 pub fn root_package(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<(String, Version), DescriptionParseError> {
-    let package = description.package();
-    let version = description.version();
-
-    let package_issues = package
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            PackageError::Missing => {
-                vec![DescriptionParseIssue::missing(error.to_string())]
-            }
-            PackageError::Duplicate(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect(),
-        });
-
-    let version_issues = version
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            VersionError::Missing => {
-                vec![DescriptionParseIssue::missing(error.to_string())]
-            }
-            VersionError::Duplicate(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect(),
-            VersionError::Invalid { value, source } => {
-                let value_range = value.range();
-                let value_start = usize::from(value_range.start());
-                let span = source.range().map_or_else(
-                    || usize::from(value_range.start())..usize::from(value_range.end()),
-                    |range| {
-                        value_start + usize::from(range.start())
-                            ..value_start + usize::from(range.end())
-                    },
-                );
-
-                vec![DescriptionParseIssue::positioned(error.clone(), span)]
-            }
-        });
-
-    let issues = package_issues.chain(version_issues).collect::<Vec<_>>();
-
-    match (package, version) {
-        (Ok(package), Ok(version)) => Ok((package, version)),
-        _ => Err(DescriptionParseError::new(
+    let package = description.package().map(|value| value.as_str().to_owned());
+    let version = description.version_parsed();
+    let mut issues = Vec::new();
+    match package.as_deref() {
+        None => issues.push(DescriptionParseIssue::missing("Package field is missing")),
+        Some("") => issues.push(DescriptionParseIssue::missing("Package field is empty")),
+        Some(_) => {}
+    }
+    match &version {
+        None => issues.push(DescriptionParseIssue::missing("Version field is missing")),
+        Some(Ok(version)) if version.as_str().is_empty() => {
+            issues.push(DescriptionParseIssue::missing("Version field is empty"));
+        }
+        Some(Err(error)) => {
+            let field = description
+                .field("Version")
+                .expect("parsed Version has a field");
+            let value = field.value();
+            let range = value.source_range();
+            let span = error.span().map_or(range.start..range.end, |span| {
+                range.start + span.start()..range.start + span.end()
+            });
+            issues.push(DescriptionParseIssue::positioned(error.clone(), span));
+        }
+        Some(Ok(_)) => {}
+    }
+    if issues.is_empty() {
+        Ok((
+            package.expect("validated Package"),
+            version.expect("validated Version").expect("valid Version"),
+        ))
+    } else {
+        Err(DescriptionParseError::new(
             path.join(DESCRIPTION_NAME).display().to_string(),
             description.to_string(),
             issues,
-        )),
+        ))
     }
 }
 
 pub fn required_dependencies(
     source_name: impl Into<String>,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
-    let imports = description.imports();
-    let depends = description.depends();
-    let linking_to = description.linking_to();
+    hard_dependencies(source_name, description).map(without_r)
+}
 
-    let imports_issues = imports
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            ImportsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let depends_issues = depends
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            DependsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let linking_to_issues = linking_to
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            LinkingToError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let issues = imports_issues
-        .chain(depends_issues)
-        .chain(linking_to_issues)
-        .collect::<Vec<_>>();
-
-    match (imports, depends, linking_to) {
-        (Ok(imports), Ok(depends), Ok(linking_to)) => Ok(imports
-            .chain(depends)
-            .chain(linking_to)
-            .filter(|relation| relation.package() != "R")
-            .collect()),
-        _ => Err(DescriptionParseError::new(
-            source_name,
-            description.to_string(),
-            issues,
-        )),
-    }
+pub fn hard_dependencies(
+    source_name: impl Into<String>,
+    description: &Description,
+) -> Result<BTreeSet<Relation>, DescriptionParseError> {
+    dependencies_from_fields(
+        source_name,
+        description,
+        &["Imports", "Depends", "LinkingTo"],
+    )
 }
 
 pub fn project_dependencies(
     project_path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
-    let imports = description.imports();
-    let depends = description.depends();
-    let linking_to = description.linking_to();
-    let suggests = description.suggests();
+    dependencies_from_fields(
+        project_path.join(DESCRIPTION_NAME).display().to_string(),
+        description,
+        &["Imports", "Depends", "LinkingTo", "Suggests"],
+    )
+    .map(without_r)
+}
 
-    let imports_issues = imports
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            ImportsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
+fn without_r(mut dependencies: BTreeSet<Relation>) -> BTreeSet<Relation> {
+    dependencies.retain(|relation| relation.package() != "R");
+    dependencies
+}
 
-    let depends_issues = depends
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            DependsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let linking_to_issues = linking_to
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            LinkingToError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let suggests_issues = suggests
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            SuggestsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let issues = imports_issues
-        .chain(depends_issues)
-        .chain(linking_to_issues)
-        .chain(suggests_issues)
-        .collect::<Vec<_>>();
-
-    match (imports, depends, linking_to, suggests) {
-        (Ok(imports), Ok(depends), Ok(linking_to), Ok(suggests)) => Ok(imports
-            .chain(depends)
-            .chain(linking_to)
-            .chain(suggests)
-            .filter(|relation| relation.package() != "R")
-            .collect()),
-        _ => Err(DescriptionParseError::new(
-            project_path.join(DESCRIPTION_NAME).display().to_string(),
+fn dependencies_from_fields(
+    source_name: impl Into<String>,
+    description: &Description,
+    fields: &[&str],
+) -> Result<BTreeSet<Relation>, DescriptionParseError> {
+    let mut dependencies = BTreeSet::new();
+    let mut issues = Vec::new();
+    for field in fields {
+        let parsed = match *field {
+            "Depends" => description.depends_parsed(),
+            "Imports" => description.imports_parsed(),
+            "LinkingTo" => description.linking_to_parsed(),
+            "Suggests" => description.suggests_parsed(),
+            _ => unreachable!(),
+        };
+        dependencies.extend(parsed.entries().iter().map(|entry| entry.value.clone()));
+        issues.extend(parsed.issues().iter().map(|issue| {
+            DescriptionParseIssue::positioned(
+                std::io::Error::other(format!("{field}: {}", issue.error)),
+                issue.field_span.start..issue.field_span.end,
+            )
+        }));
+    }
+    if issues.is_empty() {
+        Ok(dependencies)
+    } else {
+        Err(DescriptionParseError::new(
+            source_name,
             description.to_string(),
             issues,
-        )),
+        ))
     }
 }
 
 pub fn add_dependencies(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     dependencies: &BTreeSet<Relation>,
     field: DependencyField,
 ) -> Result<(), DescriptionParseError> {
@@ -427,102 +289,14 @@ pub fn add_dependencies(
         return Ok(());
     }
 
-    let depends = description.depends();
-    let imports = description.imports();
-    let linking_to = description.linking_to();
-    let suggests = description.suggests();
-
-    let depends_issues = depends
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            DependsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let imports_issues = imports
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            ImportsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let linking_to_issues = linking_to
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            LinkingToError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let suggests_issues = suggests
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            SuggestsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let issues = depends_issues
-        .chain(imports_issues)
-        .chain(linking_to_issues)
-        .chain(suggests_issues)
-        .collect::<Vec<_>>();
-
-    let (mut depends, mut imports, mut linking_to, mut suggests) =
-        match (depends, imports, linking_to, suggests) {
-            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => (
-                depends.collect::<BTreeSet<_>>(),
-                imports.collect::<BTreeSet<_>>(),
-                linking_to.collect::<BTreeSet<_>>(),
-                suggests.collect::<BTreeSet<_>>(),
-            ),
-            _ => {
-                return Err(DescriptionParseError::new(
-                    path.join(DESCRIPTION_NAME).display().to_string(),
-                    description.to_string(),
-                    issues,
-                )
-                .into());
-            }
-        };
+    let mut depends =
+        dependencies_from_fields(path.display().to_string(), description, &["Depends"])?;
+    let mut imports =
+        dependencies_from_fields(path.display().to_string(), description, &["Imports"])?;
+    let mut linking_to =
+        dependencies_from_fields(path.display().to_string(), description, &["LinkingTo"])?;
+    let mut suggests =
+        dependencies_from_fields(path.display().to_string(), description, &["Suggests"])?;
 
     let added_packages = dependencies
         .iter()
@@ -541,131 +315,66 @@ pub fn add_dependencies(
         DependencyField::Suggests => suggests.extend(dependencies.iter().cloned()),
     }
 
-    description.set_depends(depends);
-    description.set_imports(imports);
-    description.set_linking_to(linking_to);
-    description.set_suggests(suggests);
+    let updated = set_relations(description, "Depends", depends)?;
+    let updated = set_relations(&updated, "Imports", imports)?;
+    let updated = set_relations(&updated, "LinkingTo", linking_to)?;
+    let updated = set_relations(&updated, "Suggests", suggests)?;
+    *description = updated;
 
     Ok(())
 }
 
 pub fn remove_dependencies(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     packages: &BTreeSet<String>,
 ) -> Result<(), DescriptionParseError> {
     if packages.is_empty() {
         return Ok(());
     }
 
-    let depends = description.depends();
-    let imports = description.imports();
-    let linking_to = description.linking_to();
-    let suggests = description.suggests();
-
-    let depends_issues = depends
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            DependsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let imports_issues = imports
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            ImportsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let linking_to_issues = linking_to
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            LinkingToError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let suggests_issues = suggests
-        .as_ref()
-        .err()
-        .into_iter()
-        .flat_map(|error| match error {
-            SuggestsError::Invalid(occurrences) => occurrences
-                .iter()
-                .map(|occurrence| {
-                    let range = occurrence.range();
-                    DescriptionParseIssue::positioned(
-                        error.clone(),
-                        usize::from(range.start())..usize::from(range.end()),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        });
-
-    let issues = depends_issues
-        .chain(imports_issues)
-        .chain(linking_to_issues)
-        .chain(suggests_issues)
-        .collect::<Vec<_>>();
-
-    let (mut depends, mut imports, mut linking_to, mut suggests) =
-        match (depends, imports, linking_to, suggests) {
-            (Ok(depends), Ok(imports), Ok(linking_to), Ok(suggests)) => (
-                depends.collect::<BTreeSet<_>>(),
-                imports.collect::<BTreeSet<_>>(),
-                linking_to.collect::<BTreeSet<_>>(),
-                suggests.collect::<BTreeSet<_>>(),
-            ),
-            _ => {
-                return Err(DescriptionParseError::new(
-                    path.join(DESCRIPTION_NAME).display().to_string(),
-                    description.to_string(),
-                    issues,
-                )
-                .into());
-            }
-        };
+    let mut depends =
+        dependencies_from_fields(path.display().to_string(), description, &["Depends"])?;
+    let mut imports =
+        dependencies_from_fields(path.display().to_string(), description, &["Imports"])?;
+    let mut linking_to =
+        dependencies_from_fields(path.display().to_string(), description, &["LinkingTo"])?;
+    let mut suggests =
+        dependencies_from_fields(path.display().to_string(), description, &["Suggests"])?;
 
     depends.retain(|dependency| !packages.contains(dependency.package()));
     imports.retain(|dependency| !packages.contains(dependency.package()));
     linking_to.retain(|dependency| !packages.contains(dependency.package()));
     suggests.retain(|dependency| !packages.contains(dependency.package()));
 
-    description.set_depends(depends);
-    description.set_imports(imports);
-    description.set_linking_to(linking_to);
-    description.set_suggests(suggests);
+    let updated = set_relations(description, "Depends", depends)?;
+    let updated = set_relations(&updated, "Imports", imports)?;
+    let updated = set_relations(&updated, "LinkingTo", linking_to)?;
+    let updated = set_relations(&updated, "Suggests", suggests)?;
+    *description = updated;
 
     Ok(())
+}
+
+fn set_relations(
+    description: &Description,
+    field: &str,
+    relations: BTreeSet<Relation>,
+) -> Result<Description, DescriptionParseError> {
+    let value = relations
+        .into_iter()
+        .map(|relation| relation.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let name = FieldName::new(field).expect("constant field name is valid");
+    let value = LogicalValue::new(value).expect("formatted relations form a valid DCF value");
+    replace_field_declarations(description, field, &name, &value).map_err(|error| {
+        DescriptionParseError::new(
+            "DESCRIPTION",
+            description.to_string(),
+            vec![DescriptionParseIssue::unpositioned(error)],
+        )
+    })
 }
 
 #[derive(Debug, Error)]
@@ -679,32 +388,31 @@ pub enum RemoteValidationError {
 
 pub(crate) fn remotes(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<Vec<Remote>, DescriptionParseError> {
-    let remotes = description
-        .remotes()
-        .map_err(|source| {
-            let issues = match &source {
-                RemotesError::Invalid(occurrences) => occurrences
-                    .iter()
-                    .map(|occurrence| {
-                        let range = occurrence.range();
-
-                        DescriptionParseIssue::positioned(
-                            source.clone(),
-                            usize::from(range.start())..usize::from(range.end()),
-                        )
-                    })
-                    .collect(),
-            };
-
-            DescriptionParseError::new(
-                path.join(DESCRIPTION_NAME).display().to_string(),
-                description.to_string(),
-                issues,
-            )
-        })?
+    let parsed = description.remotes_parsed();
+    let remotes = parsed
+        .entries()
+        .iter()
+        .map(|entry| entry.value.clone())
         .collect::<Vec<_>>();
+    if !parsed.issues().is_empty() {
+        let issues = parsed
+            .issues()
+            .iter()
+            .map(|issue| {
+                DescriptionParseIssue::positioned(
+                    issue.error.clone(),
+                    issue.field_span.start..issue.field_span.end,
+                )
+            })
+            .collect();
+        return Err(DescriptionParseError::new(
+            path.join(DESCRIPTION_NAME).display().to_string(),
+            description.to_string(),
+            issues,
+        ));
+    }
 
     let unsupported = remotes.iter().filter_map(|remote| {
         let kind = match &remote.source {
@@ -757,93 +465,80 @@ pub(crate) fn remotes(
 
 pub(crate) fn additional_repositories(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<Vec<Url>, DescriptionParseError> {
-    description
-        .additional_repositories()
-        .map(|repositories| {
-            repositories
-                .map(|mut repository| {
-                    if let Ok(mut segments) = repository.path_segments_mut() {
-                        segments.pop_if_empty();
-                    }
-                    repository
-                })
-                .collect()
+    let parsed = description.additional_repositories_parsed();
+    if !parsed.issues().is_empty() {
+        let issues = parsed
+            .issues()
+            .iter()
+            .map(|issue| {
+                DescriptionParseIssue::positioned(
+                    issue.error.clone(),
+                    issue.field_span.start..issue.field_span.end,
+                )
+            })
+            .collect();
+        return Err(DescriptionParseError::new(
+            path.join(DESCRIPTION_NAME).display().to_string(),
+            description.to_string(),
+            issues,
+        ));
+    }
+    Ok(parsed
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut repository = entry.value.clone();
+            if let Ok(mut segments) = repository.path_segments_mut() {
+                segments.pop_if_empty();
+            }
+            repository
         })
-        .map_err(|source| {
-            let issues = match &source {
-                AdditionalRepositoriesError::Invalid(occurrences) => occurrences
-                    .iter()
-                    .map(|occurrence| {
-                        let range = occurrence.range();
-                        DescriptionParseIssue::positioned(
-                            source.clone(),
-                            usize::from(range.start())..usize::from(range.end()),
-                        )
-                    })
-                    .collect(),
-            };
-
-            DescriptionParseError::new(
-                path.join(DESCRIPTION_NAME).display().to_string(),
-                description.to_string(),
-                issues,
-            )
-        })
+        .collect())
 }
 
 pub fn base_repository(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<Option<Url>, DescriptionParseError> {
-    let values = description.field_values(BASE_REPOSITORY_FIELD);
-    let duplicate = values.len() > 1;
-    let (repository, issues) =
-        values
-            .into_iter()
-            .fold((None, Vec::new()), |(mut repository, mut issues), value| {
-                let range = value.range();
-                let span = usize::from(range.start())..usize::from(range.end());
-
-                if duplicate {
-                    issues.push(DescriptionParseIssue::Positioned {
-                        error: "Config/rpx/base-repository field is declared multiple times".into(),
-                        span: span.clone().into(),
-                    });
-                }
-
-                match parse_repository_url(value.value()) {
-                    Ok(url) => repository = Some(url),
-                    Err(source) => issues.push(DescriptionParseIssue::Positioned {
-                        error: Box::new(source),
-                        span: span.into(),
-                    }),
-                }
-
-                (repository, issues)
-            });
-
-    if issues.is_empty() {
-        Ok(repository)
-    } else {
-        Err(DescriptionParseError::new(
-            path.join(DESCRIPTION_NAME).display().to_string(),
-            description.to_string(),
-            issues,
-        ))
-    }
+    let Some(value) = description
+        .field(BASE_REPOSITORY_FIELD)
+        .map(|field| field.value())
+    else {
+        return Ok(None);
+    };
+    parse_repository_url(value.as_str())
+        .map(Some)
+        .map_err(|source| {
+            let range = value.source_range();
+            DescriptionParseError::new(
+                path.join(DESCRIPTION_NAME).display().to_string(),
+                description.to_string(),
+                vec![DescriptionParseIssue::positioned(
+                    source,
+                    range.start..range.end,
+                )],
+            )
+        })
 }
 
 pub fn set_base_repository(
-    description: &mut RDescription,
+    description: &mut Description,
     repository: &Url,
-) -> Result<(), FieldMutationError> {
-    description.set_field(BASE_REPOSITORY_FIELD, repository.as_str())
+) -> Result<(), EditError> {
+    let name = FieldName::new(BASE_REPOSITORY_FIELD).expect("constant field name is valid");
+    let value = LogicalValue::new(repository.as_str()).expect("URL is a valid DCF value");
+    *description = description.set_field(&name, &value)?;
+    Ok(())
 }
 
-pub fn reset_base_repository(description: &mut RDescription) {
-    description.remove_field(BASE_REPOSITORY_FIELD);
+pub fn reset_base_repository(description: &mut Description) {
+    if description.field(BASE_REPOSITORY_FIELD).is_some() {
+        *description = description
+            .remove_all(BASE_REPOSITORY_FIELD)
+            .expect("field exists");
+    }
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -852,24 +547,17 @@ pub enum RepositoryMutationError {
     #[diagnostic(transparent)]
     Description(#[from] DescriptionParseError),
 
-    #[error("failed to update Additional_repositories: {source}")]
-    #[diagnostic(code(rpx::description::additional_repositories_update_failed))]
-    Additional {
+    #[error("failed to update repository metadata: {source}")]
+    #[diagnostic(code(rpx::description::repository_metadata_update_failed))]
+    Mutation {
         #[from]
-        source: UrlMutationError,
-    },
-
-    #[error("failed to update Remotes: {source}")]
-    #[diagnostic(code(rpx::description::remotes_update_failed))]
-    Remote {
-        #[from]
-        source: RemoteMutationError,
+        source: EditError,
     },
 }
 
 pub fn add_additional_repository(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     repository: Url,
 ) -> Result<bool, RepositoryMutationError> {
     let mut repositories = additional_repositories(path, description)?;
@@ -878,13 +566,13 @@ pub fn add_additional_repository(
     }
 
     repositories.push(repository);
-    description.set_additional_repositories(repositories)?;
+    *description = set_collection(description, "Additional_repositories", repositories)?;
     Ok(true)
 }
 
 pub fn remove_additional_repository(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     repository: &Url,
 ) -> Result<bool, RepositoryMutationError> {
     let mut repositories = additional_repositories(path, description)?;
@@ -894,13 +582,13 @@ pub fn remove_additional_repository(
         return Ok(false);
     }
 
-    description.set_additional_repositories(repositories)?;
+    *description = set_collection(description, "Additional_repositories", repositories)?;
     Ok(true)
 }
 
 pub fn add_remote_repository(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     remote: Remote,
 ) -> Result<bool, RepositoryMutationError> {
     let mut configured = remotes(path, description)?;
@@ -909,8 +597,7 @@ pub fn add_remote_repository(
     }
 
     configured.push(remote);
-    let mut updated = description.clone();
-    updated.set_remotes(configured)?;
+    let updated = set_collection(description, "Remotes", configured)?;
     remotes(path, &updated)?;
     *description = updated;
     Ok(true)
@@ -918,7 +605,7 @@ pub fn add_remote_repository(
 
 pub fn remove_remote_repository(
     path: &Path,
-    description: &mut RDescription,
+    description: &mut Description,
     remote: &Remote,
 ) -> Result<bool, RepositoryMutationError> {
     let mut configured = remotes(path, description)?;
@@ -928,11 +615,41 @@ pub fn remove_remote_repository(
         return Ok(false);
     }
 
-    let mut updated = description.clone();
-    updated.set_remotes(configured)?;
+    let updated = set_collection(description, "Remotes", configured)?;
     remotes(path, &updated)?;
     *description = updated;
     Ok(true)
+}
+
+fn set_collection<T: ToString>(
+    description: &Description,
+    field: &str,
+    values: Vec<T>,
+) -> Result<Description, EditError> {
+    let name = FieldName::new(field).expect("constant field name is valid");
+    let value = LogicalValue::new(
+        values
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+    .expect("formatted collection is a valid DCF value");
+    replace_field_declarations(description, field, &name, &value)
+}
+
+fn replace_field_declarations(
+    description: &Description,
+    field: &str,
+    name: &FieldName,
+    value: &LogicalValue,
+) -> Result<Description, EditError> {
+    let candidate = if description.field(field).is_some() {
+        description.remove_all(field)?
+    } else {
+        description.clone()
+    };
+    candidate.set_field(name, value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,7 +661,7 @@ pub enum ConfiguredRepository {
 
 pub fn configured_repositories(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<Vec<ConfiguredRepository>, DescriptionParseError> {
     let configured_base = base_repository(path, description);
     let configured_remotes = remotes(path, description);
@@ -1023,7 +740,7 @@ pub enum RepositoriesFromDescriptionError {
 
 pub async fn repositories_from_description(
     path: &Path,
-    description: &RDescription,
+    description: &Description,
 ) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoriesFromDescriptionError> {
     futures_util::future::join_all(configured_repositories(path, description)?.into_iter().map(
         |repository| async move {
@@ -1084,12 +801,11 @@ mod tests {
         }
     }
 
-    fn relation_strings(
-        relations: Result<std::vec::IntoIter<Relation>, impl std::fmt::Debug>,
-    ) -> Vec<String> {
+    fn relation_strings<E>(relations: r_description::CollectionResult<Relation, E>) -> Vec<String> {
         relations
-            .expect("relations should parse")
-            .map(|relation| relation.to_string())
+            .entries()
+            .iter()
+            .map(|entry| entry.value.to_string())
             .collect()
     }
 
@@ -1115,7 +831,7 @@ mod tests {
             Err(DescriptionReadError::Parse(_))
         ));
 
-        let expected = RDescription::parse("Package: project\nVersion: 2.0.0\nImports: cli\n");
+        let expected = Description::parse("Package: project\nVersion: 2.0.0\nImports: cli\n");
         fs::write(&path, expected.to_string()).expect("DESCRIPTION should be written");
         let actual = read_description(&directory.0).expect("DESCRIPTION should be reread");
 
@@ -1139,7 +855,7 @@ mod tests {
 
     #[test]
     fn parses_root_package_and_version() {
-        let description = RDescription::parse("Package: project\nVersion: 1.2.3\n");
+        let description = Description::parse("Package: project\nVersion: 1.2.3\n");
 
         let (package, version) =
             root_package(Path::new("."), &description).expect("root should parse");
@@ -1150,18 +866,27 @@ mod tests {
 
     #[test]
     fn reports_all_invalid_root_fields() {
-        let missing = RDescription::parse("");
+        let missing = Description::parse("");
         let error = root_package(Path::new("."), &missing).expect_err("root should be invalid");
         assert_eq!(error.count, 2);
 
-        let invalid = RDescription::parse("Package: one\nPackage: two\nVersion: invalid\n");
+        let invalid = Description::parse("Package: one\nPackage: two\nVersion: invalid\n");
         let error = root_package(Path::new("."), &invalid).expect_err("root should be invalid");
-        assert_eq!(error.count, 3);
+        assert_eq!(error.count, 1);
+    }
+
+    #[test]
+    fn rejects_empty_root_package_and_version() {
+        let description = Description::parse("Package: \nVersion: \n");
+        let error = root_package(Path::new("."), &description)
+            .expect_err("empty root identity fields should be rejected");
+
+        assert_eq!(error.count, 2);
     }
 
     #[test]
     fn collects_project_dependencies_with_current_field_semantics() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\nImports: cli (>= 3.6.0), digest\nLinkingTo: cpp11\nSuggests: testthat (>= 3.0.0)\nEnhances: shiny\n",
         );
 
@@ -1180,6 +905,20 @@ mod tests {
             ]
         );
         assert_eq!(
+            hard_dependencies("DESCRIPTION", &description)
+                .expect("hard dependencies should parse")
+                .into_iter()
+                .map(|relation| relation.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "R (>= 4.2)",
+                "cli (>= 3.6.0)",
+                "cpp11",
+                "digest",
+                "jsonlite (== 1.8.9)",
+            ]
+        );
+        assert_eq!(
             required_dependencies("DESCRIPTION", &description)
                 .expect("required dependencies should parse")
                 .into_iter()
@@ -1191,7 +930,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_project_dependency_fields_together() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nImports: cli (>= invalid)\nSuggests: testthat (< invalid)\n",
         );
 
@@ -1209,7 +948,7 @@ mod tests {
             (DependencyField::LinkingTo, 2),
             (DependencyField::Suggests, 3),
         ] {
-            let mut description = RDescription::parse(
+            let mut description = Description::parse(
                 "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), dplyr (>= 1.0.0), keepDepends\nImports: dplyr (< 2.0.0), keepImports\nLinkingTo: dplyr, keepLinking\nSuggests: dplyr, keepSuggests\nEnhances: dplyr, keepEnhances\n",
             );
 
@@ -1222,10 +961,10 @@ mod tests {
             .expect("dependency should be added");
 
             let managed_fields = [
-                relation_strings(description.depends()),
-                relation_strings(description.imports()),
-                relation_strings(description.linking_to()),
-                relation_strings(description.suggests()),
+                relation_strings(description.depends_parsed()),
+                relation_strings(description.imports_parsed()),
+                relation_strings(description.linking_to_parsed()),
+                relation_strings(description.suggests_parsed()),
             ];
             assert!(managed_fields[selected_index].contains(&"dplyr (== 1.1.0)".to_string()));
             assert!(managed_fields.iter().enumerate().all(|(index, relations)| {
@@ -1236,7 +975,7 @@ mod tests {
             }));
             assert!(managed_fields[0].contains(&"R (>= 4.2)".to_string()));
             assert_eq!(
-                relation_strings(description.enhances()),
+                relation_strings(description.enhances_parsed()),
                 ["dplyr", "keepEnhances"]
             );
         }
@@ -1244,7 +983,7 @@ mod tests {
 
     #[test]
     fn add_semantically_deduplicates_every_rewritten_field() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nDepends: alpha, alpha\nImports: beta (>= 1.0), beta (>= 1.0.0), zoo\nLinkingTo: gamma, gamma\nSuggests: delta, delta\n",
         );
 
@@ -1256,18 +995,18 @@ mod tests {
         )
         .expect("dependencies should be added");
 
-        assert_eq!(relation_strings(description.depends()), ["alpha"]);
+        assert_eq!(relation_strings(description.depends_parsed()), ["alpha"]);
         assert_eq!(
-            relation_strings(description.imports()),
-            ["askpass", "beta (>= 1.0.0)", "cli", "zoo"]
+            relation_strings(description.imports_parsed()),
+            ["askpass", "beta (>= 1.0)", "cli", "zoo"]
         );
-        assert_eq!(relation_strings(description.linking_to()), ["gamma"]);
-        assert_eq!(relation_strings(description.suggests()), ["delta"]);
+        assert_eq!(relation_strings(description.linking_to_parsed()), ["gamma"]);
+        assert_eq!(relation_strings(description.suggests_parsed()), ["delta"]);
     }
 
     #[test]
     fn add_preserves_distinct_requirements_for_the_same_package() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nImports: cli (>= 1.0.0), cli (< 2.0.0)\n",
         );
 
@@ -1280,14 +1019,14 @@ mod tests {
         .expect("dependency should be added");
 
         assert_eq!(
-            relation_strings(description.imports()),
+            relation_strings(description.imports_parsed()),
             ["cli (< 2.0.0)", "cli (>= 1.0.0)", "digest"]
         );
     }
 
     #[test]
     fn add_is_transactional_when_any_dependency_field_is_invalid() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nDepends: cli\nImports: digest (>= invalid)\n",
         );
         let original = description.to_string();
@@ -1307,7 +1046,7 @@ mod tests {
     #[test]
     fn empty_add_does_not_rewrite_existing_fields() {
         let mut description =
-            RDescription::parse("Package: project\nVersion: 1.0.0\nImports: cli, cli\n");
+            Description::parse("Package: project\nVersion: 1.0.0\nImports: cli, cli\n");
         let original = description.to_string();
 
         add_dependencies(
@@ -1323,7 +1062,7 @@ mod tests {
 
     #[test]
     fn remove_normalizes_managed_fields_and_leaves_enhances_untouched() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nDepends: R (>= 4.2), removeMe, keepDepends, keepDepends\nImports: removeMe, keepImports, keepImports\nLinkingTo: removeMe, keepLinking, keepLinking\nSuggests: removeMe, keepSuggests, keepSuggests\nEnhances: removeMe, keepEnhances, keepEnhances\n",
         );
 
@@ -1335,21 +1074,50 @@ mod tests {
         .expect("dependency should be removed");
 
         assert_eq!(
-            relation_strings(description.depends()),
+            relation_strings(description.depends_parsed()),
             ["R (>= 4.2)", "keepDepends"]
         );
-        assert_eq!(relation_strings(description.imports()), ["keepImports"]);
-        assert_eq!(relation_strings(description.linking_to()), ["keepLinking"]);
-        assert_eq!(relation_strings(description.suggests()), ["keepSuggests"]);
         assert_eq!(
-            relation_strings(description.enhances()),
+            relation_strings(description.imports_parsed()),
+            ["keepImports"]
+        );
+        assert_eq!(
+            relation_strings(description.linking_to_parsed()),
+            ["keepLinking"]
+        );
+        assert_eq!(
+            relation_strings(description.suggests_parsed()),
+            ["keepSuggests"]
+        );
+        assert_eq!(
+            relation_strings(description.enhances_parsed()),
             ["removeMe", "keepEnhances", "keepEnhances"]
         );
     }
 
     #[test]
+    fn remove_dependencies_replaces_duplicate_exact_name_declarations() {
+        let mut description = Description::parse(
+            "Package: project\nVersion: 1.0.0\nImports: removeMe, keepEarlier\nImports: keepLater\n",
+        );
+
+        remove_dependencies(
+            Path::new("."),
+            &mut description,
+            &BTreeSet::from(["removeMe".to_string()]),
+        )
+        .expect("dependency should be removed");
+
+        assert_eq!(description.fields("Imports").count(), 1);
+        assert_eq!(
+            relation_strings(description.imports_parsed()),
+            ["keepEarlier", "keepLater"]
+        );
+    }
+
+    #[test]
     fn remove_is_transactional_when_any_dependency_field_is_invalid() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nDepends: cli\nSuggests: testthat (>= invalid)\n",
         );
         let original = description.to_string();
@@ -1367,7 +1135,7 @@ mod tests {
 
     #[test]
     fn parses_supported_git_remotes() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nRemotes: github::owner/github-package@main,\n gitlab@code.example::group/gitlab-package,\n bitbucket::owner/bitbucket-package/subdir@v1,\n generic=git::ssh://git@example.com/team/generic-package.git@develop\n",
         );
 
@@ -1385,10 +1153,10 @@ mod tests {
     #[test]
     fn rejects_malformed_unsupported_and_duplicate_remotes() {
         let malformed =
-            RDescription::parse("Package: project\nVersion: 1.0.0\nRemotes: github::owner\n");
+            Description::parse("Package: project\nVersion: 1.0.0\nRemotes: github::owner\n");
         assert!(remotes(Path::new("."), &malformed).is_err());
 
-        let invalid = RDescription::parse(
+        let invalid = Description::parse(
             "Package: project\nVersion: 1.0.0\nRemotes: dependency=url::https://example.com/pkg.tar.gz, dependency=owner/repository\n",
         );
         let error = remotes(Path::new("."), &invalid).expect_err("remotes should be invalid");
@@ -1397,7 +1165,7 @@ mod tests {
 
     #[test]
     fn parses_additional_repositories_in_source_order() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://first.example/cran, https://second.example/cran\n",
         );
 
@@ -1413,15 +1181,21 @@ mod tests {
 
     #[test]
     fn parses_and_sets_base_repository() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://first.example/cran\nconfig/RPX/base-repository: https://second.example/cran\n",
         );
-        assert!(base_repository(Path::new("."), &description).is_err());
+        assert_eq!(
+            base_repository(Path::new("."), &description)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://first.example/cran"
+        );
 
         let expected = parse_repository_url("https://replacement.example/cran").unwrap();
         set_base_repository(&mut description, &expected).expect("base repository should be set");
 
-        assert_eq!(description.field_values(BASE_REPOSITORY_FIELD).len(), 1);
+        assert_eq!(description.fields(BASE_REPOSITORY_FIELD).count(), 1);
         assert_eq!(
             base_repository(Path::new("."), &description).unwrap(),
             Some(expected)
@@ -1433,7 +1207,7 @@ mod tests {
 
     #[test]
     fn adds_and_removes_normalized_additional_repositories() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://first.example/cran/\n",
         );
         let first = parse_repository_url("https://first.example/cran").unwrap();
@@ -1453,8 +1227,28 @@ mod tests {
     }
 
     #[test]
+    fn remove_additional_repository_replaces_duplicate_exact_name_declarations() {
+        let mut description = Description::parse(
+            "Package: project\nVersion: 1.0.0\nAdditional_repositories: https://remove.example/cran, https://earlier.example/cran\nAdditional_repositories: https://later.example/cran\n",
+        );
+        let removed = parse_repository_url("https://remove.example/cran").unwrap();
+
+        assert!(remove_additional_repository(Path::new("."), &mut description, &removed).unwrap());
+
+        assert_eq!(description.fields("Additional_repositories").count(), 1);
+        assert_eq!(
+            additional_repositories(Path::new("."), &description)
+                .unwrap()
+                .into_iter()
+                .map(|repository| repository.to_string())
+                .collect::<Vec<_>>(),
+            ["https://earlier.example/cran", "https://later.example/cran"]
+        );
+    }
+
+    #[test]
     fn adds_and_removes_remote_repositories_without_losing_source_details() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nRemotes: github::owner/existing@main\n",
         );
         let remote: Remote = "alias=gitlab@code.example::group/repository/subdir@develop"
@@ -1476,8 +1270,28 @@ mod tests {
     }
 
     #[test]
+    fn remove_remote_replaces_duplicate_exact_name_declarations() {
+        let mut description = Description::parse(
+            "Package: project\nVersion: 1.0.0\nRemotes: github::owner/remove, github::owner/earlier\nRemotes: gitlab::owner/later\n",
+        );
+        let removed = "github::owner/remove".parse::<Remote>().unwrap();
+
+        assert!(remove_remote_repository(Path::new("."), &mut description, &removed).unwrap());
+
+        assert_eq!(description.fields("Remotes").count(), 1);
+        assert_eq!(
+            remotes(Path::new("."), &description)
+                .unwrap()
+                .into_iter()
+                .map(|remote| remote.to_string())
+                .collect::<Vec<_>>(),
+            ["github::owner/earlier", "gitlab::owner/later"]
+        );
+    }
+
+    #[test]
     fn unsupported_remote_addition_does_not_mutate_description() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: project\nVersion: 1.0.0\nRemotes: github::owner/existing\n",
         );
         let original = description.clone();
@@ -1491,12 +1305,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base_and_additional_repositories() {
-        let base = RDescription::parse(
+        let base = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\n",
         );
         assert!(base_repository(Path::new("."), &base).is_err());
 
-        let additional = RDescription::parse(
+        let additional = Description::parse(
             "Package: project\nVersion: 1.0.0\nAdditional_repositories: not-a-url\n",
         );
         assert!(additional_repositories(Path::new("."), &additional).is_err());
@@ -1504,7 +1318,7 @@ mod tests {
 
     #[test]
     fn configures_base_git_and_additional_repositories_in_order() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: https://base.example/cran/\nRemotes: github::owner/repository@main\nAdditional_repositories: https://additional.example/cran/\n",
         );
 
@@ -1529,7 +1343,7 @@ mod tests {
 
     #[test]
     fn configures_builtin_base_repository_by_default() {
-        let repositories = configured_repositories(Path::new("."), &RDescription::parse(""))
+        let repositories = configured_repositories(Path::new("."), &Description::parse(""))
             .expect("default repository should configure");
 
         assert_eq!(
@@ -1542,7 +1356,7 @@ mod tests {
 
     #[test]
     fn aggregates_repository_configuration_errors() {
-        let description = RDescription::parse(
+        let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/base-repository: not-a-url\nRemotes: archive=url::https://example.com/pkg.tar.gz\nAdditional_repositories: also-not-a-url\n",
         );
 
@@ -1554,14 +1368,14 @@ mod tests {
 
     #[test]
     fn serializes_empty_dependency_fields_as_parseable_description() {
-        let mut description = RDescription::parse(
+        let mut description = Description::parse(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\n",
         );
-        description.set_imports([]);
+        description = set_relations(&description, "Imports", BTreeSet::new()).unwrap();
 
         let contents = description.to_string();
         assert!(
-            RDescription::parse(&contents).syntax_issues().is_empty(),
+            Description::parse(&contents).diagnostics().is_empty(),
             "serialized DESCRIPTION should parse:\n{contents}"
         );
     }
