@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn normalizes_description_and_preserves_repository_priority() {
         let description = Description::parse(
-            "Version: 1.0.0\nAdditional_repositories: https://z.example/repo\nImports: zed\nPackage: project\nRemotes: github::z/repo, cran::alpha\nImports: alpha, zed\nAdditional_repositories: https://a.example/repo, https://z.example/repo\nRemotes: github::z/repo\n",
+            "Version: 1.0.0\nAdditional_repositories: https://z.example/repo\nImports: zed\nPackage: project\nRemotes: github::z/repo, cran::alpha\nImports: alpha, AzureAuth, zed\nAdditional_repositories: https://a.example/repo, https://z.example/repo\nRemotes: github::z/repo\n",
         );
 
         let normalized = normalize_description(Path::new("."), &description)
@@ -950,7 +950,7 @@ mod tests {
 
         assert_eq!(
             normalized.to_string(),
-            "Package: project\nVersion: 1.0.0\nImports:\n    alpha,\n    zed\nRemotes:\n    github::z/repo,\n    cran::alpha\nAdditional_repositories:\n    https://z.example/repo,\n    https://a.example/repo\n"
+            "Package: project\nVersion: 1.0.0\nImports:\n    alpha,\n    AzureAuth,\n    zed\nRemotes:\n    github::z/repo,\n    cran::alpha\nAdditional_repositories:\n    https://z.example/repo,\n    https://a.example/repo\n"
         );
         assert_eq!(
             normalize_description(Path::new("."), &normalized)
@@ -1255,7 +1255,7 @@ mod tests {
 
         assert_eq!(
             relation_strings(description.depends_parsed()),
-            ["R (>= 4.2)", "keepDepends"]
+            ["keepDepends", "R (>= 4.2)"]
         );
         assert_eq!(
             relation_strings(description.imports_parsed()),
@@ -1275,7 +1275,7 @@ mod tests {
         );
         assert_eq!(
             description.to_string(),
-            "Package: project\nVersion: 1.0.0\nDepends:\n    R (>= 4.2),\n    keepDepends\nImports:\n    keepImports\nLinkingTo:\n    keepLinking\nSuggests:\n    keepSuggests\nEnhances: removeMe, keepEnhances, keepEnhances\n"
+            "Package: project\nVersion: 1.0.0\nDepends:\n    keepDepends,\n    R (>= 4.2)\nImports:\n    keepImports\nLinkingTo:\n    keepLinking\nSuggests:\n    keepSuggests\nEnhances: removeMe, keepEnhances, keepEnhances\n"
         );
     }
 
