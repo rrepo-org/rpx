@@ -5,11 +5,11 @@ use crate::{
         RepoRemoteCommands, RepositoryType,
     },
     description::{
-        BASE_REPOSITORY_FIELD, DescriptionParseError, DescriptionReadError,
-        RepositoryMutationError, add_additional_repository, add_remote_repository,
-        additional_repositories, base_repository, read_description, remotes,
-        remove_additional_repository, remove_remote_repository, reset_base_repository,
-        set_base_repository,
+        BASE_REPOSITORY_FIELD, DescriptionNormalizationError, DescriptionParseError,
+        DescriptionReadError, RepositoryMutationError, add_additional_repository,
+        add_remote_repository, additional_repositories, base_repository, normalize_description,
+        read_description, remotes, remove_additional_repository, remove_remote_repository,
+        reset_base_repository, set_base_repository,
     },
     http,
     output::status,
@@ -38,6 +38,10 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error("failed to update {BASE_REPOSITORY_FIELD}: {source}")]
     #[diagnostic(code(rpx::repo::description_update_failed))]
@@ -273,9 +277,10 @@ fn list(args: RepoListArgs) -> Result<(), Error> {
 }
 
 async fn relock_and_write(path: &Path, description: &Description) -> Result<(), Error> {
+    let description = normalize_description(path, description)?;
     let project = Project {
         root: path.to_path_buf(),
-        description: description.clone(),
+        description,
     };
     let resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
     write_project_files(

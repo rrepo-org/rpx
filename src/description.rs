@@ -1,6 +1,8 @@
 use miette::{Diagnostic, NamedSource, SourceSpan};
-use r_description::{Description, EditError, FieldName, LogicalValue};
-use r_metadata::{Relation, Remote, RemoteSource, Url, Version};
+use r_description::{
+    CollectionEditError, CollectionResult, Description, EditError, FieldName, LogicalValue,
+};
+use r_metadata::{PositionedRelationParseError, Relation, Remote, RemoteSource, Url, Version};
 use std::{
     collections::BTreeSet,
     fs,
@@ -30,6 +32,19 @@ pub enum DependencyField {
 #[error("failed to parse DESCRIPTION ({count} errors)")]
 #[diagnostic(code(rpx::description::parse_failed))]
 pub struct DescriptionParseError {
+    count: usize,
+
+    #[source_code]
+    source_code: NamedSource<String>,
+
+    #[related]
+    issues: Vec<DescriptionParseIssue>,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("failed to normalize DESCRIPTION ({count} errors)")]
+#[diagnostic(code(rpx::description::normalization_failed))]
+pub struct DescriptionNormalizationError {
     count: usize,
 
     #[source_code]
@@ -142,6 +157,38 @@ pub fn read_description(path: &PathBuf) -> Result<Description, DescriptionReadEr
     Ok(description)
 }
 
+pub fn normalize_description(
+    path: &Path,
+    description: &Description,
+) -> Result<Description, DescriptionNormalizationError> {
+    let source = description.to_string();
+    description.normalize().map_err(|error| {
+        let issues = error
+            .into_diagnostics()
+            .into_iter()
+            .map(|diagnostic| {
+                let span = diagnostic.span();
+                DescriptionParseIssue::positioned(
+                    std::io::Error::other(format!(
+                        "{}: {}",
+                        diagnostic.code(),
+                        diagnostic.message()
+                    )),
+                    span.start..span.end,
+                )
+            })
+            .collect::<Vec<_>>();
+        DescriptionNormalizationError {
+            count: issues.len(),
+            source_code: NamedSource::new(
+                path.join(DESCRIPTION_NAME).display().to_string(),
+                source,
+            ),
+            issues,
+        }
+    })
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum NamespaceWriteError {
     #[error("failed to write NAMESPACE at {}: {source}", path.display())]
@@ -214,18 +261,21 @@ pub fn required_dependencies(
     source_name: impl Into<String>,
     description: &Description,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
-    hard_dependencies(source_name, description).map(without_r)
-}
-
-pub fn hard_dependencies(
-    source_name: impl Into<String>,
-    description: &Description,
-) -> Result<BTreeSet<Relation>, DescriptionParseError> {
     dependencies_from_fields(
         source_name,
         description,
-        &["Imports", "Depends", "LinkingTo"],
+        [
+            ("Imports", description.imports_parsed()),
+            ("Depends", description.depends_parsed()),
+            ("LinkingTo", description.linking_to_parsed()),
+        ],
     )
+    .map(|dependencies| {
+        dependencies
+            .into_iter()
+            .filter(|relation| relation.package() != "R")
+            .collect()
+    })
 }
 
 pub fn project_dependencies(
@@ -235,39 +285,47 @@ pub fn project_dependencies(
     dependencies_from_fields(
         project_path.join(DESCRIPTION_NAME).display().to_string(),
         description,
-        &["Imports", "Depends", "LinkingTo", "Suggests"],
+        [
+            ("Imports", description.imports_parsed()),
+            ("Depends", description.depends_parsed()),
+            ("LinkingTo", description.linking_to_parsed()),
+            ("Suggests", description.suggests_parsed()),
+        ],
     )
-    .map(without_r)
+    .map(|dependencies| {
+        dependencies
+            .into_iter()
+            .filter(|relation| relation.package() != "R")
+            .collect()
+    })
 }
 
-fn without_r(mut dependencies: BTreeSet<Relation>) -> BTreeSet<Relation> {
-    dependencies.retain(|relation| relation.package() != "R");
-    dependencies
-}
-
-fn dependencies_from_fields(
+pub(crate) fn dependencies_from_fields(
     source_name: impl Into<String>,
     description: &Description,
-    fields: &[&str],
+    fields: impl IntoIterator<
+        Item = (
+            &'static str,
+            CollectionResult<Relation, PositionedRelationParseError>,
+        ),
+    >,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
-    let mut dependencies = BTreeSet::new();
-    let mut issues = Vec::new();
-    for field in fields {
-        let parsed = match *field {
-            "Depends" => description.depends_parsed(),
-            "Imports" => description.imports_parsed(),
-            "LinkingTo" => description.linking_to_parsed(),
-            "Suggests" => description.suggests_parsed(),
-            _ => unreachable!(),
-        };
-        dependencies.extend(parsed.entries().iter().map(|entry| entry.value.clone()));
-        issues.extend(parsed.issues().iter().map(|issue| {
-            DescriptionParseIssue::positioned(
-                std::io::Error::other(format!("{field}: {}", issue.error)),
-                issue.field_span.start..issue.field_span.end,
-            )
-        }));
-    }
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    let dependencies = fields
+        .iter()
+        .flat_map(|(_, parsed)| parsed.values().cloned())
+        .collect();
+    let issues = fields
+        .iter()
+        .flat_map(|(field, parsed)| {
+            parsed.issues().iter().map(move |issue| {
+                DescriptionParseIssue::positioned(
+                    std::io::Error::other(format!("{field}: {}", issue.error)),
+                    issue.field_span.start..issue.field_span.end,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
     if issues.is_empty() {
         Ok(dependencies)
     } else {
@@ -289,14 +347,27 @@ pub fn add_dependencies(
         return Ok(());
     }
 
-    let mut depends =
-        dependencies_from_fields(path.display().to_string(), description, &["Depends"])?;
-    let mut imports =
-        dependencies_from_fields(path.display().to_string(), description, &["Imports"])?;
-    let mut linking_to =
-        dependencies_from_fields(path.display().to_string(), description, &["LinkingTo"])?;
-    let mut suggests =
-        dependencies_from_fields(path.display().to_string(), description, &["Suggests"])?;
+    let source_name = path.join(DESCRIPTION_NAME).display().to_string();
+    let mut depends = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Depends", description.depends_parsed())],
+    )?;
+    let mut imports = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Imports", description.imports_parsed())],
+    )?;
+    let mut linking_to = dependencies_from_fields(
+        &source_name,
+        description,
+        [("LinkingTo", description.linking_to_parsed())],
+    )?;
+    let mut suggests = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Suggests", description.suggests_parsed())],
+    )?;
 
     let added_packages = dependencies
         .iter()
@@ -315,10 +386,18 @@ pub fn add_dependencies(
         DependencyField::Suggests => suggests.extend(dependencies.iter().cloned()),
     }
 
-    let updated = set_relations(description, "Depends", depends)?;
-    let updated = set_relations(&updated, "Imports", imports)?;
-    let updated = set_relations(&updated, "LinkingTo", linking_to)?;
-    let updated = set_relations(&updated, "Suggests", suggests)?;
+    let updated = description
+        .set_depends(&depends)
+        .and_then(|description| description.set_imports(&imports))
+        .and_then(|description| description.set_linking_to(&linking_to))
+        .and_then(|description| description.set_suggests(&suggests))
+        .map_err(|error| {
+            DescriptionParseError::new(
+                source_name,
+                description.to_string(),
+                vec![DescriptionParseIssue::unpositioned(error)],
+            )
+        })?;
     *description = updated;
 
     Ok(())
@@ -333,48 +412,48 @@ pub fn remove_dependencies(
         return Ok(());
     }
 
-    let mut depends =
-        dependencies_from_fields(path.display().to_string(), description, &["Depends"])?;
-    let mut imports =
-        dependencies_from_fields(path.display().to_string(), description, &["Imports"])?;
-    let mut linking_to =
-        dependencies_from_fields(path.display().to_string(), description, &["LinkingTo"])?;
-    let mut suggests =
-        dependencies_from_fields(path.display().to_string(), description, &["Suggests"])?;
+    let source_name = path.join(DESCRIPTION_NAME).display().to_string();
+    let mut depends = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Depends", description.depends_parsed())],
+    )?;
+    let mut imports = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Imports", description.imports_parsed())],
+    )?;
+    let mut linking_to = dependencies_from_fields(
+        &source_name,
+        description,
+        [("LinkingTo", description.linking_to_parsed())],
+    )?;
+    let mut suggests = dependencies_from_fields(
+        &source_name,
+        description,
+        [("Suggests", description.suggests_parsed())],
+    )?;
 
     depends.retain(|dependency| !packages.contains(dependency.package()));
     imports.retain(|dependency| !packages.contains(dependency.package()));
     linking_to.retain(|dependency| !packages.contains(dependency.package()));
     suggests.retain(|dependency| !packages.contains(dependency.package()));
 
-    let updated = set_relations(description, "Depends", depends)?;
-    let updated = set_relations(&updated, "Imports", imports)?;
-    let updated = set_relations(&updated, "LinkingTo", linking_to)?;
-    let updated = set_relations(&updated, "Suggests", suggests)?;
+    let updated = description
+        .set_depends(&depends)
+        .and_then(|description| description.set_imports(&imports))
+        .and_then(|description| description.set_linking_to(&linking_to))
+        .and_then(|description| description.set_suggests(&suggests))
+        .map_err(|error| {
+            DescriptionParseError::new(
+                source_name,
+                description.to_string(),
+                vec![DescriptionParseIssue::unpositioned(error)],
+            )
+        })?;
     *description = updated;
 
     Ok(())
-}
-
-fn set_relations(
-    description: &Description,
-    field: &str,
-    relations: BTreeSet<Relation>,
-) -> Result<Description, DescriptionParseError> {
-    let value = relations
-        .into_iter()
-        .map(|relation| relation.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let name = FieldName::new(field).expect("constant field name is valid");
-    let value = LogicalValue::new(value).expect("formatted relations form a valid DCF value");
-    replace_field_declarations(description, field, &name, &value).map_err(|error| {
-        DescriptionParseError::new(
-            "DESCRIPTION",
-            description.to_string(),
-            vec![DescriptionParseIssue::unpositioned(error)],
-        )
-    })
 }
 
 #[derive(Debug, Error)]
@@ -551,7 +630,7 @@ pub enum RepositoryMutationError {
     #[diagnostic(code(rpx::description::repository_metadata_update_failed))]
     Mutation {
         #[from]
-        source: EditError,
+        source: CollectionEditError,
     },
 }
 
@@ -566,7 +645,7 @@ pub fn add_additional_repository(
     }
 
     repositories.push(repository);
-    *description = set_collection(description, "Additional_repositories", repositories)?;
+    *description = description.set_additional_repositories(repositories)?;
     Ok(true)
 }
 
@@ -582,7 +661,7 @@ pub fn remove_additional_repository(
         return Ok(false);
     }
 
-    *description = set_collection(description, "Additional_repositories", repositories)?;
+    *description = description.set_additional_repositories(repositories)?;
     Ok(true)
 }
 
@@ -597,7 +676,7 @@ pub fn add_remote_repository(
     }
 
     configured.push(remote);
-    let updated = set_collection(description, "Remotes", configured)?;
+    let updated = description.set_remotes(configured)?;
     remotes(path, &updated)?;
     *description = updated;
     Ok(true)
@@ -615,41 +694,10 @@ pub fn remove_remote_repository(
         return Ok(false);
     }
 
-    let updated = set_collection(description, "Remotes", configured)?;
+    let updated = description.set_remotes(configured)?;
     remotes(path, &updated)?;
     *description = updated;
     Ok(true)
-}
-
-fn set_collection<T: ToString>(
-    description: &Description,
-    field: &str,
-    values: Vec<T>,
-) -> Result<Description, EditError> {
-    let name = FieldName::new(field).expect("constant field name is valid");
-    let value = LogicalValue::new(
-        values
-            .into_iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-    .expect("formatted collection is a valid DCF value");
-    replace_field_declarations(description, field, &name, &value)
-}
-
-fn replace_field_declarations(
-    description: &Description,
-    field: &str,
-    name: &FieldName,
-    value: &LogicalValue,
-) -> Result<Description, EditError> {
-    let candidate = if description.field(field).is_some() {
-        description.remove_all(field)?
-    } else {
-        description.clone()
-    };
-    candidate.set_field(name, value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,11 +850,7 @@ mod tests {
     }
 
     fn relation_strings<E>(relations: r_description::CollectionResult<Relation, E>) -> Vec<String> {
-        relations
-            .entries()
-            .iter()
-            .map(|entry| entry.value.to_string())
-            .collect()
+        relations.values().map(ToString::to_string).collect()
     }
 
     fn relation_set(relations: &[&str]) -> BTreeSet<Relation> {
@@ -836,6 +880,43 @@ mod tests {
         let actual = read_description(&directory.0).expect("DESCRIPTION should be reread");
 
         assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn normalizes_description_and_preserves_repository_priority() {
+        let description = Description::parse(
+            "Version: 1.0.0\nAdditional_repositories: https://z.example/repo\nImports: zed\nPackage: project\nRemotes: github::z/repo, cran::alpha\nImports: alpha, zed\nAdditional_repositories: https://a.example/repo, https://z.example/repo\nRemotes: github::z/repo\n",
+        );
+
+        let normalized = normalize_description(Path::new("."), &description)
+            .expect("DESCRIPTION should normalize");
+
+        assert_eq!(
+            normalized.to_string(),
+            "Package: project\nVersion: 1.0.0\nImports:\n    alpha,\n    zed\nRemotes:\n    github::z/repo,\n    cran::alpha\nAdditional_repositories:\n    https://z.example/repo,\n    https://a.example/repo\n"
+        );
+        assert_eq!(
+            normalize_description(Path::new("."), &normalized)
+                .expect("normalized DESCRIPTION should normalize again"),
+            normalized
+        );
+    }
+
+    #[test]
+    fn reports_positioned_normalization_diagnostics() {
+        let description = Description::parse(
+            "Package: project\nVersion: 1.0.0\nURL: https://example.com, not-a-url\n",
+        );
+
+        let error = normalize_description(Path::new("."), &description)
+            .expect_err("invalid URL should prevent normalization");
+
+        assert_eq!(error.count, 1);
+        assert!(matches!(
+            error.issues[0],
+            DescriptionParseIssue::Positioned { .. }
+        ));
+        assert!(error.issues[0].to_string().contains("invalid-collection"));
     }
 
     #[test]
@@ -902,20 +983,6 @@ mod tests {
                 "digest",
                 "jsonlite (== 1.8.9)",
                 "testthat (>= 3.0.0)",
-            ]
-        );
-        assert_eq!(
-            hard_dependencies("DESCRIPTION", &description)
-                .expect("hard dependencies should parse")
-                .into_iter()
-                .map(|relation| relation.to_string())
-                .collect::<Vec<_>>(),
-            [
-                "R (>= 4.2)",
-                "cli (>= 3.6.0)",
-                "cpp11",
-                "digest",
-                "jsonlite (== 1.8.9)",
             ]
         );
         assert_eq!(
@@ -998,10 +1065,14 @@ mod tests {
         assert_eq!(relation_strings(description.depends_parsed()), ["alpha"]);
         assert_eq!(
             relation_strings(description.imports_parsed()),
-            ["askpass", "beta (>= 1.0)", "cli", "zoo"]
+            ["askpass", "beta (>= 1.0.0)", "cli", "zoo"]
         );
         assert_eq!(relation_strings(description.linking_to_parsed()), ["gamma"]);
         assert_eq!(relation_strings(description.suggests_parsed()), ["delta"]);
+        assert_eq!(
+            description.to_string(),
+            "Package: project\nVersion: 1.0.0\nDepends:\n    alpha\nImports:\n    askpass,\n    beta (>= 1.0.0),\n    cli,\n    zoo\nLinkingTo:\n    gamma\nSuggests:\n    delta\n"
+        );
     }
 
     #[test]
@@ -1092,6 +1163,10 @@ mod tests {
         assert_eq!(
             relation_strings(description.enhances_parsed()),
             ["removeMe", "keepEnhances", "keepEnhances"]
+        );
+        assert_eq!(
+            description.to_string(),
+            "Package: project\nVersion: 1.0.0\nDepends:\n    R (>= 4.2),\n    keepDepends\nImports:\n    keepImports\nLinkingTo:\n    keepLinking\nSuggests:\n    keepSuggests\nEnhances: removeMe, keepEnhances, keepEnhances\n"
         );
     }
 
@@ -1367,13 +1442,22 @@ mod tests {
     }
 
     #[test]
-    fn serializes_empty_dependency_fields_as_parseable_description() {
+    fn removes_empty_dependency_fields() {
         let mut description = Description::parse(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\n",
         );
-        description = set_relations(&description, "Imports", BTreeSet::new()).unwrap();
+        remove_dependencies(
+            Path::new("."),
+            &mut description,
+            &BTreeSet::from(["digest".to_string()]),
+        )
+        .unwrap();
 
         let contents = description.to_string();
+        assert_eq!(
+            contents,
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\n"
+        );
         assert!(
             Description::parse(&contents).diagnostics().is_empty(),
             "serialized DESCRIPTION should parse:\n{contents}"

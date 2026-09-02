@@ -1,8 +1,8 @@
 use crate::{
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
-        set_base_repository, write_namespace_if_missing,
+        DependencyField, DescriptionNormalizationError, DescriptionParseError, NamespaceWriteError,
+        add_dependencies, normalize_description, set_base_repository, write_namespace_if_missing,
     },
     git,
     output::status,
@@ -107,6 +107,10 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -435,6 +439,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         &development_relations,
         DependencyField::Suggests,
     )?;
+    description = normalize_description(&target, &description)?;
 
     fs::create_dir_all(&target).map_err(|source| Error::CreateTarget {
         path: target.clone(),

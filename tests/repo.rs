@@ -78,7 +78,7 @@ fn resets_configured_base_and_relocks_with_builtin_repository() {
     append_description(
         &container,
         project_path,
-        "Config/rpx/base-repository: https://unused.example/cran",
+        "Config/rpx/base-repository: https://unused.example/cran\nTitle: Normalized Title",
     );
 
     let command = format!("cd {project_path} && rpx repo base reset");
@@ -88,6 +88,9 @@ fn resets_configured_base_and_relocks_with_builtin_repository() {
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(!description.contains("Config/rpx/base-repository"));
+    assert_eq!(description.matches("Title:").count(), 1);
+    assert!(description.contains("Title: Normalized Title"));
+    assert!(description.find("Title:").unwrap() < description.find("Version:").unwrap());
     assert!(lockfile.contains("https://upstream.rrepo.dev/cran"));
 }
 
@@ -125,6 +128,7 @@ fn additional_shortcut_detects_normalized_duplicate_without_relocking() {
         project_path,
         "Additional_repositories: https://upstream.rrepo.dev/cran/",
     );
+    let before = read_project_file(&container, project_path, "DESCRIPTION");
 
     let command = format!("cd {project_path} && rpx repo add https://upstream.rrepo.dev/cran");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
@@ -137,6 +141,10 @@ fn additional_shortcut_detects_normalized_duplicate_without_relocking() {
     let lock_check = format!("test ! -e {project_path}/rpx.lock");
     let (exit_code, _, stderr) = run_shell_command(&container, &lock_check);
     assert_eq!(exit_code, 0, "stderr was: {stderr}");
+    assert_eq!(
+        read_project_file(&container, project_path, "DESCRIPTION"),
+        before
+    );
 }
 
 #[test]
@@ -157,7 +165,7 @@ fn removes_additional_repository_and_preserves_other_description_fields() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(!description.contains("Additional_repositories"));
-    assert!(description.contains("Suggests: testthat"));
+    assert!(description.contains("Suggests:\n    testthat"));
 }
 
 #[test]

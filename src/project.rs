@@ -20,7 +20,7 @@ use crate::{
     description::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
         DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
-        configured_repositories, hard_dependencies, project_dependencies, read_description,
+        configured_repositories, dependencies_from_fields, project_dependencies, read_description,
         repositories_from_description,
     },
     git,
@@ -1034,11 +1034,18 @@ pub(crate) async fn lockfile_from_resolution(
                     repository: version.repository().to_string(),
                 })?;
 
-            let dependencies = hard_dependencies(name, description).map_err(|source| {
-                LockfileBuildError::InvalidPackageRequirements {
-                    package: name.clone(),
-                    details: source.to_string(),
-                }
+            let dependencies = dependencies_from_fields(
+                name,
+                description,
+                [
+                    ("Imports", description.imports_parsed()),
+                    ("Depends", description.depends_parsed()),
+                    ("LinkingTo", description.linking_to_parsed()),
+                ],
+            )
+            .map_err(|source| LockfileBuildError::InvalidPackageRequirements {
+                package: name.clone(),
+                details: source.to_string(),
             })?;
 
             Ok((

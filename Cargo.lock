@@ -2204,16 +2204,16 @@ dependencies = [
 [[package]]
 name = "r-dcf-syntax"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
 dependencies = [
  "rowan",
  "thiserror",
 ]
 
 [[package]]
-name = "r-description"
+name = "r-description-parser"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
 dependencies = [
  "r-dcf-syntax",
  "r-metadata",
@@ -2235,16 +2235,16 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r-metadata"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
 dependencies = [
  "thiserror",
  "url",
 ]
 
 [[package]]
-name = "r-packages"
+name = "r-packages-parser"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=ff603926486414a736c3cd04f1cd1e0391e65c63#ff603926486414a736c3cd04f1cd1e0391e65c63"
+source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
 dependencies = [
  "r-dcf-syntax",
  "r-metadata",
@@ -2515,9 +2515,9 @@ dependencies = [
  "pathdiff",
  "petname",
  "pubgrub",
- "r-description",
+ "r-description-parser",
  "r-metadata",
- "r-packages",
+ "r-packages-parser",
  "relative-path",
  "reqwest",
  "reqwest-middleware",

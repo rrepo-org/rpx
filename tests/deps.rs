@@ -452,6 +452,13 @@ Enhances: digest",
 
         let description = read_project_file(&container, project_path, "DESCRIPTION");
         let parsed = parsed_description(&description);
+        let package = description.find("Package:").unwrap();
+        let title = description.find("Title:").unwrap();
+        let version = description.find("Version:").unwrap();
+        assert!(
+            package < title && title < version,
+            "DESCRIPTION was: {description}"
+        );
         let managed_fields = [
             relation_names(parsed.depends_parsed()),
             relation_names(parsed.imports_parsed()),
@@ -517,6 +524,13 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     let parsed = parsed_description(&description);
+    let package = description.find("Package:").unwrap();
+    let title = description.find("Title:").unwrap();
+    let version = description.find("Version:").unwrap();
+    assert!(
+        package < title && title < version,
+        "DESCRIPTION was: {description}"
+    );
     let depends = relation_names(parsed.depends_parsed());
     assert!(
         depends == vec!["R".to_string()],

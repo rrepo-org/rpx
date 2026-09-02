@@ -1,6 +1,9 @@
 use crate::{
     cli::AddArgs,
-    description::{DescriptionParseError, add_dependencies},
+    description::{
+        DescriptionNormalizationError, DescriptionParseError, add_dependencies,
+        normalize_description,
+    },
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
@@ -29,6 +32,10 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     Resolve(#[from] ResolveProjectError),
 
     #[error(transparent)]
@@ -51,6 +58,7 @@ pub(crate) async fn run(args: AddArgs) -> Result<(), Error> {
         &added_relations,
         dependency_field,
     )?;
+    project.description = normalize_description(&project.root, &project.description)?;
 
     let mut resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
 
