@@ -1,6 +1,9 @@
 use crate::{
     cli::RemoveArgs,
-    description::{DescriptionParseError, remove_dependencies},
+    description::{
+        DependencyMutationError, DescriptionNormalizationError, normalize_description,
+        remove_dependencies,
+    },
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
@@ -20,7 +23,11 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -39,6 +46,7 @@ pub(crate) async fn run(args: RemoveArgs) -> Result<(), Error> {
     let mut project = load_project()?;
     let removed_packages = args.packages.iter().cloned().collect::<BTreeSet<_>>();
     remove_dependencies(&project.root, &mut project.description, &removed_packages)?;
+    project.description = normalize_description(&project.root, &project.description)?;
     let resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
     write_project_files(
         &project.root,

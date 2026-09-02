@@ -2,7 +2,8 @@ use super::{PackageRepository, RepositoryError};
 use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use moka::future::Cache;
-use r_description::{RDescription, Version};
+use r_description::Description;
+use r_metadata::Version;
 use reqwest::Url;
 use std::{
     any::Any,
@@ -15,7 +16,7 @@ pub struct RrepoRepository {
     url: Url,
     packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
     versions: Cache<String, BTreeSet<Version>>,
-    descriptions: Cache<(String, Version), Arc<RDescription>>,
+    descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
 impl std::fmt::Display for RrepoRepository {
@@ -159,7 +160,7 @@ impl PackageRepository for RrepoRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError> {
+    ) -> Result<Arc<Description>, RepositoryError> {
         let key = (package.to_string(), version.clone());
 
         self.descriptions
@@ -179,7 +180,7 @@ impl PackageRepository for RrepoRepository {
                         .map_err(|source| RepositoryError::Response {
                             source: Arc::new(source),
                         })?;
-                let description = RDescription::parse(&description);
+                let description = Description::parse(&description);
 
                 tracing::trace!(
                     package,
@@ -188,7 +189,7 @@ impl PackageRepository for RrepoRepository {
                     "fetched package description"
                 );
 
-                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
+                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
             })
             .await
             .map_err(Arc::unwrap_or_clone)

@@ -1,8 +1,9 @@
 use crate::{
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionParseError, NamespaceWriteError, add_dependencies,
-        set_base_repository, write_namespace_if_missing,
+        DependencyField, DependencyMutationError, DescriptionNormalizationError,
+        NamespaceWriteError, add_dependencies, normalize_description, set_base_repository,
+        write_namespace_if_missing,
     },
     git,
     output::status,
@@ -14,7 +15,8 @@ use crate::{
     sync::{ProjectPackageMode, SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
-use r_description::{RDescription, Relation};
+use r_description::{Description, EditError, LogicalValue};
+use r_metadata::Relation;
 use std::{
     collections::BTreeSet,
     env, fmt, fs, io,
@@ -101,11 +103,15 @@ pub(crate) enum Error {
 
     #[error("failed to initialize DESCRIPTION")]
     #[diagnostic(code(rpx::description::initializing_description))]
-    InitialDescription(#[from] r_description::FieldMutationError),
+    InitialDescription(#[from] EditError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -425,7 +431,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         author: &author,
         maintainer: &maintainer,
         license: license.description_value(),
-    })?;
+    });
     configure_base_repository(&mut description, base_repository)?;
     let development_relations = development_relations(&development_packages);
     add_dependencies(
@@ -434,6 +440,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         &development_relations,
         DependencyField::Suggests,
     )?;
+    description = normalize_description(&target, &description)?;
 
     fs::create_dir_all(&target).map_err(|source| Error::CreateTarget {
         path: target.clone(),
@@ -684,9 +691,9 @@ fn prompt_for_base_repository() -> Result<BaseRepository, Error> {
 }
 
 fn configure_base_repository(
-    description: &mut RDescription,
+    description: &mut Description,
     repository: BaseRepository,
-) -> Result<(), r_description::FieldMutationError> {
+) -> Result<(), EditError> {
     if repository == BaseRepository::Cran {
         let repository = parse_repository_url(CRAN_REPOSITORY_URL)
             .expect("built-in CRAN repository URL should be valid");
@@ -723,20 +730,19 @@ fn development_relations(packages: &[DevelopmentPackage]) -> BTreeSet<Relation> 
         .collect()
 }
 
-fn initial_description(
-    options: InitialDescriptionOptions<'_>,
-) -> Result<RDescription, r_description::FieldMutationError> {
-    let mut description = RDescription::parse("");
-    description.set_package(options.package_name)?;
-    let version = "0.1.0".parse().expect("0.1.0 should parse");
-    description.set_version(&version);
-    description.set_title(options.title)?;
-    description.set_description(options.description)?;
-    description.set_license(options.license)?;
-    description.set_authors_at_r(options.authors_at_r)?;
-    description.set_author(options.author)?;
-    description.set_maintainer(options.maintainer)?;
-    Ok(description)
+fn initial_description(options: InitialDescriptionOptions<'_>) -> Description {
+    let value =
+        |text: &str| LogicalValue::new(text).expect("validated init text is a valid DCF value");
+    Description::builder()
+        .package(value(options.package_name))
+        .version(value("0.1.0"))
+        .title(value(options.title))
+        .description(value(options.description))
+        .license(value(options.license))
+        .authors_at_r(value(options.authors_at_r))
+        .author(value(options.author))
+        .maintainer(value(options.maintainer))
+        .build()
 }
 
 fn prompt_for_git_repository(target: &Path) -> Result<bool, Error> {
@@ -1148,17 +1154,19 @@ mod tests {
             author: "Package Author [aut, cre]",
             maintainer: "Package Author <author@example.com>",
             license: "MIT + file LICENSE",
-        })
-        .expect("description should initialize");
+        });
 
-        assert_eq!(description.package().unwrap(), "my.package");
+        assert_eq!(description.package().unwrap().as_str(), "my.package");
         assert_eq!(description.version().unwrap().to_string(), "0.1.0");
-        assert_eq!(description.title().unwrap(), "My Package");
+        assert_eq!(description.title().unwrap().as_str(), "My Package");
         assert_eq!(
-            description.description().unwrap(),
+            description.description().unwrap().as_str(),
             "Describe what this package does."
         );
-        assert_eq!(description.license().unwrap(), "MIT + file LICENSE");
+        assert_eq!(
+            description.license().unwrap().as_str(),
+            "MIT + file LICENSE"
+        );
         let rendered = description.to_string();
         assert!(rendered.contains(
             "Authors@R: person(given = \"Package Author\", email = \"author@example.com\", role = c(\"aut\", \"cre\"))"
@@ -1169,7 +1177,7 @@ mod tests {
 
     #[test]
     fn configures_selected_base_repository() {
-        let mut rrepo = RDescription::parse("Package: project\nVersion: 0.1.0\n");
+        let mut rrepo = Description::parse("Package: project\nVersion: 0.1.0\n");
         configure_base_repository(&mut rrepo, BaseRepository::Rrepo)
             .expect("rrepo should remain the implicit base repository");
         assert_eq!(
@@ -1177,7 +1185,7 @@ mod tests {
             None
         );
 
-        let mut cran = RDescription::parse("Package: project\nVersion: 0.1.0\n");
+        let mut cran = Description::parse("Package: project\nVersion: 0.1.0\n");
         configure_base_repository(&mut cran, BaseRepository::Cran)
             .expect("CRAN should be configured as the base repository");
         assert_eq!(

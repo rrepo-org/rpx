@@ -1,6 +1,6 @@
 use crate::{git::GitUrl, project::cache_dir_path};
 use git2::Oid;
-use r_description::Version;
+use r_metadata::Version;
 use semver::Version as RVersion;
 use std::{
     collections::hash_map::DefaultHasher,

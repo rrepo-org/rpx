@@ -1,12 +1,14 @@
 use super::{PackageRepository, RepositoryError};
 use crate::{
+    description::description_identity,
     git::{self, GitUrl},
     resolver::PackageVersion,
 };
 use async_trait::async_trait;
 use git2::Oid;
 use moka::future::Cache;
-use r_description::{RDescription, Remote, RemoteSource, Version};
+use r_description::Description;
+use r_metadata::{Remote, RemoteSource, Version};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -23,7 +25,7 @@ pub struct GitRepository {
     reference: Option<String>,
     subdirectory: Option<PathBuf>,
     commit: Arc<OnceCell<Oid>>,
-    descriptions: Cache<Oid, Arc<RDescription>>,
+    descriptions: Cache<Oid, Arc<Description>>,
 }
 
 impl GitRepository {
@@ -93,7 +95,7 @@ impl GitRepository {
         self.subdirectory.as_deref()
     }
 
-    async fn repository_description(&self) -> Result<Arc<RDescription>, RepositoryError> {
+    async fn repository_description(&self) -> Result<Arc<Description>, RepositoryError> {
         let commit = self.commit().await?;
         self.descriptions
             .try_get_with(commit, async {
@@ -112,9 +114,9 @@ impl GitRepository {
                         source: Arc::new(source),
                     }
                 })?;
-                let description = RDescription::parse(&contents);
+                let description = Description::parse(&contents);
 
-                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
+                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -122,19 +124,8 @@ impl GitRepository {
 
     async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
         let description = self.repository_description().await?;
-        let location = format!("from {self}");
-        let package = description
-            .package()
-            .map_err(|source| RepositoryError::PackageField {
-                location: location.clone(),
-                source: Arc::new(source),
-            })?;
-        let version = description
-            .version()
-            .map_err(|source| RepositoryError::VersionField {
-                location,
-                source: Arc::new(source),
-            })?;
+        let (package, version) =
+            description_identity(format!("DESCRIPTION from {self}"), &description)?;
         let repository: Arc<dyn PackageRepository> = self.clone();
 
         Ok((package, PackageVersion::new(version, repository)))
@@ -211,23 +202,10 @@ impl PackageRepository for GitRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError> {
+    ) -> Result<Arc<Description>, RepositoryError> {
         let description = self.repository_description().await?;
-        let location = format!("from {self}");
-        let repository_package =
-            description
-                .package()
-                .map_err(|source| RepositoryError::PackageField {
-                    location: location.clone(),
-                    source: Arc::new(source),
-                })?;
-        let repository_version =
-            description
-                .version()
-                .map_err(|source| RepositoryError::VersionField {
-                    location,
-                    source: Arc::new(source),
-                })?;
+        let (repository_package, repository_version) =
+            description_identity(format!("DESCRIPTION from {self}"), &description)?;
         if package != repository_package || version != &repository_version {
             return Err(RepositoryError::RepositoryPackageVersionNotFound {
                 repository: self.to_string(),
@@ -325,6 +303,27 @@ mod tests {
             .expect("packages should be cached");
         assert_eq!(packages["example"].version().to_string(), "1.0.0");
 
+        fs::remove_dir_all(source_path).expect("source should be removed");
+    }
+
+    #[tokio::test]
+    async fn reports_invalid_description_identity_with_positioned_details() {
+        let (source_path, source, _) = source_repository("invalid-description-identity");
+        let invalid = commit_file(&source, "Package: _bad\nVersion: nope\n", "invalid");
+        let repository = Arc::new(
+            GitRepository::from_parts(GitUrl::from_local_path(&source_path), None, None)
+                .with_commit(invalid),
+        );
+
+        let error = repository
+            .packages()
+            .await
+            .expect_err("invalid DESCRIPTION identity should be rejected");
+
+        let RepositoryError::Description(error) = error else {
+            panic!("expected positioned DESCRIPTION error");
+        };
+        assert_eq!(error.messages().len(), 2);
         fs::remove_dir_all(source_path).expect("source should be removed");
     }
 

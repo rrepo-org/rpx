@@ -1509,7 +1509,8 @@ async fn validate_package_graph(packages: &RequiredPackages) -> Result<(), SyncE
 mod tests {
     use super::*;
     use crate::repository::{PackageRepository, built_in_repository};
-    use r_description::{RDescription, Remote};
+    use r_description::Description;
+    use r_metadata::Remote;
 
     #[test]
     fn package_requires_install_respects_source_and_version() {
@@ -1540,7 +1541,7 @@ mod tests {
             .iter()
             .map(|(name, fields)| {
                 let description =
-                    RDescription::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
+                    Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
                 (
                     (*name).to_string(),
                     (

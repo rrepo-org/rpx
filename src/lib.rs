@@ -92,7 +92,8 @@ mod tests {
     };
     use miette::Diagnostic;
     use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
-    use r_description::{RDescription, Relation, Version};
+    use r_description::Description;
+    use r_metadata::{Relation, Version};
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::PathBuf,
@@ -112,7 +113,7 @@ mod tests {
             .iter()
             .map(|(name, fields)| {
                 let description =
-                    RDescription::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
+                    Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
                 (
                     (*name).to_string(),
                     (
@@ -190,11 +191,14 @@ mod tests {
 
     #[test]
     fn cran_index_diagnostic_survives_pubgrub_resolution_errors() {
-        let parse_error = crate::http::CranPackagesIndex::parse(
+        let metadata = "Package: fixture\nVersion: invalid\n".to_string();
+        let packages = r_packages::Packages::parse(&metadata);
+        let findings = packages.validate().into_iter().collect();
+        let parse_error = crate::http::CranPackagesParseError::new(
             "https://example.test/src/contrib/PACKAGES",
-            "Package: fixture\nVersion: invalid\n".to_string(),
-        )
-        .expect_err("invalid CRAN version should fail");
+            metadata,
+            findings,
+        );
         let source = PubGrubError::ErrorChoosingVersion {
             package: "fixture".to_string(),
             source: ProviderError::Repository(RepositoryError::CranPackages(Box::new(parse_error))),
@@ -272,7 +276,7 @@ mod tests {
             "selected".into(),
             (
                 PackageVersion::new(version("1.0.0"), local),
-                Arc::new(RDescription::parse("Package: selected\nVersion: 1.0.0\n")),
+                Arc::new(Description::parse("Package: selected\nVersion: 1.0.0\n")),
             ),
         )]);
         assert!(matches!(

@@ -14,7 +14,6 @@ async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }
 bytes = "1"
 cliclack = "0.5.6"
-deb822-lossless = "0.5.18"
 directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
@@ -32,7 +31,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 reqwest-middleware = "0.5"
 reqwest-tracing = "0.7"
 rpassword = "7.3.1"
-r-description = { package = "r-description-scalerail", version = "0.7.0" }
+r-description = { package = "r-description-parser", version = "=0.1.0" }
+r-metadata = "=0.1.0"
+r-packages = { package = "r-packages-parser", version = "=0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

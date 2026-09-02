@@ -208,7 +208,7 @@ fn run_rejects_dependency_drift_before_starting_the_command() {
     let project_path = "/tmp/rpx-project-run-description-drift";
     create_package_project(&container, project_path);
     lock_package_project(&container, project_path);
-    let mutate = format!("cd {project_path} && printf '\\nImports: digest\\n' >> DESCRIPTION");
+    let mutate = format!("cd {project_path} && printf 'Imports: digest\\n' >> DESCRIPTION");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 

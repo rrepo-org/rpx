@@ -3,7 +3,9 @@ use crate::{http, resolver::PackageVersion};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use moka::future::Cache;
-use r_description::{RDescription, Version};
+use r_description::{Description, LogicalValue};
+use r_metadata::Version;
+use r_packages::{PackageRecord, Packages};
 use reqwest::Url;
 use std::{
     any::Any,
@@ -16,9 +18,9 @@ use std::{
 pub struct CranRepository {
     url: Url,
     archives: ArchiveSupport,
-    packages: Cache<(), Arc<http::CranPackagesIndex>>,
+    packages: Cache<(), Arc<Packages>>,
     archive_versions: Cache<String, BTreeSet<Version>>,
-    descriptions: Cache<(String, Version), Arc<RDescription>>,
+    descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
 impl std::fmt::Display for CranRepository {
@@ -46,7 +48,7 @@ impl CranRepository {
         self.archives
     }
 
-    async fn packages_index(&self) -> Result<Arc<http::CranPackagesIndex>, RepositoryError> {
+    async fn packages_index(&self) -> Result<Arc<Packages>, RepositoryError> {
         self.packages
             .try_get_with((), async {
                 let response = http::cran_packages(&self.url)
@@ -65,10 +67,14 @@ impl CranRepository {
                     .map_err(|source| RepositoryError::Response {
                         source: Arc::new(source),
                     })?;
-                let index = http::CranPackagesIndex::parse(source_name, text)
-                    .map_err(|source| RepositoryError::CranPackages(Box::new(source)))?;
+                let packages = Packages::parse(&text);
+                let findings = packages.validate().into_iter().collect::<Vec<_>>();
+                if !findings.is_empty() {
+                    let source = http::CranPackagesParseError::new(source_name, text, findings);
+                    return Err(RepositoryError::CranPackages(Box::new(source)));
+                }
 
-                Ok::<Arc<http::CranPackagesIndex>, RepositoryError>(Arc::new(index))
+                Ok::<Arc<Packages>, RepositoryError>(Arc::new(packages))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -93,12 +99,16 @@ impl PackageRepository for CranRepository {
         let index = self.packages_index().await?;
 
         Ok(index
-            .packages
-            .iter()
-            .map(|package| {
+            .records()
+            .map(|record| {
+                let package = record.package().expect("validated Package should exist");
+                let version = record
+                    .parsed_version()
+                    .expect("validated Version should exist")
+                    .expect("validated Version should parse");
                 (
-                    package.package.clone(),
-                    PackageVersion::new(package.version.clone(), Arc::clone(&repository)),
+                    package.as_str().to_owned(),
+                    PackageVersion::new(version, Arc::clone(&repository)),
                 )
             })
             .collect())
@@ -108,10 +118,18 @@ impl PackageRepository for CranRepository {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let index = self.packages_index().await?;
         let mut versions = index
-            .packages
-            .iter()
-            .filter(|entry| entry.package == package)
-            .map(|entry| entry.version.clone())
+            .records()
+            .filter(|record| {
+                record
+                    .package()
+                    .is_some_and(|value| value.as_str() == package)
+            })
+            .map(|record| {
+                record
+                    .parsed_version()
+                    .expect("validated Version should exist")
+                    .expect("validated Version should parse")
+            })
             .collect::<BTreeSet<_>>();
 
         if versions.is_empty() {
@@ -168,18 +186,21 @@ impl PackageRepository for CranRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<RDescription>, RepositoryError> {
+    ) -> Result<Arc<Description>, RepositoryError> {
         let key = (package.to_string(), version.clone());
 
         self.descriptions
             .try_get_with(key, async {
                 let index = self.packages_index().await?;
-                let description = if let Some(entry) = index
-                    .packages
-                    .iter()
-                    .find(|entry| entry.package == package && &entry.version == version)
-                {
-                    packages_entry_to_description(entry)?
+                let description = if let Some(entry) = index.records().find(|record| {
+                    record
+                        .package()
+                        .is_some_and(|value| value.as_str() == package)
+                        && record
+                            .parsed_version()
+                            .is_some_and(|value| value.as_ref().is_ok_and(|value| value == version))
+                }) {
+                    packages_record_to_description(&entry)
                 } else {
                     let version_string = version.to_string();
                     let response =
@@ -203,49 +224,46 @@ impl PackageRepository for CranRepository {
                     "fetched package description"
                 );
 
-                Ok::<Arc<RDescription>, RepositoryError>(Arc::new(description))
+                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
     }
 }
 
-fn packages_entry_to_description(
-    entry: &http::CranPackageIndexEntry,
-) -> Result<RDescription, RepositoryError> {
-    let mut description = RDescription::parse("");
-
-    description
-        .set_package(&entry.package)
-        .map_err(|source| RepositoryError::InvalidData {
-            resource: "Package in CRAN PACKAGES index".to_string(),
-            details: source.to_string(),
-        })?;
-    description.set_version(&entry.version);
-
-    if !entry.depends.is_empty() {
-        description.set_depends(entry.depends.clone());
+fn packages_record_to_description(record: &PackageRecord) -> Description {
+    let value = |value: r_description::ValueText| {
+        LogicalValue::new(value.as_str()).expect("validated metadata is a valid DCF value")
+    };
+    let mut builder = Description::builder()
+        .package(value(
+            record.package().expect("validated Package should exist"),
+        ))
+        .version(value(
+            record.version().expect("validated Version should exist"),
+        ));
+    if let Some(depends) = record.depends() {
+        builder = builder.depends(value(depends));
     }
-
-    if !entry.imports.is_empty() {
-        description.set_imports(entry.imports.clone());
+    if let Some(imports) = record.imports() {
+        builder = builder.imports(value(imports));
     }
-
-    if !entry.suggests.is_empty() {
-        description.set_suggests(entry.suggests.clone());
+    if let Some(suggests) = record.suggests() {
+        builder = builder.suggests(value(suggests));
     }
-
-    if !entry.linking_to.is_empty() {
-        description.set_linking_to(entry.linking_to.clone());
+    if let Some(linking_to) = record.linking_to() {
+        builder = builder.field(
+            r_description::FieldName::new("LinkingTo").expect("constant field name is valid"),
+            value(linking_to),
+        );
     }
-
-    Ok(description)
+    builder.build()
 }
 
 async fn description_from_source_tarball_response(
     response: reqwest::Response,
     package: &str,
-) -> Result<RDescription, RepositoryError> {
+) -> Result<Description, RepositoryError> {
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -294,7 +312,7 @@ async fn description_from_source_tarball_response(
                 source: Arc::new(source),
             })?;
 
-        return Ok(RDescription::parse(&body));
+        return Ok(Description::parse(&body));
     }
 
     Err(RepositoryError::DescriptionNotFound {
@@ -311,4 +329,34 @@ fn path_is_top_level_description(path: &std::path::Path, package: &str) -> bool 
     components.next() == Some(package)
         && components.next() == Some("DESCRIPTION")
         && components.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_description_from_validated_package_record() {
+        let packages = r_packages::Packages::parse(
+            "Package: example\nVersion: 1.0.0\nImports: old\nImports: current,\n",
+        );
+        assert!(packages.validate().is_empty());
+        let record = packages.record(0).expect("package record should exist");
+
+        let description = packages_record_to_description(&record);
+
+        assert_eq!(description.package().unwrap().as_str(), "example");
+        assert_eq!(
+            description.version_parsed().unwrap().unwrap().as_str(),
+            "1.0.0"
+        );
+        assert_eq!(
+            description
+                .imports_parsed()
+                .values()
+                .map(r_metadata::Relation::package)
+                .collect::<Vec<_>>(),
+            ["current"]
+        );
+    }
 }
