@@ -2204,7 +2204,8 @@ dependencies = [
 [[package]]
 name = "r-dcf-syntax"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6918555af9df51dd5d31ad4a2c05c69db643e666f105edf6dddcfb8dde79121c"
 dependencies = [
  "rowan",
  "thiserror",
@@ -2213,7 +2214,8 @@ dependencies = [
 [[package]]
 name = "r-description-parser"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a3032e92cf785f42955016f3a3ef985df7d460eb6b45f3e8a05541b6701481"
 dependencies = [
  "r-dcf-syntax",
  "r-metadata",
@@ -2235,7 +2237,8 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r-metadata"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "884f184e42abe54b64d310703de4fa29bd2e5ecd74082383ca3a12021f376dd3"
 dependencies = [
  "thiserror",
  "url",
@@ -2244,7 +2247,8 @@ dependencies = [
 [[package]]
 name = "r-packages-parser"
 version = "0.1.0"
-source = "git+https://github.com/rrepo-org/r-metadata-rs?rev=48fa05236f1e796b2a07985af367417cdfab19b1#48fa05236f1e796b2a07985af367417cdfab19b1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b95edd105580d7884763cfd7f9b3110550c9b78792ebfb3c0d90453808807841"
 dependencies = [
  "r-dcf-syntax",
  "r-metadata",
