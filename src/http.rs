@@ -4,7 +4,7 @@ use keyring::Entry;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
 use r_metadata::Version;
-use r_packages::{Finding, Packages};
+use r_packages::Finding;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
@@ -331,11 +331,6 @@ pub(crate) fn display_safe_url(url: &reqwest::Url) -> reqwest::Url {
     url
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CranPackagesIndex {
-    pub packages: Packages,
-}
-
 #[derive(Clone, Debug, Error, Diagnostic)]
 #[error("failed to parse CRAN PACKAGES index ({count} errors)")]
 #[diagnostic(
@@ -355,12 +350,22 @@ pub struct CranPackagesParseError {
 }
 
 impl CranPackagesParseError {
-    fn new(
+    pub(crate) fn new(
         source_name: impl Into<String>,
         source: String,
-        issues: Vec<CranPackagesParseIssue>,
+        findings: Vec<Finding>,
     ) -> Self {
         let source_name = source_name.into();
+        let issues = findings
+            .into_iter()
+            .map(|finding| {
+                let range = finding.span();
+                CranPackagesParseIssue::Finding {
+                    span: (range.start..range.end).into(),
+                    finding,
+                }
+            })
+            .collect::<Vec<_>>();
         Self {
             count: issues.len(),
             source_code: NamedSource::new(source_name, source),
@@ -377,32 +382,6 @@ pub enum CranPackagesParseIssue {
         #[label("{finding}")]
         span: SourceSpan,
     },
-}
-
-impl CranPackagesIndex {
-    pub fn parse(
-        source_name: impl Into<String>,
-        source: String,
-    ) -> Result<Self, CranPackagesParseError> {
-        let parsed = Packages::parse(&source);
-        let issues = parsed
-            .validate()
-            .into_iter()
-            .map(|finding| {
-                let range = finding.span();
-                CranPackagesParseIssue::Finding {
-                    span: (range.start..range.end).into(),
-                    finding,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if !issues.is_empty() {
-            return Err(CranPackagesParseError::new(source_name, source, issues));
-        }
-
-        Ok(Self { packages: parsed })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,13 +702,25 @@ pub async fn cran_binary(
 mod tests {
     use miette::SourceSpan;
 
+    use r_packages::Packages;
+
     use super::{
-        BinaryArtifactRequestError, CranPackagesIndex, CranPackagesParseError,
-        CranPackagesParseIssue, display_safe_url, r_macos_binary_target,
+        BinaryArtifactRequestError, CranPackagesParseError, CranPackagesParseIssue,
+        display_safe_url, r_macos_binary_target,
     };
 
-    fn parse_packages_index(input: &str) -> Result<CranPackagesIndex, CranPackagesParseError> {
-        CranPackagesIndex::parse("CRAN PACKAGES fixture", input.to_string())
+    fn parse_packages_index(input: &str) -> Result<Packages, CranPackagesParseError> {
+        let packages = Packages::parse(input);
+        let findings = packages.validate().into_iter().collect::<Vec<_>>();
+        if findings.is_empty() {
+            Ok(packages)
+        } else {
+            Err(CranPackagesParseError::new(
+                "CRAN PACKAGES fixture",
+                input.to_string(),
+                findings,
+            ))
+        }
     }
 
     #[test]
@@ -764,9 +755,9 @@ mod tests {
         let index = "Package: AzureStor\nVersion: 3.7.1\nDepends: R (>= 3.3),\n";
 
         let index = parse_packages_index(index).expect("trailing commas should be accepted");
-        let package = index.packages.record(0).expect("package should exist");
+        let package = index.record(0).expect("package should exist");
 
-        assert_eq!(index.packages.len(), 1);
+        assert_eq!(index.len(), 1);
         assert_eq!(package.package().unwrap().as_str(), "AzureStor");
         assert_eq!(
             package.parsed_depends().unwrap().entries()[0]
@@ -782,7 +773,7 @@ mod tests {
             "package: ignored\nPackage: first\nVersion: 2.0.0\nImports: old\nImports: current\n",
         )
         .expect("the final exact-case fields should be selected");
-        let package = index.packages.record(0).expect("package should exist");
+        let package = index.record(0).expect("package should exist");
 
         assert_eq!(package.package().unwrap().as_str(), "first");
         assert_eq!(package.parsed_version().unwrap().unwrap().as_str(), "2.0.0");

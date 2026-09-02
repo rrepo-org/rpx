@@ -191,11 +191,14 @@ mod tests {
 
     #[test]
     fn cran_index_diagnostic_survives_pubgrub_resolution_errors() {
-        let parse_error = crate::http::CranPackagesIndex::parse(
+        let metadata = "Package: fixture\nVersion: invalid\n".to_string();
+        let packages = r_packages::Packages::parse(&metadata);
+        let findings = packages.validate().into_iter().collect();
+        let parse_error = crate::http::CranPackagesParseError::new(
             "https://example.test/src/contrib/PACKAGES",
-            "Package: fixture\nVersion: invalid\n".to_string(),
-        )
-        .expect_err("invalid CRAN version should fail");
+            metadata,
+            findings,
+        );
         let source = PubGrubError::ErrorChoosingVersion {
             package: "fixture".to_string(),
             source: ProviderError::Repository(RepositoryError::CranPackages(Box::new(parse_error))),

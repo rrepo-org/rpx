@@ -5,7 +5,7 @@ use futures_util::TryStreamExt;
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
 use r_metadata::Version;
-use r_packages::PackageRecord;
+use r_packages::{PackageRecord, Packages};
 use reqwest::Url;
 use std::{
     any::Any,
@@ -18,7 +18,7 @@ use std::{
 pub struct CranRepository {
     url: Url,
     archives: ArchiveSupport,
-    packages: Cache<(), Arc<http::CranPackagesIndex>>,
+    packages: Cache<(), Arc<Packages>>,
     archive_versions: Cache<String, BTreeSet<Version>>,
     descriptions: Cache<(String, Version), Arc<Description>>,
 }
@@ -48,7 +48,7 @@ impl CranRepository {
         self.archives
     }
 
-    async fn packages_index(&self) -> Result<Arc<http::CranPackagesIndex>, RepositoryError> {
+    async fn packages_index(&self) -> Result<Arc<Packages>, RepositoryError> {
         self.packages
             .try_get_with((), async {
                 let response = http::cran_packages(&self.url)
@@ -67,10 +67,14 @@ impl CranRepository {
                     .map_err(|source| RepositoryError::Response {
                         source: Arc::new(source),
                     })?;
-                let index = http::CranPackagesIndex::parse(source_name, text)
-                    .map_err(|source| RepositoryError::CranPackages(Box::new(source)))?;
+                let packages = Packages::parse(&text);
+                let findings = packages.validate().into_iter().collect::<Vec<_>>();
+                if !findings.is_empty() {
+                    let source = http::CranPackagesParseError::new(source_name, text, findings);
+                    return Err(RepositoryError::CranPackages(Box::new(source)));
+                }
 
-                Ok::<Arc<http::CranPackagesIndex>, RepositoryError>(Arc::new(index))
+                Ok::<Arc<Packages>, RepositoryError>(Arc::new(packages))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -95,7 +99,6 @@ impl PackageRepository for CranRepository {
         let index = self.packages_index().await?;
 
         Ok(index
-            .packages
             .records()
             .map(|record| {
                 let package = record.package().expect("validated Package should exist");
@@ -115,7 +118,6 @@ impl PackageRepository for CranRepository {
         let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
         let index = self.packages_index().await?;
         let mut versions = index
-            .packages
             .records()
             .filter(|record| {
                 record
@@ -190,7 +192,7 @@ impl PackageRepository for CranRepository {
         self.descriptions
             .try_get_with(key, async {
                 let index = self.packages_index().await?;
-                let description = if let Some(entry) = index.packages.records().find(|record| {
+                let description = if let Some(entry) = index.records().find(|record| {
                     record
                         .package()
                         .is_some_and(|value| value.as_str() == package)
