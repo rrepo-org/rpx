@@ -3,8 +3,8 @@ mod git;
 mod local;
 mod rrepo;
 
-use crate::http;
 use crate::resolver::PackageVersion;
+use crate::{description::DescriptionParseError, http};
 use async_trait::async_trait;
 use miette::Diagnostic;
 use r_description::Description;
@@ -81,11 +81,9 @@ pub enum RepositoryError {
         source: Arc<std::io::Error>,
     },
 
-    #[error("failed to read Package from DESCRIPTION {location}: {details}")]
-    PackageField { location: String, details: String },
-
-    #[error("failed to read Version from DESCRIPTION {location}: {details}")]
-    VersionField { location: String, details: String },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Description(#[from] DescriptionParseError),
 
     #[error("invalid {resource}: {details}")]
     InvalidData { resource: String, details: String },

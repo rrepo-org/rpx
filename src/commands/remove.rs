@@ -1,7 +1,7 @@
 use crate::{
     cli::RemoveArgs,
     description::{
-        DescriptionNormalizationError, DescriptionParseError, normalize_description,
+        DependencyMutationError, DescriptionNormalizationError, normalize_description,
         remove_dependencies,
     },
     output::status,
@@ -23,7 +23,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

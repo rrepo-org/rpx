@@ -393,35 +393,36 @@ fn dependencies_from_description(
 }
 
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
-    fn numeric_version(operand: &RequirementVersion) -> Option<&Version> {
-        match operand {
-            RequirementVersion::Version(version) => Some(version),
-            RequirementVersion::Revision(_) => None,
-        }
-    }
-
     let bound = |version: &Version| PackageVersion::new(version.clone(), built_in_repository());
 
     match relation.requirement() {
         VersionRequirement::Any => Ranges::full(),
-        VersionRequirement::Equal(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| Ranges::singleton(bound(value))),
-        VersionRequirement::GreaterThan(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| {
-                Ranges::strictly_higher_than(bound(value))
-            }),
-        VersionRequirement::GreaterThanEqual(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| Ranges::higher_than(bound(value))),
-        VersionRequirement::LessThan(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| {
-                Ranges::strictly_lower_than(bound(value))
-            }),
-        VersionRequirement::LessThanEqual(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| Ranges::lower_than(bound(value))),
-        VersionRequirement::NotEqual(value) => numeric_version(value)
-            .map_or_else(Ranges::full, |value| {
-                Ranges::singleton(bound(value)).complement()
-            }),
+        VersionRequirement::Equal(RequirementVersion::Version(version)) => {
+            Ranges::singleton(bound(version))
+        }
+        VersionRequirement::GreaterThan(RequirementVersion::Version(version)) => {
+            Ranges::strictly_higher_than(bound(version))
+        }
+        VersionRequirement::GreaterThanEqual(RequirementVersion::Version(version)) => {
+            Ranges::higher_than(bound(version))
+        }
+        VersionRequirement::LessThan(RequirementVersion::Version(version)) => {
+            Ranges::strictly_lower_than(bound(version))
+        }
+        VersionRequirement::LessThanEqual(RequirementVersion::Version(version)) => {
+            Ranges::lower_than(bound(version))
+        }
+        VersionRequirement::NotEqual(RequirementVersion::Version(version)) => {
+            Ranges::singleton(bound(version)).complement()
+        }
+        VersionRequirement::Equal(RequirementVersion::Revision(_))
+        | VersionRequirement::GreaterThan(RequirementVersion::Revision(_))
+        | VersionRequirement::GreaterThanEqual(RequirementVersion::Revision(_))
+        | VersionRequirement::LessThan(RequirementVersion::Revision(_))
+        | VersionRequirement::LessThanEqual(RequirementVersion::Revision(_))
+        | VersionRequirement::NotEqual(RequirementVersion::Revision(_)) => {
+            unreachable!("R revision requirement reached the package version resolver")
+        }
     }
 }
 
@@ -946,20 +947,12 @@ mod tests {
     }
 
     #[test]
-    fn revision_constraints_are_unconstrained_for_pubgrub() {
+    #[should_panic(expected = "R revision requirement reached the package version resolver")]
+    fn revision_constraints_cannot_reach_pubgrub() {
         let relation = "example (>= r123)"
             .parse()
             .expect("revision relation should parse");
-        let range = package_version_range_from_relation(&relation);
-
-        assert!(range.contains(&PackageVersion::new(
-            "0.1.0".parse().unwrap(),
-            built_in_repository(),
-        )));
-        assert!(range.contains(&PackageVersion::new(
-            "999.0.0".parse().unwrap(),
-            built_in_repository(),
-        )));
+        package_version_range_from_relation(&relation);
     }
 
     #[tokio::test(flavor = "multi_thread")]

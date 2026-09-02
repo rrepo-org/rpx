@@ -1,5 +1,6 @@
 use super::{PackageRepository, RepositoryError};
 use crate::{
+    description::description_identity,
     git::{self, GitUrl},
     resolver::PackageVersion,
 };
@@ -123,25 +124,8 @@ impl GitRepository {
 
     async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
         let description = self.repository_description().await?;
-        let location = format!("from {self}");
-        let package = description
-            .package()
-            .filter(|value| !value.as_str().is_empty())
-            .map(|value| value.as_str().to_owned())
-            .ok_or_else(|| RepositoryError::PackageField {
-                location: location.clone(),
-                details: "Package field is missing or empty".to_string(),
-            })?;
-        let version = description
-            .version_parsed()
-            .ok_or_else(|| RepositoryError::VersionField {
-                location: location.clone(),
-                details: "Version field is missing".to_string(),
-            })?
-            .map_err(|source| RepositoryError::VersionField {
-                location,
-                details: source.to_string(),
-            })?;
+        let (package, version) =
+            description_identity(format!("DESCRIPTION from {self}"), &description)?;
         let repository: Arc<dyn PackageRepository> = self.clone();
 
         Ok((package, PackageVersion::new(version, repository)))
@@ -220,25 +204,8 @@ impl PackageRepository for GitRepository {
         version: &Version,
     ) -> Result<Arc<Description>, RepositoryError> {
         let description = self.repository_description().await?;
-        let location = format!("from {self}");
-        let repository_package = description
-            .package()
-            .filter(|value| !value.as_str().is_empty())
-            .map(|value| value.as_str().to_owned())
-            .ok_or_else(|| RepositoryError::PackageField {
-                location: location.clone(),
-                details: "Package field is missing or empty".to_string(),
-            })?;
-        let repository_version = description
-            .version_parsed()
-            .ok_or_else(|| RepositoryError::VersionField {
-                location: location.clone(),
-                details: "Version field is missing".to_string(),
-            })?
-            .map_err(|source| RepositoryError::VersionField {
-                location,
-                details: source.to_string(),
-            })?;
+        let (repository_package, repository_version) =
+            description_identity(format!("DESCRIPTION from {self}"), &description)?;
         if package != repository_package || version != &repository_version {
             return Err(RepositoryError::RepositoryPackageVersionNotFound {
                 repository: self.to_string(),
@@ -336,6 +303,27 @@ mod tests {
             .expect("packages should be cached");
         assert_eq!(packages["example"].version().to_string(), "1.0.0");
 
+        fs::remove_dir_all(source_path).expect("source should be removed");
+    }
+
+    #[tokio::test]
+    async fn reports_invalid_description_identity_with_positioned_details() {
+        let (source_path, source, _) = source_repository("invalid-description-identity");
+        let invalid = commit_file(&source, "Package: _bad\nVersion: nope\n", "invalid");
+        let repository = Arc::new(
+            GitRepository::from_parts(GitUrl::from_local_path(&source_path), None, None)
+                .with_commit(invalid),
+        );
+
+        let error = repository
+            .packages()
+            .await
+            .expect_err("invalid DESCRIPTION identity should be rejected");
+
+        let RepositoryError::Description(error) = error else {
+            panic!("expected positioned DESCRIPTION error");
+        };
+        assert_eq!(error.messages().len(), 2);
         fs::remove_dir_all(source_path).expect("source should be removed");
     }
 

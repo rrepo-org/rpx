@@ -1,5 +1,5 @@
 use super::{PackageRepository, RepositoryError};
-use crate::resolver::PackageVersion;
+use crate::{description::root_package, resolver::PackageVersion};
 use async_trait::async_trait;
 use r_description::Description;
 use r_metadata::Version;
@@ -63,25 +63,7 @@ impl LocalRepository {
 
     pub async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
         let description = self.description().await?;
-        let location = format!("at {}", self.path.join("DESCRIPTION").display());
-        let package = description
-            .package()
-            .filter(|value| !value.as_str().is_empty())
-            .map(|value| value.as_str().to_owned())
-            .ok_or_else(|| RepositoryError::PackageField {
-                location: location.clone(),
-                details: "Package field is missing or empty".to_string(),
-            })?;
-        let version = description
-            .version_parsed()
-            .ok_or_else(|| RepositoryError::VersionField {
-                location: location.clone(),
-                details: "Version field is missing".to_string(),
-            })?
-            .map_err(|source| RepositoryError::VersionField {
-                location,
-                details: source.to_string(),
-            })?;
+        let (package, version) = root_package(&self.path, &description)?;
 
         let repository: Arc<dyn PackageRepository> = self.clone();
         Ok((package, PackageVersion::new(version, repository)))
@@ -124,25 +106,7 @@ impl PackageRepository for LocalRepository {
         version: &Version,
     ) -> Result<Arc<Description>, RepositoryError> {
         let description = self.description().await?;
-        let location = format!("at {}", self.path.join("DESCRIPTION").display());
-        let local_package = description
-            .package()
-            .filter(|value| !value.as_str().is_empty())
-            .map(|value| value.as_str().to_owned())
-            .ok_or_else(|| RepositoryError::PackageField {
-                location: location.clone(),
-                details: "Package field is missing or empty".to_string(),
-            })?;
-        let local_version = description
-            .version_parsed()
-            .ok_or_else(|| RepositoryError::VersionField {
-                location: location.clone(),
-                details: "Version field is missing".to_string(),
-            })?
-            .map_err(|source| RepositoryError::VersionField {
-                location,
-                details: source.to_string(),
-            })?;
+        let (local_package, local_version) = root_package(&self.path, &description)?;
 
         if package != local_package || version != &local_version {
             return Err(RepositoryError::PackageVersionNotFound {

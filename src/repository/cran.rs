@@ -5,6 +5,7 @@ use futures_util::TryStreamExt;
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
 use r_metadata::Version;
+use r_packages::PackageRecord;
 use reqwest::Url;
 use std::{
     any::Any,
@@ -95,11 +96,16 @@ impl PackageRepository for CranRepository {
 
         Ok(index
             .packages
-            .iter()
-            .map(|package| {
+            .records()
+            .map(|record| {
+                let package = record.package().expect("validated Package should exist");
+                let version = record
+                    .parsed_version()
+                    .expect("validated Version should exist")
+                    .expect("validated Version should parse");
                 (
-                    package.package.clone(),
-                    PackageVersion::new(package.version.clone(), Arc::clone(&repository)),
+                    package.as_str().to_owned(),
+                    PackageVersion::new(version, Arc::clone(&repository)),
                 )
             })
             .collect())
@@ -110,9 +116,18 @@ impl PackageRepository for CranRepository {
         let index = self.packages_index().await?;
         let mut versions = index
             .packages
-            .iter()
-            .filter(|entry| entry.package == package)
-            .map(|entry| entry.version.clone())
+            .records()
+            .filter(|record| {
+                record
+                    .package()
+                    .is_some_and(|value| value.as_str() == package)
+            })
+            .map(|record| {
+                record
+                    .parsed_version()
+                    .expect("validated Version should exist")
+                    .expect("validated Version should parse")
+            })
             .collect::<BTreeSet<_>>();
 
         if versions.is_empty() {
@@ -175,12 +190,15 @@ impl PackageRepository for CranRepository {
         self.descriptions
             .try_get_with(key, async {
                 let index = self.packages_index().await?;
-                let description = if let Some(entry) = index
-                    .packages
-                    .iter()
-                    .find(|entry| entry.package == package && &entry.version == version)
-                {
-                    packages_entry_to_description(entry)
+                let description = if let Some(entry) = index.packages.records().find(|record| {
+                    record
+                        .package()
+                        .is_some_and(|value| value.as_str() == package)
+                        && record
+                            .parsed_version()
+                            .is_some_and(|value| value.as_ref().is_ok_and(|value| value == version))
+                }) {
+                    packages_record_to_description(&entry)
                 } else {
                     let version_string = version.to_string();
                     let response =
@@ -211,34 +229,30 @@ impl PackageRepository for CranRepository {
     }
 }
 
-fn packages_entry_to_description(entry: &http::CranPackageIndexEntry) -> Description {
-    let value =
-        |value: String| LogicalValue::new(value).expect("parsed metadata is a valid DCF value");
-    let relations = |values: &[r_metadata::Relation]| {
-        value(
-            values
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
+fn packages_record_to_description(record: &PackageRecord) -> Description {
+    let value = |value: r_description::ValueText| {
+        LogicalValue::new(value.as_str()).expect("validated metadata is a valid DCF value")
     };
     let mut builder = Description::builder()
-        .package(value(entry.package.clone()))
-        .version(value(entry.version.to_string()));
-    if !entry.depends.is_empty() {
-        builder = builder.depends(relations(&entry.depends));
+        .package(value(
+            record.package().expect("validated Package should exist"),
+        ))
+        .version(value(
+            record.version().expect("validated Version should exist"),
+        ));
+    if let Some(depends) = record.depends() {
+        builder = builder.depends(value(depends));
     }
-    if !entry.imports.is_empty() {
-        builder = builder.imports(relations(&entry.imports));
+    if let Some(imports) = record.imports() {
+        builder = builder.imports(value(imports));
     }
-    if !entry.suggests.is_empty() {
-        builder = builder.suggests(relations(&entry.suggests));
+    if let Some(suggests) = record.suggests() {
+        builder = builder.suggests(value(suggests));
     }
-    if !entry.linking_to.is_empty() {
+    if let Some(linking_to) = record.linking_to() {
         builder = builder.field(
             r_description::FieldName::new("LinkingTo").expect("constant field name is valid"),
-            relations(&entry.linking_to),
+            value(linking_to),
         );
     }
     builder.build()
@@ -313,4 +327,34 @@ fn path_is_top_level_description(path: &std::path::Path, package: &str) -> bool 
     components.next() == Some(package)
         && components.next() == Some("DESCRIPTION")
         && components.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_description_from_validated_package_record() {
+        let packages = r_packages::Packages::parse(
+            "Package: example\nVersion: 1.0.0\nImports: old\nImports: current,\n",
+        );
+        assert!(packages.validate().is_empty());
+        let record = packages.record(0).expect("package record should exist");
+
+        let description = packages_record_to_description(&record);
+
+        assert_eq!(description.package().unwrap().as_str(), "example");
+        assert_eq!(
+            description.version_parsed().unwrap().unwrap().as_str(),
+            "1.0.0"
+        );
+        assert_eq!(
+            description
+                .imports_parsed()
+                .values()
+                .map(r_metadata::Relation::package)
+                .collect::<Vec<_>>(),
+            ["current"]
+        );
+    }
 }

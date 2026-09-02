@@ -1,8 +1,9 @@
 use crate::{
     cli::{InitArgs, InitLicense},
     description::{
-        DependencyField, DescriptionNormalizationError, DescriptionParseError, NamespaceWriteError,
-        add_dependencies, normalize_description, set_base_repository, write_namespace_if_missing,
+        DependencyField, DependencyMutationError, DescriptionNormalizationError,
+        NamespaceWriteError, add_dependencies, normalize_description, set_base_repository,
+        write_namespace_if_missing,
     },
     git,
     output::status,
@@ -106,7 +107,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

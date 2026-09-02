@@ -1,7 +1,7 @@
 use crate::{
     cli::AddArgs,
     description::{
-        DescriptionNormalizationError, DescriptionParseError, add_dependencies,
+        DependencyMutationError, DescriptionNormalizationError, add_dependencies,
         normalize_description,
     },
     output::status,
@@ -28,7 +28,7 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]

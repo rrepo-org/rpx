@@ -2,7 +2,7 @@ use directories::ProjectDirs;
 use miette::Diagnostic;
 use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
 use r_description::Description;
-use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
+use r_metadata::{Relation, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env, fs,
@@ -18,10 +18,10 @@ use thiserror::Error;
 
 use crate::{
     description::{
-        ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DescriptionParseError,
-        DescriptionReadError, RepositoriesFromDescriptionError, add_dependencies,
-        configured_repositories, dependencies_from_fields, project_dependencies, read_description,
-        repositories_from_description,
+        ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DependencyMutationError,
+        DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError,
+        add_dependencies, configured_repositories, dependencies_from_fields, project_dependencies,
+        read_description, repositories_from_description,
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
@@ -921,7 +921,7 @@ pub(crate) fn pin_unconstrained_dependencies(
     resolution: &mut ProjectResolution,
     relations: &BTreeSet<Relation>,
     dependency_field: DependencyField,
-) -> Result<(), DescriptionParseError> {
+) -> Result<(), DependencyMutationError> {
     let pinned_relations = relations
         .iter()
         .filter(|relation| matches!(relation.requirement(), VersionRequirement::Any))
@@ -966,16 +966,13 @@ fn pin_dependency_to_resolved_major(
     relations.insert(
         Relation::new(
             package,
-            VersionRequirement::GreaterThanEqual(RequirementVersion::Version(version.clone())),
+            VersionRequirement::GreaterThanEqual(version.clone().into()),
         )
         .expect("previously parsed package name should remain valid"),
     );
     relations.insert(
-        Relation::new(
-            package,
-            VersionRequirement::LessThan(RequirementVersion::Version(next_major)),
-        )
-        .expect("previously parsed package name should remain valid"),
+        Relation::new(package, VersionRequirement::LessThan(next_major.into()))
+            .expect("previously parsed package name should remain valid"),
     );
 }
 

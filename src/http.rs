@@ -3,7 +3,7 @@ use http::Extensions;
 use keyring::Entry;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
-use r_metadata::{Relation, Version};
+use r_metadata::Version;
 use r_packages::{Finding, Packages};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest_middleware::{ClientBuilder, Middleware, Next};
@@ -333,7 +333,7 @@ pub(crate) fn display_safe_url(url: &reqwest::Url) -> reqwest::Url {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CranPackagesIndex {
-    pub packages: Vec<CranPackageIndexEntry>,
+    pub packages: Packages,
 }
 
 #[derive(Clone, Debug, Error, Diagnostic)]
@@ -379,16 +379,6 @@ pub enum CranPackagesParseIssue {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CranPackageIndexEntry {
-    pub package: String,
-    pub version: Version,
-    pub depends: Vec<Relation>,
-    pub imports: Vec<Relation>,
-    pub suggests: Vec<Relation>,
-    pub linking_to: Vec<Relation>,
-}
-
 impl CranPackagesIndex {
     pub fn parse(
         source_name: impl Into<String>,
@@ -411,35 +401,8 @@ impl CranPackagesIndex {
             return Err(CranPackagesParseError::new(source_name, source, issues));
         }
 
-        let packages = parsed
-            .records()
-            .filter_map(|record| cran_package_index_entry_from_validated_record(&record))
-            .collect();
-        Ok(Self { packages })
+        Ok(Self { packages: parsed })
     }
-}
-
-fn cran_package_index_entry_from_validated_record(
-    record: &r_packages::PackageRecord,
-) -> Option<CranPackageIndexEntry> {
-    Some(CranPackageIndexEntry {
-        package: record.package()?.as_str().to_owned(),
-        version: record.parsed_version()?.ok()?,
-        depends: relation_values(record.parsed_depends()),
-        imports: relation_values(record.parsed_imports()),
-        suggests: relation_values(record.parsed_suggests()),
-        linking_to: relation_values(record.parsed_linking_to()),
-    })
-}
-
-fn relation_values(relations: Option<r_metadata::RelationList>) -> Vec<Relation> {
-    relations.map_or_else(Vec::new, |relations| {
-        relations
-            .entries()
-            .iter()
-            .map(|entry| entry.value.clone())
-            .collect()
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -801,10 +764,16 @@ mod tests {
         let index = "Package: AzureStor\nVersion: 3.7.1\nDepends: R (>= 3.3),\n";
 
         let index = parse_packages_index(index).expect("trailing commas should be accepted");
+        let package = index.packages.record(0).expect("package should exist");
 
         assert_eq!(index.packages.len(), 1);
-        assert_eq!(index.packages[0].package, "AzureStor");
-        assert_eq!(index.packages[0].depends[0].to_string(), "R (>= 3.3)");
+        assert_eq!(package.package().unwrap().as_str(), "AzureStor");
+        assert_eq!(
+            package.parsed_depends().unwrap().entries()[0]
+                .value
+                .to_string(),
+            "R (>= 3.3)"
+        );
     }
 
     #[test]
@@ -813,10 +782,16 @@ mod tests {
             "package: ignored\nPackage: first\nVersion: 2.0.0\nImports: old\nImports: current\n",
         )
         .expect("the final exact-case fields should be selected");
+        let package = index.packages.record(0).expect("package should exist");
 
-        assert_eq!(index.packages[0].package, "first");
-        assert_eq!(index.packages[0].version.to_string(), "2.0.0");
-        assert_eq!(index.packages[0].imports[0].package(), "current");
+        assert_eq!(package.package().unwrap().as_str(), "first");
+        assert_eq!(package.parsed_version().unwrap().unwrap().as_str(), "2.0.0");
+        assert_eq!(
+            package.parsed_imports().unwrap().entries()[0]
+                .value
+                .package(),
+            "current"
+        );
 
         let error = parse_packages_index("package: wrong-case\nVersion: 1.0.0\n")
             .expect_err("wrong-case Package should remain missing");

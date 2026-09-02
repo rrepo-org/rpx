@@ -2,7 +2,10 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 use r_description::{
     CollectionEditError, CollectionResult, Description, EditError, FieldName, LogicalValue,
 };
-use r_metadata::{PositionedRelationParseError, Relation, Remote, RemoteSource, Url, Version};
+use r_metadata::{
+    PositionedRelationParseError, Relation, Remote, RemoteSource, RequirementVersion, Url, Version,
+    VersionRequirement,
+};
 use std::{
     collections::BTreeSet,
     fs,
@@ -28,7 +31,7 @@ pub enum DependencyField {
     Suggests,
 }
 
-#[derive(Debug, Error, Diagnostic)]
+#[derive(Clone, Debug, Error, Diagnostic)]
 #[error("failed to parse DESCRIPTION ({count} errors)")]
 #[diagnostic(code(rpx::description::parse_failed))]
 pub struct DescriptionParseError {
@@ -41,7 +44,7 @@ pub struct DescriptionParseError {
     issues: Vec<DescriptionParseIssue>,
 }
 
-#[derive(Debug, Error, Diagnostic)]
+#[derive(Clone, Debug, Error, Diagnostic)]
 #[error("failed to normalize DESCRIPTION ({count} errors)")]
 #[diagnostic(code(rpx::description::normalization_failed))]
 pub struct DescriptionNormalizationError {
@@ -73,11 +76,11 @@ impl DescriptionParseError {
     }
 }
 
-#[derive(Debug, Error, Diagnostic)]
+#[derive(Clone, Debug, Error, Diagnostic)]
 pub enum DescriptionParseIssue {
     #[error("{error}")]
     Positioned {
-        error: Box<dyn std::error::Error + Send + Sync>,
+        error: Arc<dyn std::error::Error + Send + Sync>,
 
         #[label("{error}")]
         span: SourceSpan,
@@ -85,7 +88,7 @@ pub enum DescriptionParseIssue {
 
     #[error("{error}")]
     Unpositioned {
-        error: Box<dyn std::error::Error + Send + Sync>,
+        error: Arc<dyn std::error::Error + Send + Sync>,
     },
 
     #[error("{message}")]
@@ -98,14 +101,14 @@ impl DescriptionParseIssue {
         span: impl Into<SourceSpan>,
     ) -> Self {
         Self::Positioned {
-            error: Box::new(error),
+            error: Arc::new(error),
             span: span.into(),
         }
     }
 
     pub fn unpositioned(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Unpositioned {
-            error: Box::new(error),
+            error: Arc::new(error),
         }
     }
 
@@ -217,9 +220,42 @@ pub fn root_package(
     path: &Path,
     description: &Description,
 ) -> Result<(String, Version), DescriptionParseError> {
+    description_identity(
+        path.join(DESCRIPTION_NAME).display().to_string(),
+        description,
+    )
+}
+
+pub(crate) fn description_identity(
+    source_name: impl Into<String>,
+    description: &Description,
+) -> Result<(String, Version), DescriptionParseError> {
     let package = description.package().map(|value| value.as_str().to_owned());
     let version = description.version_parsed();
+    let has_multiple_records = description.records().nth(1).is_some();
     let mut issues = Vec::new();
+
+    issues.extend(
+        description
+            .validate()
+            .into_issues()
+            .into_iter()
+            .filter(|issue| {
+                issue.code().starts_with("syntax.")
+                    || (issue.code() == "record-count" && has_multiple_records)
+                    || (issue.code() == "invalid-package-name"
+                        && package
+                            .as_deref()
+                            .is_some_and(|package| !package.is_empty()))
+            })
+            .map(|issue| {
+                let span = issue.span();
+                DescriptionParseIssue::positioned(
+                    std::io::Error::other(format!("{}: {}", issue.code(), issue.message())),
+                    span.start..span.end,
+                )
+            }),
+    );
     match package.as_deref() {
         None => issues.push(DescriptionParseIssue::missing("Package field is missing")),
         Some("") => issues.push(DescriptionParseIssue::missing("Package field is empty")),
@@ -250,11 +286,25 @@ pub fn root_package(
         ))
     } else {
         Err(DescriptionParseError::new(
-            path.join(DESCRIPTION_NAME).display().to_string(),
+            source_name,
             description.to_string(),
             issues,
         ))
     }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum DependencyMutationError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Description(#[from] DescriptionParseError),
+
+    #[error("failed to update dependency metadata: {source}")]
+    #[diagnostic(code(rpx::description::dependency_update_failed))]
+    Mutation {
+        #[from]
+        source: CollectionEditError,
+    },
 }
 
 pub fn required_dependencies(
@@ -325,6 +375,27 @@ pub(crate) fn dependencies_from_fields(
                 )
             })
         })
+        .chain(fields.iter().flat_map(|(field, parsed)| {
+            parsed.entries().iter().filter_map(move |entry| {
+                let uses_revision = matches!(
+                    entry.value.requirement(),
+                    VersionRequirement::Equal(RequirementVersion::Revision(_))
+                        | VersionRequirement::NotEqual(RequirementVersion::Revision(_))
+                        | VersionRequirement::GreaterThan(RequirementVersion::Revision(_))
+                        | VersionRequirement::GreaterThanEqual(RequirementVersion::Revision(_))
+                        | VersionRequirement::LessThan(RequirementVersion::Revision(_))
+                        | VersionRequirement::LessThanEqual(RequirementVersion::Revision(_))
+                );
+                (entry.value.package() != "R" && uses_revision).then(|| {
+                    DescriptionParseIssue::positioned(
+                        std::io::Error::other(format!(
+                            "{field}: revision requirements are only valid for R"
+                        )),
+                        entry.field_span.start..entry.field_span.end,
+                    )
+                })
+            })
+        }))
         .collect::<Vec<_>>();
     if issues.is_empty() {
         Ok(dependencies)
@@ -342,7 +413,7 @@ pub fn add_dependencies(
     description: &mut Description,
     dependencies: &BTreeSet<Relation>,
     field: DependencyField,
-) -> Result<(), DescriptionParseError> {
+) -> Result<(), DependencyMutationError> {
     if dependencies.is_empty() {
         return Ok(());
     }
@@ -390,14 +461,7 @@ pub fn add_dependencies(
         .set_depends(&depends)
         .and_then(|description| description.set_imports(&imports))
         .and_then(|description| description.set_linking_to(&linking_to))
-        .and_then(|description| description.set_suggests(&suggests))
-        .map_err(|error| {
-            DescriptionParseError::new(
-                source_name,
-                description.to_string(),
-                vec![DescriptionParseIssue::unpositioned(error)],
-            )
-        })?;
+        .and_then(|description| description.set_suggests(&suggests))?;
     *description = updated;
 
     Ok(())
@@ -407,7 +471,7 @@ pub fn remove_dependencies(
     path: &Path,
     description: &mut Description,
     packages: &BTreeSet<String>,
-) -> Result<(), DescriptionParseError> {
+) -> Result<(), DependencyMutationError> {
     if packages.is_empty() {
         return Ok(());
     }
@@ -443,14 +507,7 @@ pub fn remove_dependencies(
         .set_depends(&depends)
         .and_then(|description| description.set_imports(&imports))
         .and_then(|description| description.set_linking_to(&linking_to))
-        .and_then(|description| description.set_suggests(&suggests))
-        .map_err(|error| {
-            DescriptionParseError::new(
-                source_name,
-                description.to_string(),
-                vec![DescriptionParseIssue::unpositioned(error)],
-            )
-        })?;
+        .and_then(|description| description.set_suggests(&suggests))?;
     *description = updated;
 
     Ok(())
@@ -957,6 +1014,22 @@ mod tests {
     }
 
     #[test]
+    fn reports_positioned_invalid_package_identity_fields() {
+        let description = Description::parse("Package: _bad\nVersion: nope\n");
+
+        let error = root_package(Path::new("."), &description)
+            .expect_err("invalid package identity should be rejected");
+
+        assert_eq!(error.count, 2);
+        assert!(
+            error
+                .issues
+                .iter()
+                .all(|issue| matches!(issue, DescriptionParseIssue::Positioned { .. }))
+        );
+    }
+
+    #[test]
     fn rejects_empty_root_package_and_version() {
         let description = Description::parse("Package: \nVersion: \n");
         let error = root_package(Path::new("."), &description)
@@ -1005,6 +1078,27 @@ mod tests {
             .expect_err("dependencies should be invalid");
 
         assert_eq!(error.count, 2);
+    }
+
+    #[test]
+    fn permits_r_revisions_and_rejects_package_revision_requirements() {
+        let r = Description::parse("Package: project\nVersion: 1.0.0\nDepends: R (>= r123)\n");
+        assert!(
+            required_dependencies("DESCRIPTION", &r)
+                .expect("R revision should be accepted")
+                .is_empty()
+        );
+
+        let package =
+            Description::parse("Package: project\nVersion: 1.0.0\nImports: example (>= r123)\n");
+        let error = required_dependencies("DESCRIPTION", &package)
+            .expect_err("package revision should be rejected");
+        assert!(
+            error
+                .messages()
+                .iter()
+                .any(|message| message.contains("revision requirements are only valid for R"))
+        );
     }
 
     #[test]
@@ -1112,6 +1206,21 @@ mod tests {
             .is_err()
         );
         assert_eq!(description.to_string(), original);
+    }
+
+    #[test]
+    fn add_reports_edit_failures_as_mutation_errors() {
+        let mut description = Description::parse("");
+
+        let error = add_dependencies(
+            Path::new("."),
+            &mut description,
+            &relation_set(&["jsonlite"]),
+            DependencyField::Imports,
+        )
+        .expect_err("a missing record cannot be edited");
+
+        assert!(matches!(error, DependencyMutationError::Mutation { .. }));
     }
 
     #[test]
