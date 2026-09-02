@@ -10,8 +10,45 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    name: Build / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: rpx-ubuntu-latest
+            executable: target/release/rpx
+          - os: macos-latest
+            artifact: rpx-macos-latest
+            executable: target/release/rpx
+          - os: windows-latest
+            artifact: rpx-windows-latest
+            executable: target/release/rpx.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.executable }}
+          retention-days: 1
+
   e2e-unix:
-    name: ${{ matrix.os }} / R ${{ matrix.r }}
+    name: ${{ matrix.scenario }} / ${{ matrix.os }} / R ${{ matrix.r }}
+    needs: build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -23,33 +60,36 @@ jobs:
         r:
           - release
           - oldrel
+        scenario:
+          - lifecycle
+          - RcppParallel 6.2.1
     defaults:
       run:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v6
-
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: ${{ matrix.r }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download release binary
+        uses: actions/download-artifact@v7
+        with:
+          name: rpx-${{ matrix.os }}
+          path: ${{ runner.temp }}/rpx-bin
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
+      - name: Activate release binary
         run: |
           set -euo pipefail
-          cargo build --release --locked
-          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+          chmod +x "$RUNNER_TEMP/rpx-bin/rpx"
+          echo "$RUNNER_TEMP/rpx-bin" >> "$GITHUB_PATH"
 
-      - name: Initialize and sync a project
+      - name: Run lifecycle scenario
+        if: matrix.scenario == 'lifecycle'
         run: |
           set -euo pipefail
-          project="$RUNNER_TEMP/rpx-e2e"
+          project="$RUNNER_TEMP/rpx-e2e-lifecycle"
 
           rpx init "$project" --name rpxe2e
           cd "$project"
@@ -57,28 +97,33 @@ jobs:
           rpx sync
           rpx run Rscript --vanilla -e 'library("rpxe2e", lib.loc = .libPaths()[1L])'
 
-      - name: Add and use packages
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/rpx-e2e"
-
           rpx add R6
           rpx add digest
           rpx status
           rpx run Rscript --vanilla -e 'library("R6", lib.loc = .libPaths()[1L]); library("digest", lib.loc = .libPaths()[1L]); stopifnot(nzchar(digest("rpx")))'
-
-      - name: Remove packages
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/rpx-e2e"
 
           rpx remove R6
           rpx run Rscript --vanilla -e 'packages <- rownames(installed.packages(lib.loc = .libPaths()[1L], noCache = TRUE)); stopifnot(!("R6" %in% packages), "digest" %in% packages)'
           rpx remove digest
           rpx status
 
+      - name: Run RcppParallel scenario
+        if: matrix.scenario == 'RcppParallel 6.2.1'
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/rpx-e2e-rcppparallel"
+
+          rpx init "$project" --name rpxrcppparallel
+          cd "$project"
+          rpx add 'RcppParallel@==6.2.1'
+          rpx clean
+          rpx sync
+          rpx status
+          rpx run Rscript --vanilla -e 'library("RcppParallel", lib.loc = .libPaths()[1L]); stopifnot(as.character(packageVersion("RcppParallel", lib.loc = .libPaths()[1L])) == "6.2.1")'
+
   e2e-windows:
-    name: windows-latest / R ${{ matrix.r }}
+    name: ${{ matrix.scenario }} / windows-latest / R ${{ matrix.r }}
+    needs: build
     runs-on: windows-latest
     timeout-minutes: 30
     strategy:
@@ -87,36 +132,37 @@ jobs:
         r:
           - release
           - oldrel
+        scenario:
+          - lifecycle
+          - RcppParallel 6.2.1
     defaults:
       run:
         shell: pwsh
 
     steps:
-      - uses: actions/checkout@v6
-
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: ${{ matrix.r }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download release binary
+        uses: actions/download-artifact@v7
+        with:
+          name: rpx-windows-latest
+          path: ${{ runner.temp }}/rpx-bin
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Activate release binary
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = Join-Path $env:RUNNER_TEMP "rpx-bin"
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Build release binary
+      - name: Run lifecycle scenario
+        if: matrix.scenario == 'lifecycle'
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --release --locked
-          Join-Path $env:GITHUB_WORKSPACE "target/release" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Initialize and sync a project
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          $project = Join-Path $env:RUNNER_TEMP "rpx-e2e"
+          $project = Join-Path $env:RUNNER_TEMP "rpx-e2e-lifecycle"
 
           rpx init $project --name rpxe2e
           Set-Location $project
@@ -124,24 +170,27 @@ jobs:
           rpx sync
           rpx run Rscript --vanilla -e 'library("rpxe2e", lib.loc = .libPaths()[1L])'
 
-      - name: Add and use packages
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          Set-Location (Join-Path $env:RUNNER_TEMP "rpx-e2e")
-
           rpx add R6
           rpx add digest
           rpx status
           rpx run Rscript --vanilla -e 'library("R6", lib.loc = .libPaths()[1L]); library("digest", lib.loc = .libPaths()[1L]); stopifnot(nzchar(digest("rpx")))'
 
-      - name: Remove packages
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          Set-Location (Join-Path $env:RUNNER_TEMP "rpx-e2e")
-
           rpx remove R6
           rpx run Rscript --vanilla -e 'packages <- rownames(installed.packages(lib.loc = .libPaths()[1L], noCache = TRUE)); stopifnot(!("R6" %in% packages), "digest" %in% packages)'
           rpx remove digest
           rpx status
+
+      - name: Run RcppParallel scenario
+        if: matrix.scenario == 'RcppParallel 6.2.1'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $project = Join-Path $env:RUNNER_TEMP "rpx-e2e-rcppparallel"
+
+          rpx init $project --name rpxrcppparallel
+          Set-Location $project
+          rpx add 'RcppParallel@==6.2.1'
+          rpx clean
+          rpx sync
+          rpx status
+          rpx run Rscript --vanilla -e 'library("RcppParallel", lib.loc = .libPaths()[1L]); stopifnot(as.character(packageVersion("RcppParallel", lib.loc = .libPaths()[1L])) == "6.2.1")'
