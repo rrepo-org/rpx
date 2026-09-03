@@ -351,7 +351,7 @@ impl dyn PackageRepository {
     }
 }
 
-fn is_commit_reference(reference: &str, commit: git2::Oid) -> bool {
+fn is_commit_reference(reference: &str, commit: crate::git::GitOid) -> bool {
     (4..=40).contains(&reference.len())
         && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
         && commit.to_string().starts_with(reference)

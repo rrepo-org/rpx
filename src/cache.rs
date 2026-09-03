@@ -1,5 +1,7 @@
-use crate::{git::GitUrl, project::cache_dir_path};
-use git2::Oid;
+use crate::{
+    git::{GitOid, GitUrl},
+    project::cache_dir_path,
+};
 use r_metadata::Version;
 use semver::Version as RVersion;
 use std::{
@@ -25,7 +27,7 @@ pub(crate) enum SourceArtifactIdentity {
     Registry(RegistryIdentity),
     Git {
         remote: GitUrl,
-        commit: Oid,
+        commit: GitOid,
         subdirectory: Option<PathBuf>,
     },
     Local(PathBuf),

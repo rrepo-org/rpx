@@ -1,3 +1,4 @@
+use crate::git::GitOid;
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,8 +45,7 @@ pub enum Repository {
         #[serde(with = "repository_url")]
         url: url::Url,
         reference: GitReference,
-        #[serde(with = "git_oid")]
-        commit: git2::Oid,
+        commit: GitOid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subdirectory: Option<relative_path::RelativePathBuf>,
     },
@@ -125,26 +125,6 @@ mod repository_url {
     {
         let value = String::deserialize(deserializer)?;
         parse_repository_url(&value).map_err(D::Error::custom)
-    }
-}
-
-mod git_oid {
-    use git2::Oid;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S>(oid: &Oid, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.collect_str(oid)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Oid, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(D::Error::custom)
     }
 }
 
@@ -265,7 +245,7 @@ mod tests {
         );
     }
 
-    fn oid(value: &str) -> git2::Oid {
+    fn oid(value: &str) -> GitOid {
         value.parse().expect("OID should parse")
     }
 
