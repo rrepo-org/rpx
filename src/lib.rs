@@ -84,7 +84,7 @@ fn init_tracing() {
 mod tests {
     use crate::project::RequiredPackages;
     use crate::{
-        git::GitError,
+        git::{GitError, GitProcessError},
         project::{LockfileBuildError, ResolveProjectError, lockfile_from_resolution},
         r::BasePackagesError,
         repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository},
@@ -130,7 +130,12 @@ mod tests {
             repository: remote.to_string(),
             source: Arc::new(GitError::Access {
                 remote: remote.to_string(),
-                source: git2::Error::from_str("access denied"),
+                source: Box::new(GitProcessError {
+                    operation: "access test Git repository",
+                    exit_code: Some(128),
+                    stdout: String::new(),
+                    stderr: "access denied".to_string(),
+                }),
             }),
         }
     }

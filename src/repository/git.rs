@@ -1,11 +1,10 @@
 use super::{PackageRepository, RepositoryError};
 use crate::{
     description::description_identity,
-    git::{self, GitUrl},
+    git::{self, GitOid, GitUrl},
     resolver::PackageVersion,
 };
 use async_trait::async_trait;
-use git2::Oid;
 use moka::future::Cache;
 use r_description::Description;
 use r_metadata::{Remote, RemoteSource, Version};
@@ -24,8 +23,8 @@ pub struct GitRepository {
     remote: GitUrl,
     reference: Option<String>,
     subdirectory: Option<PathBuf>,
-    commit: Arc<OnceCell<Oid>>,
-    descriptions: Cache<Oid, Arc<Description>>,
+    commit: Arc<OnceCell<GitOid>>,
+    descriptions: Cache<GitOid, Arc<Description>>,
 }
 
 impl GitRepository {
@@ -50,17 +49,17 @@ impl GitRepository {
         })
     }
 
-    pub fn with_commit(mut self, commit: Oid) -> Self {
+    pub(crate) fn with_commit(mut self, commit: GitOid) -> Self {
         self.commit = Arc::new(OnceCell::new_with(Some(commit)));
         self
     }
 
     #[cfg(test)]
-    fn set_commit(&self, commit: Oid) -> Result<(), SetError<Oid>> {
+    fn set_commit(&self, commit: GitOid) -> Result<(), SetError<GitOid>> {
         self.commit.set(commit)
     }
 
-    pub async fn commit(&self) -> Result<Oid, RepositoryError> {
+    pub(crate) async fn commit(&self) -> Result<GitOid, RepositoryError> {
         self.commit
             .get_or_try_init(|| async {
                 git::resolve(&self.remote, self.reference.as_deref())
@@ -256,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn converts_to_a_pinned_lockfile_repository() {
         let commit = "1111111111111111111111111111111111111111"
-            .parse::<Oid>()
+            .parse::<GitOid>()
             .expect("commit should parse");
         let remote = "github::owner/repository/subdir@main"
             .parse::<Remote>()

@@ -68,7 +68,7 @@ the selected field.
 
 ## Install
 
-`rpx` requires R to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` works in your shell.
+`rpx` requires R and Git to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` and `git` work in your shell.
 
 Install R:
 

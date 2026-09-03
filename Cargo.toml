@@ -18,7 +18,6 @@ directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
 futures-util = "0.3"
-git2 = { version = "0.21", features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
 http = "1"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }

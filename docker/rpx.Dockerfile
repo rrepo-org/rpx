@@ -11,7 +11,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --link --from=builder /app/target/release/rpx /usr/local/bin/rpx
