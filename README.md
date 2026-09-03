@@ -144,10 +144,18 @@ library before completing.
 For an R package project that already has a `DESCRIPTION` file, create the lockfile and install the locked package set:
 
 ```bash
+rpx audit --add --prune
 rpx lock
 rpx sync
 rpx run R
 ```
+
+`rpx audit` scans `.R` files under `R/` for `library()` calls and `::` or `:::`
+usage. It also reads imports from the required `NAMESPACE` file, reports
+differences from `DESCRIPTION`, and can reconcile them with `--add` and
+`--prune`. Audit updates `DESCRIPTION` and `rpx.lock` but does not install
+packages. Run it without flags for an interactive review in a terminal or a
+read-only check in CI.
 
 By default, `rpx add`, `rpx remove`, and `rpx sync` also install the current
 project package. Use `--no-install-project` to synchronize its dependencies
@@ -268,6 +276,7 @@ The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overvie
 - `DESCRIPTION` is the dependency declaration and compatibility contract.
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
 - `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
+- `rpx audit` discovers dependencies used by package source and can reconcile `DESCRIPTION` and `rpx.lock` without installing packages.
 - `rpx` prefers existing locked versions when they are still available from enabled repositories.
 - `rpx sync` installs the packages in `rpx.lock` and installable current projects into the project library by default.
 - `--no-install-project` is available on `rpx add`, `rpx remove`, and `rpx sync` for dependency-only synchronization.
