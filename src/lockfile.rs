@@ -1,3 +1,4 @@
+use crate::git::GitOid;
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,7 +25,7 @@ pub struct Lockfile {
     pub r: semver::Version,
     pub repos: Vec<Repository>,
     #[serde(with = "relation_set")]
-    pub requirements: BTreeSet<r_description::Relation>,
+    pub requirements: BTreeSet<r_metadata::Relation>,
     pub packages: BTreeMap<String, Package>,
 }
 
@@ -44,8 +45,7 @@ pub enum Repository {
         #[serde(with = "repository_url")]
         url: url::Url,
         reference: GitReference,
-        #[serde(with = "git_oid")]
-        commit: git2::Oid,
+        commit: GitOid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subdirectory: Option<relative_path::RelativePathBuf>,
     },
@@ -77,15 +77,15 @@ pub enum GitReference {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Package {
     #[serde(with = "package_version")]
-    pub version: r_description::Version,
+    pub version: r_metadata::Version,
     #[serde(with = "repository_url")]
     pub repository: url::Url,
     #[serde(with = "relation_set")]
-    pub dependencies: BTreeSet<r_description::Relation>,
+    pub dependencies: BTreeSet<r_metadata::Relation>,
 }
 
 mod relation_set {
-    use r_description::Relation;
+    use r_metadata::Relation;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
     use std::collections::BTreeSet;
 
@@ -128,28 +128,8 @@ mod repository_url {
     }
 }
 
-mod git_oid {
-    use git2::Oid;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S>(oid: &Oid, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.collect_str(oid)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Oid, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(D::Error::custom)
-    }
-}
-
 mod package_version {
-    use r_description::Version;
+    use r_metadata::Version;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S>(version: &Version, serializer: S) -> Result<S::Ok, S::Error>
@@ -265,7 +245,7 @@ mod tests {
         );
     }
 
-    fn oid(value: &str) -> git2::Oid {
+    fn oid(value: &str) -> GitOid {
         value.parse().expect("OID should parse")
     }
 
@@ -273,11 +253,11 @@ mod tests {
         value.parse().expect("URL should parse")
     }
 
-    fn relation(value: &str) -> r_description::Relation {
+    fn relation(value: &str) -> r_metadata::Relation {
         value.parse().expect("relation should parse")
     }
 
-    fn package_version(value: &str) -> r_description::Version {
+    fn package_version(value: &str) -> r_metadata::Version {
         value.parse().expect("package version should parse")
     }
 
@@ -367,9 +347,9 @@ mod tests {
                         "version": "6.2.3",
                         "repository": "https://api.rrepo.org/cran",
                         "dependencies": [
-                            "R (>= 4.1.0)",
                             "jsonlite (>= 1.8.0)",
-                            "methods"
+                            "methods",
+                            "R (>= 4.1.0)"
                         ]
                     }
                 }

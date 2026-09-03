@@ -71,7 +71,7 @@ pub(crate) async fn run() -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::{repository::built_in_repository, resolver::PackageVersion};
-    use r_description::Version;
+    use r_metadata::Version;
 
     fn version(value: &str) -> Version {
         value.parse().expect("version should parse")

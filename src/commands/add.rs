@@ -1,6 +1,9 @@
 use crate::{
     cli::AddArgs,
-    description::{DescriptionParseError, add_dependencies},
+    description::{
+        DependencyMutationError, DescriptionNormalizationError, add_dependencies,
+        normalize_description,
+    },
     output::status,
     project::{
         ProjectLoadError, ProjectWriteError, ResolutionPolicy, ResolveProjectError, load_project,
@@ -9,7 +12,7 @@ use crate::{
     sync::{SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
-use r_description::{Relation, Version, VersionRequirement};
+use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -25,7 +28,11 @@ pub(crate) enum Error {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    DescriptionParse(#[from] DescriptionParseError),
+    DependencyMutation(#[from] DependencyMutationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -51,6 +58,7 @@ pub(crate) async fn run(args: AddArgs) -> Result<(), Error> {
         &added_relations,
         dependency_field,
     )?;
+    project.description = normalize_description(&project.root, &project.description)?;
 
     let mut resolution = resolve_project(&project, ResolutionPolicy::ReuseIfValid).await?;
 
@@ -169,6 +177,7 @@ fn parse_add_packages(packages: &[String]) -> Result<BTreeSet<Relation>, AddPack
                     details: source.to_string(),
                 })
             })?;
+            let version = RequirementVersion::Version(version);
             let requirement = match operator {
                 ">=" => VersionRequirement::GreaterThanEqual(version),
                 "<=" => VersionRequirement::LessThanEqual(version),

@@ -14,12 +14,10 @@ async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }
 bytes = "1"
 cliclack = "0.5.6"
-deb822-lossless = "0.5.18"
 directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
 futures-util = "0.3"
-git2 = { version = "0.21", features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
 http = "1"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
@@ -32,7 +30,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 reqwest-middleware = "0.5"
 reqwest-tracing = "0.7"
 rpassword = "7.3.1"
-r-description = { package = "r-description-scalerail", version = "0.7.0" }
+r-description = { package = "r-description-parser", version = "=0.2.0" }
+r-metadata = "=0.2.0"
+r-packages = { package = "r-packages-parser", version = "=0.2.0" }
 r-parser = { git = "https://github.com/rrepo-org/r-syntax-rs", branch = "main" }
 r-syntax = { git = "https://github.com/rrepo-org/r-syntax-rs", branch = "main" }
 serde = { version = "1.0", features = ["derive"] }

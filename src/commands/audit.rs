@@ -1,7 +1,8 @@
 use crate::{
     cli::AuditArgs,
     description::{
-        DependencyField, DescriptionParseError, add_dependencies, project_dependencies,
+        DependencyField, DependencyMutationError, DescriptionNormalizationError,
+        DescriptionParseError, add_dependencies, normalize_description, project_dependencies,
         remove_dependencies, root_package,
     },
     output::status,
@@ -11,7 +12,7 @@ use crate::{
     },
 };
 use miette::{Diagnostic, NamedSource, SourceSpan};
-use r_description::Relation;
+use r_metadata::Relation;
 use r_parser::{ParseStatus, ParserConfig, parse_source};
 use r_syntax::{
     Argument, CallExpr, DocumentId, Expr, NodeOrToken, RowanAstNode, SyntaxKind, SyntaxNode,
@@ -36,6 +37,14 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DependencyMutation(#[from] DependencyMutationError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    DescriptionNormalization(#[from] DescriptionNormalizationError),
 
     #[error("NAMESPACE is required at {}", path.display())]
     #[diagnostic(
@@ -159,16 +168,8 @@ pub(crate) async fn run(args: AuditArgs) -> Result<(), Error> {
         .collect::<BTreeSet<_>>();
     let imports = project
         .description
-        .imports()
-        .map_err(|source| {
-            DescriptionParseError::new(
-                project.root.join("DESCRIPTION").display().to_string(),
-                project.description.to_string(),
-                vec![crate::description::DescriptionParseIssue::unpositioned(
-                    source,
-                )],
-            )
-        })?
+        .imports_parsed()
+        .values()
         .map(|relation| relation.package().to_string())
         .collect::<BTreeSet<_>>();
 
@@ -256,6 +257,7 @@ async fn apply_changes(
         DependencyField::Imports,
     )?;
     remove_dependencies(&project.root, &mut project.description, removed_packages)?;
+    project.description = normalize_description(&project.root, &project.description)?;
 
     let mut resolution = resolve_project(project, ResolutionPolicy::ReuseIfValid).await?;
     pin_unconstrained_dependencies(

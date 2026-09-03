@@ -6,7 +6,7 @@ use std::{
 };
 
 use miette::Diagnostic;
-use r_description::Version;
+use r_metadata::Version;
 use thiserror::Error;
 use tokio::{process::Command, sync::OnceCell};
 

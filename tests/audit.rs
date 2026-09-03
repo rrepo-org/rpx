@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use r_description::RDescription;
+use r_description::Description;
 use serde_json::Value;
 
 fn write_r_source(
@@ -64,10 +64,10 @@ fn adds_and_prunes_without_installing_packages() {
     assert!(stdout.contains("Removed jsonlite"));
 
     let description =
-        RDescription::parse(&read_project_file(&container, project_path, "DESCRIPTION"));
+        Description::parse(&read_project_file(&container, project_path, "DESCRIPTION"));
     let imports = description
-        .imports()
-        .expect("Imports should parse")
+        .imports_parsed()
+        .values()
         .map(|relation| relation.package().to_string())
         .collect::<Vec<_>>();
     assert_eq!(imports.len(), 2);

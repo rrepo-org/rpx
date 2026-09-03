@@ -1,15 +1,13 @@
 use crate::project::cache_dir_path;
-use git2::{
-    AutotagOption, Config, Cred, CredentialType, Direction, ErrorClass, ErrorCode, FetchOptions,
-    Odb, Oid, ProxyOptions, Reference, RemoteCallbacks, RemoteRedirect, Repository,
-    build::CheckoutBuilder,
-};
-use r_description::{HostedGitRemote, Remote, RemoteSource};
+use r_metadata::{HostedGitRemote, Remote, RemoteSource};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{self, Write as _},
     fs,
     path::{Path, PathBuf},
+    process::{Command, Output},
+    str::FromStr,
     sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +20,69 @@ const FETCHED_COMMIT_REF: &str = "refs/rpx/commit";
 
 static GIT_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
+const GIT_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+];
+
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct GitOid([u8; 40]);
+
+impl fmt::Display for GitOid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(std::str::from_utf8(&self.0).expect("Git OID is ASCII"))
+    }
+}
+
+impl fmt::Debug for GitOid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl FromStr for GitOid {
+    type Err = GitOidParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(GitOidParseError);
+        }
+        let mut bytes = [0; 40];
+        for (destination, source) in bytes.iter_mut().zip(value.bytes()) {
+            *destination = source.to_ascii_lowercase();
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for GitOid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitOid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid Git object ID; expected exactly 40 hexadecimal characters")]
+pub(crate) struct GitOidParseError;
+
 #[derive(Debug, Default)]
 pub(crate) struct Identity {
     pub(crate) name: Option<String>,
@@ -29,18 +90,9 @@ pub(crate) struct Identity {
 }
 
 pub(crate) fn configured_identity(path: &Path) -> Result<Identity, GitError> {
-    let config = match Repository::discover(path) {
-        Ok(repository) => repository
-            .config()
-            .map_err(|source| operation("read Git repository configuration", source))?,
-        Err(source) if source.code() == ErrorCode::NotFound => Config::open_default()
-            .map_err(|source| operation("read default Git configuration", source))?,
-        Err(source) => return Err(operation("discover Git repository", source)),
-    };
-
     Ok(Identity {
-        name: config_value(&config, "user.name")?,
-        email: config_value(&config, "user.email")?,
+        name: config_value(path, "user.name")?,
+        email: config_value(path, "user.email")?,
     })
 }
 
@@ -66,25 +118,39 @@ pub(crate) fn is_inside_worktree(path: &Path) -> Result<bool, GitError> {
         return Ok(false);
     };
 
-    match Repository::discover(existing_ancestor) {
-        Ok(repository) => Ok(repository.workdir().is_some()),
-        Err(source) if source.code() == ErrorCode::NotFound => Ok(false),
-        Err(source) => Err(operation("discover Git repository", source)),
-    }
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(existing_ancestor)
+        .args(["rev-parse", "--is-inside-work-tree"]);
+    let output = command_output(command)?;
+    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
 
 pub(crate) fn initialize_repository(path: &Path) -> Result<(), GitError> {
-    Repository::init(path)
-        .map(|_| ())
-        .map_err(|source| operation("initialize Git repository", source))
+    let mut command = git_command();
+    command.arg("init").arg(path);
+    run(command, "initialize Git repository").map(|_| ())
 }
 
-fn config_value(config: &Config, key: &str) -> Result<Option<String>, GitError> {
-    match config.get_string(key) {
-        Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
-        Err(source) if source.code() == ErrorCode::NotFound => Ok(None),
-        Err(source) => Err(operation("read Git identity configuration", source)),
+fn config_value(path: &Path, key: &str) -> Result<Option<String>, GitError> {
+    let existing_ancestor = path.ancestors().find(|path| path.is_dir());
+    let mut command = git_command();
+    if let Some(path) = existing_ancestor {
+        command.arg("-C").arg(path);
     }
+    command.args(["config", "--get", key]);
+    let output = command_output(command)?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(Box::new(process_error("read Git identity configuration", &output)).into());
+    }
+    Ok(
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty()),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,10 +159,6 @@ pub(crate) struct GitUrl(String);
 impl GitUrl {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
-    }
-
-    fn is_ssh(&self) -> bool {
-        self.0.starts_with("ssh://") || !self.0.contains("://")
     }
 
     fn from_hosted(
@@ -229,7 +291,7 @@ impl fmt::Display for GitUrl {
 }
 
 #[derive(Debug, Error)]
-pub enum GitError {
+pub(crate) enum GitError {
     #[error("unsupported Remotes source; expected GitHub, GitLab, Bitbucket, or generic git")]
     UnsupportedRemote,
 
@@ -261,21 +323,23 @@ pub enum GitError {
     MissingDefaultBranch,
 
     #[error("Git commit {commit} is not available from {remote}")]
-    CommitUnavailable { remote: String, commit: Oid },
+    CommitUnavailable { remote: String, commit: GitOid },
 
     #[error("could not access Git repository {remote}")]
     Access {
         remote: String,
         #[source]
-        source: git2::Error,
+        source: Box<GitProcessError>,
     },
 
-    #[error("failed to {operation}: {source}")]
-    Operation {
-        operation: &'static str,
-        #[source]
-        source: git2::Error,
-    },
+    #[error("Git executable not found; ensure Git is installed and available on PATH")]
+    GitNotFound,
+
+    #[error("failed to invoke Git: {0}")]
+    Invocation(#[source] std::io::Error),
+
+    #[error(transparent)]
+    Process(#[from] Box<GitProcessError>),
 
     #[error("failed to {operation} {}: {source}", path.display())]
     FileSystem {
@@ -285,9 +349,6 @@ pub enum GitError {
         source: std::io::Error,
     },
 
-    #[error("Git cache path is not valid UTF-8: {}", path.display())]
-    InvalidCachePath { path: PathBuf },
-
     #[error("Git service is unavailable")]
     Unavailable,
 
@@ -295,7 +356,16 @@ pub enum GitError {
     Join(#[source] tokio::task::JoinError),
 }
 
-pub(crate) async fn resolve(remote: &GitUrl, reference: Option<&str>) -> Result<Oid, GitError> {
+#[derive(Debug, Error)]
+#[error("failed to {operation} (exit code {exit_code:?})\nstdout:\n{stdout}\nstderr:\n{stderr}")]
+pub(crate) struct GitProcessError {
+    pub(crate) operation: &'static str,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+pub(crate) async fn resolve(remote: &GitUrl, reference: Option<&str>) -> Result<GitOid, GitError> {
     if let Some(oid) = requested_oid(reference)? {
         return Ok(oid);
     }
@@ -309,14 +379,7 @@ pub(crate) async fn resolve(remote: &GitUrl, reference: Option<&str>) -> Result<
 
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let odb =
-            Odb::new().map_err(|source| operation("create in-memory Git database", source))?;
-        let repository = Repository::from_odb(odb)
-            .map_err(|source| operation("create in-memory Git repository", source))?;
-        let mut git_remote = repository
-            .remote_anonymous(remote.as_str())
-            .map_err(|source| operation("open Git remote", source))?;
-        let advertised = advertised_references(&mut git_remote, &remote)?;
+        let advertised = advertised_references(&remote)?;
         select_reference(reference.as_deref(), &advertised).map(|selected| selected.commit)
     })
     .await
@@ -326,7 +389,7 @@ pub(crate) async fn resolve(remote: &GitUrl, reference: Option<&str>) -> Result<
 pub(crate) async fn checkout(
     remote: &GitUrl,
     reference: Option<&str>,
-    commit: Oid,
+    commit: GitOid,
 ) -> Result<PathBuf, GitError> {
     let remote = remote.clone();
     let reference = reference.map(str::to_owned);
@@ -352,14 +415,14 @@ pub(crate) async fn checkout(
     .map_err(GitError::Join)?
 }
 
-pub(crate) fn checkout_path(remote: &GitUrl, commit: Oid) -> PathBuf {
+pub(crate) fn checkout_path(remote: &GitUrl, commit: GitOid) -> PathBuf {
     GitCachePaths::new(remote, commit).checkout
 }
 
 fn checkout_blocking(
     remote: &GitUrl,
     reference: Option<&str>,
-    commit: Oid,
+    commit: GitOid,
     span: &tracing::Span,
 ) -> Result<PathBuf, GitError> {
     let paths = GitCachePaths::new(remote, commit);
@@ -369,8 +432,8 @@ fn checkout_blocking(
 
     create_dir_all(&paths.db_parent)?;
     create_dir_all(&paths.checkout_parent)?;
-    let database = open_or_initialize_bare(&paths.database)?;
-    ensure_commit(&database, remote, reference, commit, span)?;
+    open_or_initialize_bare(&paths.database)?;
+    ensure_commit(&paths.database, remote, reference, commit, span)?;
 
     if valid_checkout(&paths.checkout, commit) {
         return Ok(paths.checkout);
@@ -387,13 +450,7 @@ fn checkout_blocking(
             source,
         })?;
     }
-    fs::create_dir(&staging).map_err(|source| GitError::FileSystem {
-        operation: "create Git staging directory",
-        path: staging.clone(),
-        source,
-    })?;
-
-    let result = populate_checkout(&database, commit, &staging);
+    let result = populate_checkout(&paths.database, commit, &staging);
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
@@ -416,42 +473,46 @@ fn checkout_blocking(
     }
 }
 
-fn open_or_initialize_bare(path: &Path) -> Result<Repository, GitError> {
+fn open_or_initialize_bare(path: &Path) -> Result<(), GitError> {
     if path.exists() {
-        return Repository::open_bare(path)
-            .map_err(|source| operation("open Git object database", source));
+        return validate_bare_repository(path);
     }
 
-    Repository::init_bare(path).or_else(|initialize_error| {
-        Repository::open_bare(path).map_err(|open_error| GitError::Operation {
-            operation: "initialize Git object database",
-            source: if path.exists() {
-                open_error
-            } else {
-                initialize_error
-            },
-        })
-    })
+    let mut command = git_command();
+    command.args(["init", "--bare"]).arg(path);
+    match run(command, "initialize Git object database") {
+        Ok(_) => Ok(()),
+        Err(error) if path.exists() => validate_bare_repository(path).map_err(|_| error),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_bare_repository(path: &Path) -> Result<(), GitError> {
+    let mut command = git_in(path);
+    command.args(["rev-parse", "--is-bare-repository"]);
+    let output = run(command, "open Git object database")?;
+    if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+        Ok(())
+    } else {
+        Err(Box::new(process_error("open Git object database", &output)).into())
+    }
 }
 
 fn ensure_commit(
-    database: &Repository,
+    database: &Path,
     remote: &GitUrl,
     reference: Option<&str>,
-    commit: Oid,
+    commit: GitOid,
     span: &tracing::Span,
 ) -> Result<(), GitError> {
-    if database.find_commit(commit).is_ok() {
+    if commit_exists(database, commit)? {
         return Ok(());
     }
 
     let selected_source = if requested_oid(reference)?.is_some() {
         None
     } else {
-        let mut git_remote = database
-            .remote_anonymous(remote.as_str())
-            .map_err(|source| operation("open Git remote", source))?;
-        advertised_references(&mut git_remote, remote)
+        advertised_references(remote)
             .and_then(|advertised| select_reference(reference, &advertised))
             .ok()
             .and_then(|selected| selected.source)
@@ -460,14 +521,14 @@ fn ensure_commit(
     if let Some(source) = selected_source {
         let refspec = format!("+{source}:{FETCHED_REF}");
         let _ = fetch(database, remote, &[refspec], span);
-        if database.find_commit(commit).is_ok() {
+        if commit_exists(database, commit)? {
             return Ok(());
         }
     }
 
     let direct = format!("+{commit}:{FETCHED_COMMIT_REF}");
     let _ = fetch(database, remote, &[direct], span);
-    if database.find_commit(commit).is_ok() {
+    if commit_exists(database, commit)? {
         return Ok(());
     }
 
@@ -480,98 +541,74 @@ fn ensure_commit(
         ],
         span,
     )?;
-    database
-        .find_commit(commit)
-        .map(|_| ())
-        .map_err(|_| GitError::CommitUnavailable {
+    if commit_exists(database, commit)? {
+        Ok(())
+    } else {
+        Err(GitError::CommitUnavailable {
             remote: remote.to_string(),
             commit,
         })
+    }
 }
 
 fn fetch(
-    database: &Repository,
+    database: &Path,
     remote: &GitUrl,
     refspecs: &[String],
-    span: &tracing::Span,
+    _span: &tracing::Span,
 ) -> Result<(), GitError> {
-    let mut git_remote = database
-        .remote_anonymous(remote.as_str())
-        .map_err(|source| operation("open Git remote", source))?;
-    let config = Config::open_default()
-        .map_err(|source| operation("read Git credential configuration", source))?;
-    let callbacks = remote_callbacks(&config, remote, Some(span.clone()));
-    let mut proxy = ProxyOptions::new();
-    proxy.auto();
-    let mut options = FetchOptions::new();
-    options
-        .remote_callbacks(callbacks)
-        .proxy_options(proxy)
-        .follow_redirects(RemoteRedirect::None)
-        .download_tags(AutotagOption::None)
-        .update_fetchhead(false);
-    git_remote
-        .fetch(refspecs, Some(&mut options), Some("rpx source fetch"))
-        .map_err(|source| remote_operation("fetch Git source", remote, source))
+    let mut command = remote_git_in(database);
+    command
+        .args(["fetch", "--no-tags", "--no-write-fetch-head"])
+        .arg(remote.as_str())
+        .args(refspecs);
+    remote_run(command, "fetch Git source", remote).map(|_| ())
 }
 
-fn populate_checkout(
-    database: &Repository,
-    commit: Oid,
-    destination: &Path,
-) -> Result<(), GitError> {
-    let repository = Repository::init(destination)
-        .map_err(|source| operation("initialize Git checkout", source))?;
-    let database_path = database
-        .path()
-        .to_str()
-        .ok_or_else(|| GitError::InvalidCachePath {
-            path: database.path().to_path_buf(),
-        })?;
-    let mut local = repository
-        .remote_anonymous(database_path)
-        .map_err(|source| operation("open local Git object database", source))?;
-    let refspec = format!("+{commit}:{FETCHED_REF}");
-    let mut options = FetchOptions::new();
-    options
-        .download_tags(AutotagOption::None)
-        .update_fetchhead(false);
-    local
-        .fetch(&[refspec], Some(&mut options), Some("rpx local checkout"))
-        .map_err(|source| operation("populate Git checkout", source))?;
-    drop(local);
+fn populate_checkout(database: &Path, commit: GitOid, destination: &Path) -> Result<(), GitError> {
+    let clone = |no_hardlinks: bool| {
+        let mut command = git_command();
+        command.env("GIT_LFS_SKIP_SMUDGE", "1");
+        command.args(["clone", "--local", "--no-checkout"]);
+        if no_hardlinks {
+            command.arg("--no-hardlinks");
+        }
+        command.arg(database).arg(destination);
+        run(command, "populate Git checkout")
+    };
+    if clone(false).is_err() {
+        remove_dir_all_if_exists(destination, "clean failed Git checkout")?;
+        clone(true)?;
+    }
 
-    let commit = repository
-        .find_commit(commit)
-        .map_err(|source| operation("read checked out Git commit", source))?;
-    let commit_id = commit.id();
-    let mut checkout = CheckoutBuilder::new();
-    checkout.safe().disable_filters(true);
-    repository
-        .checkout_tree(commit.as_object(), Some(&mut checkout))
-        .map_err(|source| operation("check out Git source", source))?;
-    repository
-        .set_head_detached(commit_id)
-        .map_err(|source| operation("detach Git checkout", source))
+    let mut detach = git_in(destination);
+    detach.env("GIT_LFS_SKIP_SMUDGE", "1").args([
+        "update-ref",
+        "--no-deref",
+        "HEAD",
+        &commit.to_string(),
+    ]);
+    run(detach, "detach Git checkout")?;
+    let mut reset = git_in(destination);
+    reset
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .args(["reset", "--hard", &commit.to_string()]);
+    run(reset, "check out Git source").map(|_| ())
 }
 
-fn valid_checkout(path: &Path, commit: Oid) -> bool {
-    let Ok(repository) = Repository::open(path) else {
+fn valid_checkout(path: &Path, commit: GitOid) -> bool {
+    let mut head = git_in(path);
+    head.args(["rev-parse", "HEAD"]);
+    let Ok(output) = run(head, "validate Git checkout") else {
         return false;
     };
-    let correct_head = repository
-        .head()
-        .and_then(|head| head.peel_to_commit())
-        .is_ok_and(|head| head.id() == commit);
-    if !correct_head {
+    if String::from_utf8_lossy(&output.stdout).trim() != commit.to_string() {
         return false;
     }
 
-    let mut options = git2::StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true);
-    repository
-        .statuses(Some(&mut options))
-        .is_ok_and(|statuses| statuses.is_empty())
+    let mut status = git_in(path);
+    status.args(["status", "--porcelain", "--untracked-files=all"]);
+    run(status, "validate Git checkout").is_ok_and(|output| output.stdout.is_empty())
 }
 
 #[derive(Debug)]
@@ -583,7 +620,7 @@ struct GitCachePaths {
 }
 
 impl GitCachePaths {
-    fn new(remote: &GitUrl, commit: Oid) -> Self {
+    fn new(remote: &GitUrl, commit: GitOid) -> Self {
         let root = cache_dir_path().join("git");
         let key = remote_key(remote);
         let db_parent = root.join("db");
@@ -667,39 +704,40 @@ fn remove_dir_all_if_exists(path: &Path, operation: &'static str) -> Result<(), 
 
 #[derive(Debug)]
 struct AdvertisedReferences {
-    refs: Vec<(String, Oid)>,
+    refs: Vec<(String, GitOid)>,
     default_branch: Option<String>,
 }
 
 #[derive(Debug)]
 struct SelectedReference {
     source: Option<String>,
-    commit: Oid,
+    commit: GitOid,
 }
 
-fn advertised_references(
-    remote: &mut git2::Remote<'_>,
-    remote_url: &GitUrl,
-) -> Result<AdvertisedReferences, GitError> {
-    let config = Config::open_default()
-        .map_err(|source| operation("read Git credential configuration", source))?;
-    let callbacks = remote_callbacks(&config, remote_url, None);
-    let mut proxy = ProxyOptions::new();
-    proxy.auto();
-    let connection = remote
-        .connect_auth(Direction::Fetch, Some(callbacks), Some(proxy))
-        .map_err(|source| remote_operation("connect to Git remote", remote_url, source))?;
-    let refs = connection
-        .list()
-        .map_err(|source| operation("list Git references", source))?
-        .iter()
-        .map(|head| (head.name().to_string(), head.oid()))
-        .collect();
-    let default_branch = connection
-        .default_branch()
-        .ok()
-        .and_then(|branch| std::str::from_utf8(branch.as_ref()).ok().map(str::to_owned));
-
+fn advertised_references(remote: &GitUrl) -> Result<AdvertisedReferences, GitError> {
+    let mut command = remote_git_command();
+    command.args(["ls-remote", "--symref", remote.as_str()]);
+    let output = remote_run(command, "list Git references", remote)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut refs = Vec::new();
+    let mut default_branch = None;
+    for line in stdout.lines() {
+        let Some((value, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name == "HEAD"
+            && let Some(branch) = value.strip_prefix("ref: ")
+        {
+            default_branch = Some(branch.to_string());
+            continue;
+        }
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(GitError::UnsupportedObjectFormat);
+        }
+        if let Ok(oid) = value.parse() {
+            refs.push((name.to_string(), oid));
+        }
+    }
     Ok(AdvertisedReferences {
         refs,
         default_branch,
@@ -724,7 +762,7 @@ fn select_reference(
             .clone()
             .ok_or(GitError::MissingDefaultBranch)?,
         Some(value) if value.starts_with("refs/") => {
-            if !Reference::is_valid_name(value) {
+            if !valid_reference_name(value)? {
                 return Err(GitError::InvalidReference {
                     reference: value.to_string(),
                 });
@@ -734,7 +772,7 @@ fn select_reference(
         Some(value) => {
             let branch = format!("refs/heads/{value}");
             let tag = format!("refs/tags/{value}");
-            if !Reference::is_valid_name(&branch) || !Reference::is_valid_name(&tag) {
+            if !valid_reference_name(&branch)? || !valid_reference_name(&tag)? {
                 return Err(GitError::InvalidReference {
                     reference: value.to_string(),
                 });
@@ -777,7 +815,7 @@ fn select_reference(
     })
 }
 
-fn requested_oid(reference: Option<&str>) -> Result<Option<Oid>, GitError> {
+fn requested_oid(reference: Option<&str>) -> Result<Option<GitOid>, GitError> {
     let Some(value) = reference.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -785,7 +823,7 @@ fn requested_oid(reference: Option<&str>) -> Result<Option<Oid>, GitError> {
         return Err(GitError::UnsupportedObjectFormat);
     }
     if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Oid::from_str(value)
+        return GitOid::from_str(value)
             .map(Some)
             .map_err(|_| GitError::InvalidReference {
                 reference: value.to_string(),
@@ -794,100 +832,10 @@ fn requested_oid(reference: Option<&str>) -> Result<Option<Oid>, GitError> {
     Ok(None)
 }
 
-fn remote_callbacks<'a>(
-    config: &'a Config,
-    remote: &'a GitUrl,
-    progress_span: Option<tracing::Span>,
-) -> RemoteCallbacks<'a> {
-    let mut callbacks = RemoteCallbacks::new();
-    let expected_url = remote.as_str();
-    let mut helper_attempted = false;
-    let mut agent_attempted = false;
-    let mut username_attempted = false;
-    callbacks.credentials(move |callback_url, username, allowed| {
-        if !same_git_authority(expected_url, callback_url) {
-            return Err(git2::Error::from_str(
-                "Git remote requested credentials for an unexpected host",
-            ));
-        }
-        if !remote.is_ssh()
-            && allowed.contains(CredentialType::USER_PASS_PLAINTEXT)
-            && !helper_attempted
-        {
-            helper_attempted = true;
-            return Cred::credential_helper(config, callback_url, username).map_err(
-                |mut source| {
-                    source.set_code(ErrorCode::Auth);
-                    source.set_class(ErrorClass::Callback);
-                    source
-                },
-            );
-        }
-        if remote.is_ssh()
-            && allowed.contains(CredentialType::USERNAME)
-            && !username_attempted
-            && let Some(username) = username
-        {
-            username_attempted = true;
-            return Cred::username(username);
-        }
-        if remote.is_ssh()
-            && allowed.contains(CredentialType::SSH_KEY)
-            && !agent_attempted
-            && let Some(username) = username
-        {
-            agent_attempted = true;
-            return Cred::ssh_key_from_agent(username);
-        }
-
-        Err(git2::Error::new(
-            ErrorCode::Auth,
-            ErrorClass::Callback,
-            "Git credentials are unavailable",
-        ))
-    });
-    if let Some(span) = progress_span {
-        callbacks.transfer_progress(move |progress| {
-            let total = progress.total_objects() as u64;
-            let received = progress.received_objects() as u64;
-            if total > 0 {
-                span.pb_set_length(total);
-                span.pb_set_position(received);
-            }
-            true
-        });
-    }
-
-    callbacks
-}
-
-fn same_git_authority(expected: &str, actual: &str) -> bool {
-    git_authority(expected).is_some_and(|expected| {
-        git_authority(actual).is_some_and(|actual| expected.eq_ignore_ascii_case(&actual))
-    })
-}
-
-fn git_authority(value: &str) -> Option<String> {
-    if value.contains("://") {
-        let url = reqwest::Url::parse(value).ok()?;
-        let host = url.host_str()?;
-        let port = url.port().or_else(|| match url.scheme() {
-            "https" => Some(443),
-            "ssh" => Some(22),
-            _ => None,
-        });
-        return Some(match port {
-            Some(port) => format!("{}://{host}:{port}", url.scheme()),
-            None => format!("{}://{host}", url.scheme()),
-        });
-    }
-
-    let delimiter = scp_delimiter(value)?;
-    let authority = &value[..delimiter];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    Some(format!("ssh://{host}:22"))
+fn valid_reference_name(reference: &str) -> Result<bool, GitError> {
+    let mut command = git_command();
+    command.args(["check-ref-format", reference]);
+    Ok(command_output(command)?.status.success())
 }
 
 fn parse_scp_url(value: &str) -> Result<(), GitError> {
@@ -927,25 +875,87 @@ fn invalid_text(value: &str) -> bool {
         .any(|character| character.is_control() || character.is_whitespace())
 }
 
-fn operation(operation: &'static str, source: git2::Error) -> GitError {
-    GitError::Operation { operation, source }
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
+    for variable in GIT_ENVIRONMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    command
 }
 
-fn remote_operation(operation: &'static str, remote: &GitUrl, source: git2::Error) -> GitError {
-    if source.code() == ErrorCode::Auth {
-        GitError::Access {
-            remote: remote.to_string(),
-            source,
+fn git_in(path: &Path) -> Command {
+    let mut command = git_command();
+    command.arg("-C").arg(path);
+    command
+}
+
+fn remote_git_command() -> Command {
+    let mut command = git_command();
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn remote_git_in(path: &Path) -> Command {
+    let mut command = remote_git_command();
+    command.arg("-C").arg(path);
+    command
+}
+
+fn command_output(mut command: Command) -> Result<Output, GitError> {
+    command.output().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            GitError::GitNotFound
+        } else {
+            GitError::Invocation(source)
         }
-    } else {
-        GitError::Operation { operation, source }
+    })
+}
+
+fn process_error(operation: &'static str, output: &Output) -> GitProcessError {
+    GitProcessError {
+        operation,
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+fn run(command: Command, operation: &'static str) -> Result<Output, GitError> {
+    let output = command_output(command)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(Box::new(process_error(operation, &output)).into())
+    }
+}
+
+fn remote_run(
+    command: Command,
+    operation: &'static str,
+    remote: &GitUrl,
+) -> Result<Output, GitError> {
+    let output = command_output(command)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(GitError::Access {
+            remote: remote.to_string(),
+            source: Box::new(process_error(operation, &output)),
+        })
+    }
+}
+
+fn commit_exists(database: &Path, commit: GitOid) -> Result<bool, GitError> {
+    let mut command = git_in(database);
+    command.args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
+    Ok(command_output(command)?.status.success())
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use git2::{ObjectType, Signature};
 
     fn temporary_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -955,50 +965,36 @@ pub(crate) mod tests {
         std::env::temp_dir().join(format!("rpx-git-{name}-{}-{unique}", std::process::id()))
     }
 
-    pub(crate) fn commit_file(repository: &Repository, contents: &str, message: &str) -> Oid {
-        let workdir = repository
-            .workdir()
-            .expect("repository should have a worktree");
-        fs::write(workdir.join("DESCRIPTION"), contents).expect("file should be written");
-        let mut index = repository.index().expect("index should open");
-        index
-            .add_path(Path::new("DESCRIPTION"))
-            .expect("file should be added");
-        index.write().expect("index should be written");
-        let tree_id = index.write_tree().expect("tree should be written");
-        let tree = repository.find_tree(tree_id).expect("tree should exist");
-        let signature = Signature::now("rpx", "rpx@example.com").expect("signature should build");
-        let parents = repository
-            .head()
-            .ok()
-            .and_then(|head| head.peel_to_commit().ok())
-            .into_iter()
-            .collect::<Vec<_>>();
-        let parent_refs = parents.iter().collect::<Vec<_>>();
-
-        repository
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                message,
-                &tree,
-                &parent_refs,
-            )
-            .expect("commit should be created")
+    fn test_git(repository: &Path, args: &[&str]) -> Output {
+        let mut command = git_in(repository);
+        command.args(args);
+        run(command, "run test Git command").expect("Git command should succeed")
     }
 
-    pub(crate) fn source_repository(name: &str) -> (PathBuf, Repository, Oid) {
+    pub(crate) fn commit_file(repository: &Path, contents: &str, message: &str) -> GitOid {
+        fs::write(repository.join("DESCRIPTION"), contents).expect("file should be written");
+        test_git(repository, &["add", "DESCRIPTION"]);
+        test_git(repository, &["commit", "-m", message]);
+        String::from_utf8(test_git(repository, &["rev-parse", "HEAD"]).stdout)
+            .expect("commit should be UTF-8")
+            .trim()
+            .parse()
+            .expect("commit should parse")
+    }
+
+    pub(crate) fn source_repository(name: &str) -> (PathBuf, PathBuf, GitOid) {
         let path = temporary_path(name);
-        let repository = Repository::init(&path).expect("repository should initialize");
-        repository
-            .set_head("refs/heads/main")
-            .expect("default branch should be main");
-        let commit = commit_file(&repository, "Package: example\nVersion: 1.0.0\n", "initial");
+        let mut command = git_command();
+        command.args(["init", "--initial-branch=main"]).arg(&path);
+        run(command, "initialize test repository").expect("repository should initialize");
+        test_git(&path, &["config", "user.name", "rpx"]);
+        test_git(&path, &["config", "user.email", "rpx@example.com"]);
+        let commit = commit_file(&path, "Package: example\nVersion: 1.0.0\n", "initial");
+        let repository = path.clone();
         (path, repository, commit)
     }
 
-    fn remove_git_cache(remote: &GitUrl, commit: Oid) {
+    fn remove_git_cache(remote: &GitUrl, commit: GitOid) {
         let paths = GitCachePaths::new(remote, commit);
         let _ = fs::remove_dir_all(paths.database);
         let _ = fs::remove_dir_all(paths.checkout_parent);
@@ -1007,30 +1003,47 @@ pub(crate) mod tests {
     #[test]
     fn reads_optional_identity_config_values() {
         let path = temporary_path("identity-config");
-        fs::write(&path, "").expect("configuration file should be created");
-        let mut config = Config::open(&path).expect("configuration should initialize");
-        assert_eq!(config_value(&config, "user.name").unwrap(), None);
-
-        config
-            .set_str("user.name", "  Package Author  ")
-            .expect("identity should be configured");
+        let mut command = git_command();
+        command.arg("init").arg(&path);
+        run(command, "initialize test repository").expect("repository should initialize");
+        test_git(&path, &["config", "user.name", ""]);
+        assert_eq!(config_value(&path, "user.name").unwrap(), None);
+        test_git(&path, &["config", "user.name", "  Package Author  "]);
         assert_eq!(
-            config_value(&config, "user.name").unwrap().as_deref(),
+            config_value(&path, "user.name").unwrap().as_deref(),
             Some("Package Author")
         );
-        fs::remove_file(path).expect("configuration file should be removed");
+        fs::remove_dir_all(path).expect("repository should be removed");
     }
 
     #[test]
-    fn compares_scp_and_ssh_authorities() {
-        assert!(same_git_authority(
-            "git@example.com:team/repository.git",
-            "ssh://git@example.com/team/repository.git"
-        ));
-        assert!(!same_git_authority(
-            "git@example.com:team/repository.git",
-            "ssh://git@other.example.com/team/repository.git"
-        ));
+    fn git_oid_is_exact_hex_and_canonical_lowercase() {
+        let uppercase = "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD";
+        let oid = uppercase.parse::<GitOid>().expect("OID should parse");
+        assert_eq!(oid.to_string(), uppercase.to_ascii_lowercase());
+        assert_eq!(uppercase.parse::<GitOid>().unwrap(), oid);
+        assert!("abc".parse::<GitOid>().is_err());
+        assert!(
+            "gggggggggggggggggggggggggggggggggggggggg"
+                .parse::<GitOid>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_command_sanitizes_repository_environment() {
+        let command = git_command();
+        for variable in GIT_ENVIRONMENT_VARIABLES {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == variable && value.is_none())
+            );
+        }
+
+        assert!(remote_git_command().get_envs().any(|(name, value)| {
+            name == "GIT_TERMINAL_PROMPT" && value.is_some_and(|value| value == "0")
+        }));
     }
 
     #[test]
@@ -1196,34 +1209,19 @@ pub(crate) mod tests {
     async fn resolves_branches_tags_and_direct_commits() {
         let (source_path, source, initial) = source_repository("references");
         let remote = GitUrl::from_local_path(&source_path);
-        let signature = Signature::now("rpx", "rpx@example.com").expect("signature should build");
-        source
-            .branch(
-                "feature",
-                &source.find_commit(initial).expect("commit should exist"),
-                false,
-            )
-            .expect("branch should be created");
-        source
-            .tag_lightweight(
-                "v1",
-                &source
-                    .find_object(initial, Some(ObjectType::Commit))
-                    .expect("object should exist"),
-                false,
-            )
-            .expect("tag should be created");
-        source
-            .tag(
+        test_git(&source, &["branch", "feature", &initial.to_string()]);
+        test_git(&source, &["tag", "v1", &initial.to_string()]);
+        test_git(
+            &source,
+            &[
+                "tag",
+                "-a",
                 "v1-annotated",
-                &source
-                    .find_object(initial, Some(ObjectType::Commit))
-                    .expect("object should exist"),
-                &signature,
+                "-m",
                 "annotated release",
-                false,
-            )
-            .expect("annotated tag should be created");
+                &initial.to_string(),
+            ],
+        );
 
         for reference in [
             "feature".to_string(),
