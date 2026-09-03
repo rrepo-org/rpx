@@ -191,12 +191,6 @@ fn project_r_command(program: impl AsRef<OsStr>, project_library: &Path) -> Comm
     command
 }
 
-fn rscript_query() -> Command {
-    let mut command = Command::new("Rscript");
-    command.arg("--vanilla");
-    command
-}
-
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
 
@@ -403,8 +397,12 @@ pub async fn installed_packages(
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let mut command = rscript_query();
-    command.arg("-e").arg(expression).arg(project_library);
+    let mut command = Command::new("Rscript");
+    command
+        .arg("--vanilla")
+        .arg("-e")
+        .arg(expression)
+        .arg(project_library);
     let output = run_subprocess(command)
         .await
         .map_err(|source| InstalledPackagesError::Command { source })?;
@@ -558,8 +556,9 @@ async fn run_subprocess(mut command: Command) -> Result<Output, RSubprocessError
 }
 
 async fn fetch_base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
-    let mut command = rscript_query();
+    let mut command = Command::new("Rscript");
     command
+        .arg("--vanilla")
         .arg("-e")
         .arg("writeLines(rownames(utils::installed.packages(priority = 'base')))");
     let output = run_subprocess(command)
