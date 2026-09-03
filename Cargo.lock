@@ -681,7 +681,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31505d7661ac33d7848f1fb6ba82bd269b853d01fb44a1bfd9451ffad10c0005"
 dependencies = [
  "regex",
- "rowan",
+ "rowan 0.16.1",
  "serde",
 ]
 
@@ -1666,6 +1666,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2210,7 +2219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f006966a03fb5d072d8bf4355aa28349624047b6520e8172c4dc553a8a0c233"
 dependencies = [
  "deb822-lossless",
- "rowan",
+ "rowan 0.16.1",
  "thiserror",
  "url",
 ]
@@ -2226,6 +2235,40 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "r-lexer"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-syntax-rs?branch=main#d02e47f442bdfde72144d72a03d2dd696ffe072c"
+dependencies = [
+ "r-source",
+ "r-syntax",
+]
+
+[[package]]
+name = "r-parser"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-syntax-rs?branch=main#d02e47f442bdfde72144d72a03d2dd696ffe072c"
+dependencies = [
+ "r-lexer",
+ "r-source",
+ "r-syntax",
+ "rowan 0.17.0",
+]
+
+[[package]]
+name = "r-source"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-syntax-rs?branch=main#d02e47f442bdfde72144d72a03d2dd696ffe072c"
+
+[[package]]
+name = "r-syntax"
+version = "0.1.0"
+source = "git+https://github.com/rrepo-org/r-syntax-rs?branch=main#d02e47f442bdfde72144d72a03d2dd696ffe072c"
+dependencies = [
+ "r-source",
+ "rowan 0.17.0",
+]
 
 [[package]]
 name = "rand"
@@ -2458,6 +2501,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowan"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b574c58582fa59fa43a2feb6608b8744184659f08a2e0117e4b8224d95ed61"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "memoffset",
+ "rustc-hash 1.1.0",
+ "text-size",
+]
+
+[[package]]
 name = "rpassword"
 version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2492,6 +2548,8 @@ dependencies = [
  "petname",
  "pubgrub",
  "r-description-scalerail",
+ "r-parser",
+ "r-syntax",
  "relative-path",
  "reqwest",
  "reqwest-middleware",

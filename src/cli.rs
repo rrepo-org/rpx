@@ -30,6 +30,12 @@ pub enum Commands {
     Add(AddArgs),
 
     #[command(
+        about = "Audit source dependencies",
+        long_about = "Discover package usage in R source files, compare it with DESCRIPTION, and optionally add missing or prune unused dependencies."
+    )]
+    Audit(AuditArgs),
+
+    #[command(
         about = "Remove one or more packages",
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
@@ -117,6 +123,15 @@ pub struct AddArgs {
         required = true
     )]
     pub packages: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AuditArgs {
+    #[arg(long, help = "Add discovered dependencies missing from DESCRIPTION")]
+    pub add: bool,
+
+    #[arg(long, help = "Remove Imports not found in R source or NAMESPACE")]
+    pub prune: bool,
 }
 
 #[derive(Args, Debug)]
@@ -463,6 +478,22 @@ mod tests {
             assert_eq!(packages, ["digest@>=0.6.37"]);
             assert_eq!(DependencyField::from(dependency_type), expected);
             assert!(!no_install_project);
+        }
+    }
+
+    #[test]
+    fn parses_audit_actions() {
+        for (arguments, expected_add, expected_prune) in [
+            (&["rpx", "audit"][..], false, false),
+            (&["rpx", "audit", "--add"][..], true, false),
+            (&["rpx", "audit", "--prune"][..], false, true),
+            (&["rpx", "audit", "--add", "--prune"][..], true, true),
+        ] {
+            let Commands::Audit(AuditArgs { add, prune }) = parse(arguments) else {
+                panic!("audit command should parse");
+            };
+            assert_eq!(add, expected_add);
+            assert_eq!(prune, expected_prune);
         }
     }
 
