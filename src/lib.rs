@@ -27,7 +27,7 @@ mod ui;
 
 use cli::{Cli, Commands};
 use commands::{
-    add, audit, clean, init, lock, remove, repo, run as run_command, status as status_command,
+    add, clean, init, lock, remove, repo, run as run_command, status as status_command,
     sync as sync_command,
 };
 use ui::progress_spinner_style;
@@ -45,7 +45,6 @@ pub async fn run() -> miette::Result<()> {
     match cli.command {
         Commands::Init(args) => init::run(args).await?,
         Commands::Add(args) => add::run(args).await?,
-        Commands::Audit(args) => audit::run(args).await?,
         Commands::Remove(args) => remove::run(args).await?,
         Commands::Run(args) => run_command::run(args).await?,
         Commands::Lock {} => lock::run().await?,
