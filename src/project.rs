@@ -1125,7 +1125,7 @@ pub fn cache_dir_path() -> PathBuf {
 }
 
 fn project_dirs() -> ProjectDirs {
-    ProjectDirs::from("de", "scalerail", "rpx").expect("failed to resolve rpx data directory")
+    ProjectDirs::from("org", "rrepo", "rpx").expect("failed to resolve rpx data directory")
 }
 
 fn hash_path(path: &Path) -> String {
@@ -1827,5 +1827,17 @@ mod tests {
     #[test]
     fn cache_dir_matches_project_directories() {
         assert_eq!(cache_dir_path(), project_dirs().cache_dir());
+    }
+
+    #[test]
+    fn project_directory_uses_rrepo_organization() {
+        #[cfg(target_os = "linux")]
+        let expected = Path::new("rpx");
+        #[cfg(target_os = "macos")]
+        let expected = Path::new("org.rrepo.rpx");
+        #[cfg(target_os = "windows")]
+        let expected = Path::new("rrepo").join("rpx");
+
+        assert_eq!(project_dirs().project_path(), expected);
     }
 }

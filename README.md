@@ -93,7 +93,7 @@ Windows binary signing is still being worked on. The PowerShell installer is ava
 You can also install `rpx` from Git with Cargo:
 
 ```bash
-cargo install --git https://github.com/scalerail-solutions/rpx.git
+cargo install --git https://github.com/rrepo-org/rpx.git
 ```
 
 If you do not already have Rust and Cargo installed, install them with `rustup`:
@@ -108,14 +108,14 @@ If you do not already have Rust and Cargo installed, install them with `rustup`:
 You can also run the Docker image directly:
 
 ```bash
-docker run --rm ghcr.io/scalerail-solutions/rpx:latest --help
+docker run --rm ghcr.io/rrepo-org/rpx:latest --help
 ```
 
 The Docker image contains the `rpx` binary but does not include R. For project workflows, copy `rpx` into an image that provides R:
 
 ```dockerfile
 FROM r-base:latest
-COPY --link --from=ghcr.io/scalerail-solutions/rpx:latest /rpx /usr/local/bin/rpx
+COPY --link --from=ghcr.io/rrepo-org/rpx:latest /rpx /usr/local/bin/rpx
 ```
 
 ## Start a New Project
@@ -286,4 +286,4 @@ The test suite depends on Docker and uses `testcontainers`.
 
 Integration tests run against the official `r-base` image and execute realistic package-management workflows inside containers. This keeps tests close to real usage while avoiding changes to your local R installation or package library.
 
-Releases are created by pushing a version tag such as `v1.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases. The Docker workflow publishes `ghcr.io/scalerail-solutions/rpx` images for `linux/amd64` and `linux/arm64`.
+Releases are created by pushing a version tag such as `v1.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases. The Docker workflow publishes `ghcr.io/rrepo-org/rpx` images for `linux/amd64` and `linux/arm64`.
