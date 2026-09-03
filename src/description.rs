@@ -21,6 +21,14 @@ use crate::repository::{
 
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
 pub const BASE_REPOSITORY_FIELD: &str = "Config/rpx/base-repository";
+pub const PROJECT_TYPE_FIELD: &str = "Config/rpx/type";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectType {
+    #[default]
+    Package,
+    Project,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DependencyField {
@@ -224,6 +232,32 @@ pub fn root_package(
         path.join(DESCRIPTION_NAME).display().to_string(),
         description,
     )
+}
+
+pub fn project_type(description: &Description) -> ProjectType {
+    match description.field(PROJECT_TYPE_FIELD) {
+        Some(field) if field.value().as_str() == "project" => ProjectType::Project,
+        _ => ProjectType::Package,
+    }
+}
+
+pub fn set_project_type(
+    description: &mut Description,
+    project_type: ProjectType,
+) -> Result<(), EditError> {
+    match project_type {
+        ProjectType::Package => {
+            if description.field(PROJECT_TYPE_FIELD).is_some() {
+                *description = description.remove_all(PROJECT_TYPE_FIELD)?;
+            }
+        }
+        ProjectType::Project => {
+            let name = FieldName::new(PROJECT_TYPE_FIELD).expect("constant field name is valid");
+            let value = LogicalValue::new("project").expect("constant field value is valid");
+            *description = description.set_field(&name, &value)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn description_identity(
@@ -989,6 +1023,50 @@ mod tests {
             fs::read_to_string(namespace).expect("NAMESPACE should be readable"),
             "export(example)\n"
         );
+    }
+
+    #[test]
+    fn project_type_defaults_to_installable_package() {
+        let description = Description::parse("Package: project\nVersion: 1.0.0\n");
+
+        assert_eq!(project_type(&description), ProjectType::Package);
+    }
+
+    #[test]
+    fn parses_and_sets_dependency_only_project_type() {
+        let mut description = Description::parse("Package: project\nVersion: 1.0.0\n");
+        set_project_type(&mut description, ProjectType::Project).unwrap();
+
+        assert_eq!(project_type(&description), ProjectType::Project);
+        assert!(description.to_string().contains("Config/rpx/type: project"));
+    }
+
+    #[test]
+    fn treats_unknown_project_type_as_package() {
+        let description =
+            Description::parse("Package: project\nVersion: 1.0.0\nConfig/rpx/type: application\n");
+
+        assert_eq!(project_type(&description), ProjectType::Package);
+    }
+
+    #[test]
+    fn project_type_uses_field_precedence() {
+        let description = Description::parse(
+            "Package: project\nVersion: 1.0.0\nConfig/rpx/type: project\nConfig/rpx/type: package\n",
+        );
+
+        assert_eq!(project_type(&description), ProjectType::Package);
+    }
+
+    #[test]
+    fn setting_package_type_removes_existing_project_type() {
+        let mut description =
+            Description::parse("Package: project\nVersion: 1.0.0\nConfig/rpx/type: project\n");
+
+        set_project_type(&mut description, ProjectType::Package).unwrap();
+
+        assert_eq!(project_type(&description), ProjectType::Package);
+        assert!(description.field(PROJECT_TYPE_FIELD).is_none());
     }
 
     #[test]

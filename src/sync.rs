@@ -4,7 +4,9 @@ use crate::{
         SourceArtifactIdentity, binary_artifact_cache_path, compiled_package_cache_path,
         source_artifact_cache_path,
     },
-    description::{DescriptionParseError, required_dependencies, root_package},
+    description::{
+        DescriptionParseError, ProjectType, project_type, required_dependencies, root_package,
+    },
     http,
     project::{
         Project, ProjectLibraryError, ProjectResolution, RequiredPackages, cache_dir_path,
@@ -110,19 +112,21 @@ pub(crate) async fn sync_resolved_project(
     let mut required = resolution.packages;
     let (root_name, root_version) = root_package(&project.root, &project.description)?;
     required.remove(&root_name);
-
-    if project_package == ProjectPackageMode::Install {
-        let root = Arc::new(
-            LocalRepository::new(project.root.clone())
-                .with_description(project.description.clone()),
-        );
-        required.insert(
-            root_name,
-            (
-                PackageVersion::new(root_version, root),
-                Arc::new(project.description.clone()),
-            ),
-        );
+    match (project_type(&project.description), project_package) {
+        (ProjectType::Package, ProjectPackageMode::Install) => {
+            let root = Arc::new(
+                LocalRepository::new(project.root.clone())
+                    .with_description(project.description.clone()),
+            );
+            required.insert(
+                root_name,
+                (
+                    PackageVersion::new(root_version, root),
+                    Arc::new(project.description.clone()),
+                ),
+            );
+        }
+        (ProjectType::Package, ProjectPackageMode::Omit) | (ProjectType::Project, _) => {}
     }
 
     validate_package_graph(&required).await?;

@@ -19,7 +19,7 @@ pub struct Cli {
 pub enum Commands {
     #[command(
         about = "Initialize an R project",
-        long_about = "Initialize an R package project in a new or empty target directory."
+        long_about = "Initialize an installable R package or dependency-only project in a new or empty target directory."
     )]
     Init(InitArgs),
 
@@ -81,6 +81,13 @@ pub struct InitArgs {
     )]
     pub path: Option<PathBuf>,
 
+    #[arg(
+        long = "type",
+        value_enum,
+        help = "Project type; packages are installed into the project library"
+    )]
+    pub project_type: Option<InitProjectType>,
+
     #[arg(long, help = "Package name; defaults to the target directory name")]
     pub name: Option<String>,
 
@@ -98,6 +105,13 @@ pub struct InitArgs {
 
     #[arg(long, value_enum, help = "Package license")]
     pub license: Option<InitLicense>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum InitProjectType {
+    #[default]
+    Package,
+    Project,
 }
 
 #[derive(Args, Debug)]
@@ -341,6 +355,7 @@ mod tests {
             parse(&["rpx", "init"]),
             Commands::Init(InitArgs {
                 path: None,
+                project_type: None,
                 name: None,
                 title: None,
                 description: None,
@@ -358,6 +373,8 @@ mod tests {
                 "rpx",
                 "init",
                 "projects/example",
+                "--type",
+                "project",
                 "--name",
                 "example.pkg",
                 "--title",
@@ -373,6 +390,7 @@ mod tests {
             ]),
             Commands::Init(InitArgs {
                 path: Some(path),
+                project_type: Some(project_type),
                 name: Some(name),
                 title: Some(title),
                 description: Some(description),
@@ -380,6 +398,7 @@ mod tests {
                 author_email: Some(author_email),
                 license: Some(license),
             }) if path == PathBuf::from("projects/example")
+                && project_type == InitProjectType::Project
                 && name == "example.pkg"
                 && title == "Example Package"
                 && description == "An example package."

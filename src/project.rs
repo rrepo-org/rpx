@@ -21,7 +21,7 @@ use crate::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DependencyMutationError,
         DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError,
         add_dependencies, configured_repositories, dependencies_from_fields, project_dependencies,
-        read_description, repositories_from_description,
+        project_type, read_description, repositories_from_description,
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
@@ -808,6 +808,7 @@ pub(crate) async fn resolve_project(
     let previous = read_previous_lockfile(&project.root)?;
     let r_version = r_version_async().await?;
     let requirements = project_dependencies(&project.root, &project.description)?;
+    let root_type = project_type(&project.description);
 
     let repositories = match (policy, previous.as_ref()) {
         (ResolutionPolicy::ReuseIfValid, Some(lockfile)) => {
@@ -867,6 +868,7 @@ pub(crate) async fn resolve_project(
     let selected = resolve_from_registry(
         repositories.clone(),
         Arc::clone(&root),
+        root_type,
         requirements.clone(),
         preferred_versions,
     )
