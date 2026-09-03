@@ -201,6 +201,36 @@ chmod +x {wrapper_path}/Rscript"#
     format!("PATH={wrapper_path}:$PATH RPX_TEST_STATE={state_path} RPX_TEST_ROOT_DELAY=1")
 }
 
+fn install_missing_package_wrapper(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    wrapper_path: &str,
+    state_path: &str,
+) -> String {
+    let command = format!(
+        r#"mkdir -p {wrapper_path}/real {state_path}
+ln -s "$(command -v Rscript)" {wrapper_path}/real/Rscript
+cat > {wrapper_path}/Rscript <<'EOF'
+#!/bin/sh
+case "$*" in
+    *install.packages*digest*)
+        if [ "${{RPX_TEST_MISSING_DIGEST:-}}" = 1 ]; then
+            printf '%s\n' "$*" > "$RPX_TEST_STATE/invocation"
+            echo "injected successful install output"
+            echo "unable to move temporary installation for digest" >&2
+            exit 0
+        fi
+        ;;
+esac
+exec {wrapper_path}/real/Rscript "$@"
+EOF
+chmod +x {wrapper_path}/Rscript"#
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    format!("PATH={wrapper_path}:$PATH RPX_TEST_STATE={state_path}")
+}
+
 #[test]
 fn runs_rpx_lock_from_current_library() {
     let container = start_container();
@@ -420,6 +450,63 @@ Suggests: digest",
         exit_code, 0,
         "retry left an install lock or workspace\nstdout was: {stdout}\nstderr was: {stderr}"
     );
+}
+
+#[test]
+fn successful_install_without_package_reports_output_and_preserves_workspace() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-missing-package";
+    let wrapper_path = "/tmp/rpx-sync-missing-package-wrappers";
+    let state_path = "/tmp/rpx-sync-missing-package-state";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest",
+    );
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let wrapped_environment = install_missing_package_wrapper(&container, wrapper_path, state_path);
+    let sync_command = format!(
+        "cd {project_path} && {wrapped_environment} RPX_TEST_MISSING_DIGEST=1 RPX_KEEP_BUILD_TEMP=1 rpx sync"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("installed package directory is missing")
+            && stderr.contains("injected successful install output")
+            && stderr.contains("unable to move temporary installation")
+            && stderr.contains("artifact.tar.gz")
+            && stderr.contains("as source with R")
+            && stderr.contains("preserved failed package install workspace"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let assert_preserved = format!(
+        "case \"$(cat {state_path}/invocation)\" in *--vanilla*) ;; *) exit 1 ;; esac && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test -d \"$1\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_preserved);
+    assert_eq!(
+        exit_code, 0,
+        "install command was not vanilla or workspace was not preserved\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let retry_command = format!(
+        "rm -rf \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && cd {project_path} && {wrapped_environment} rpx sync"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &retry_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "testpkg", "TRUE");
 }
 
 #[test]

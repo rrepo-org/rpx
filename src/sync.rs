@@ -913,8 +913,8 @@ pub(crate) enum InstallPackageError {
     },
     #[error(transparent)]
     Command(#[from] r::PackageInstallError),
-    #[error("installed package directory is missing at {}", path.display())]
-    InstalledPackageMissing { path: PathBuf },
+    #[error(transparent)]
+    InstalledPackageMissing(Box<InstalledPackageMissingError>),
     #[error("failed to inspect installed package directory at {}: {source}", path.display())]
     InspectInstalledPackage {
         path: PathBuf,
@@ -943,6 +943,23 @@ pub(crate) enum InstallPackageError {
         #[source]
         source: std::io::Error,
     },
+}
+
+#[derive(Debug, Error)]
+#[error(
+        "installed package directory is missing at {} after Rscript exited successfully installing {package} {version} from {} as {install_type} with R {r_version}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}",
+        path.display(),
+        artifact.display()
+    )]
+pub(crate) struct InstalledPackageMissingError {
+    path: PathBuf,
+    package: String,
+    version: String,
+    artifact: PathBuf,
+    install_type: String,
+    r_version: semver::Version,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Error)]
@@ -1135,24 +1152,39 @@ async fn install_package(
             span.record("stage", "installing");
             span.pb_set_message(&format!("{package} {version} installing"));
             span.pb_tick();
-            install_package_artifact(
+            let output = install_package_artifact(
                 project_library,
                 &artifact,
                 package,
                 &version,
                 &install_type,
+                r_version,
                 &temporary_library,
             )
             .await?;
 
             let installed = temporary_library.join(package);
+            let missing_error = |path| {
+                InstallPackageError::InstalledPackageMissing(Box::new(
+                    InstalledPackageMissingError {
+                        path,
+                        package: package.to_string(),
+                        version: version.clone(),
+                        artifact: artifact.clone(),
+                        install_type: install_type.clone(),
+                        r_version: r_version.clone(),
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    },
+                ))
+            };
             match tokio::fs::metadata(&installed).await {
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => {
-                    return Err(InstallPackageError::InstalledPackageMissing { path: installed });
+                    return Err(missing_error(installed));
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(InstallPackageError::InstalledPackageMissing { path: installed });
+                    return Err(missing_error(installed));
                 }
                 Err(source) => {
                     return Err(InstallPackageError::InspectInstalledPackage {
@@ -1201,6 +1233,17 @@ async fn install_package(
             Ok(())
         }
         .await;
+
+        if result.is_err()
+            && std::env::var("RPX_KEEP_BUILD_TEMP").is_ok_and(|value| value == "1")
+        {
+            let preserved = workspace.keep();
+            tracing::warn!(
+                path = %preserved.display(),
+                "preserved failed package install workspace"
+            );
+            return result;
+        }
 
         span.record("stage", "cleaning up");
         span.pb_set_message(&format!("{package} {version} cleaning up"));

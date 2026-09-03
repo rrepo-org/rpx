@@ -206,10 +206,12 @@ pub async fn install_package_artifact(
     package: &str,
     version: &str,
     pkg_type: &str,
+    r_version: &semver::Version,
     target_library: &Path,
-) -> Result<(), PackageInstallError> {
+) -> Result<Output, PackageInstallError> {
     let mut command = project_r_command("Rscript", project_library);
     command
+        .arg("--vanilla")
         .arg("-e")
         .arg(concat!(
             "args <- commandArgs(trailingOnly = TRUE);",
@@ -219,12 +221,17 @@ pub async fn install_package_artifact(
             "package_name <- args[[4L]];",
             "expected_version <- args[[5L]];",
             "utils::install.packages(artifact, repos = NULL, type = package_type, lib = target_library);",
-            "packages <- utils::installed.packages(lib.loc = target_library);",
-            "if (!(package_name %in% rownames(packages))) ",
-            "stop(sprintf('Expected package %s to be installed', package_name));",
-            "installed_version <- packages[package_name, 'Version'];",
-            "if (installed_version != expected_version) ",
-            "warning(sprintf('Installed %s version %s, expected %s', package_name, installed_version, expected_version))"
+            "package_dir <- file.path(target_library, package_name);",
+            "description <- file.path(package_dir, 'DESCRIPTION');",
+            "if (!dir.exists(package_dir) || !file.exists(description)) ",
+            "stop(sprintf('Expected package %s at %s after installation. Library entries: %s', package_name, package_dir, paste(list.files(target_library, all.files = TRUE), collapse = ', ')));",
+            "metadata <- read.dcf(description, fields = c('Package', 'Version'));",
+            "installed_name <- unname(metadata[1L, 'Package']);",
+            "installed_version <- unname(metadata[1L, 'Version']);",
+            "if (!identical(installed_name, package_name)) ",
+            "stop(sprintf('Installed package name is %s, expected %s', installed_name, package_name));",
+            "if (!identical(installed_version, expected_version)) ",
+            "stop(sprintf('Installed %s version %s, expected %s', package_name, installed_version, expected_version))"
         ))
         .arg(artifact_path)
         .arg(pkg_type)
@@ -234,10 +241,12 @@ pub async fn install_package_artifact(
     command.kill_on_drop(true);
     run_subprocess(command)
         .await
-        .map(|_| ())
         .map_err(|source| PackageInstallError::Command {
             action: "install",
-            target: format!("{package}@{version}"),
+            target: format!(
+                "{package}@{version} from {} as {pkg_type} with R {r_version}",
+                artifact_path.display()
+            ),
             source: Box::new(source),
         })
 }
