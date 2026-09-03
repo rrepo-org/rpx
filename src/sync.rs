@@ -4,7 +4,7 @@ use crate::{
         SourceArtifactIdentity, binary_artifact_cache_path, compiled_package_cache_path,
         source_artifact_cache_path,
     },
-    description::{DescriptionParseError, required_dependencies, root_package},
+    description::{DescriptionParseError, project_type, required_dependencies, root_package},
     http,
     project::{
         Project, ProjectLibraryError, ProjectResolution, RequiredPackages, cache_dir_path,
@@ -110,8 +110,9 @@ pub(crate) async fn sync_resolved_project(
     let mut required = resolution.packages;
     let (root_name, root_version) = root_package(&project.root, &project.description)?;
     required.remove(&root_name);
-
-    if project_package == ProjectPackageMode::Install {
+    if project_type(&project.root, &project.description)?.is_installable()
+        && project_package == ProjectPackageMode::Install
+    {
         let root = Arc::new(
             LocalRepository::new(project.root.clone())
                 .with_description(project.description.clone()),

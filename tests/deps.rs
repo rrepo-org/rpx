@@ -146,6 +146,50 @@ fn add_and_remove_can_sync_without_installing_project() {
 }
 
 #[test]
+fn dependency_only_project_never_installs_the_root_package() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-dependency-only-project";
+    let command = format!(
+        "mkdir -p {project_path} && cd {project_path} && rpx init --type project && rpx add digest && rpx status"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let description = read_project_file(&container, project_path, "DESCRIPTION");
+    assert!(
+        description.contains("Config/rpx/type: project"),
+        "DESCRIPTION was: {description}"
+    );
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(
+        &container,
+        project_path,
+        "rpx.dependency.only.project",
+        "FALSE",
+    );
+}
+
+#[test]
+fn dependency_only_project_cannot_depend_on_its_namespace() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-self-dependency";
+    write_description(
+        &container,
+        project_path,
+        "Package: digest\nVersion: 0.1.0\nTitle: Digest Project\nDescription: Dependency-only project fixture.\nLicense: MIT\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\nConfig/rpx/type: project\nImports: digest",
+    );
+
+    let command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::lock::no_solution"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn constrained_add_replaces_default_dependency_bounds() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-constraint";

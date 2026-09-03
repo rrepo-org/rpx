@@ -1,9 +1,9 @@
 use crate::{
-    cli::{InitArgs, InitLicense},
+    cli::{InitArgs, InitLicense, InitProjectType},
     description::{
         DependencyField, DependencyMutationError, DescriptionNormalizationError,
-        NamespaceWriteError, add_dependencies, normalize_description, set_base_repository,
-        write_namespace_if_missing,
+        NamespaceWriteError, ProjectType, add_dependencies, normalize_description,
+        set_base_repository, set_project_type, write_namespace_if_missing,
     },
     git,
     output::status,
@@ -348,7 +348,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
     if interactive {
-        cliclack::intro("Create an R package").map_err(Error::InteractivePrompt)?;
+        cliclack::intro("Create an R project").map_err(Error::InteractivePrompt)?;
     }
 
     let target = match args.path {
@@ -362,6 +362,12 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
             validate_target(&current_dir)?;
             current_dir.clone()
         }
+    };
+
+    let project_type = match args.project_type {
+        Some(project_type) => project_type,
+        None if interactive => prompt_for_project_type()?,
+        None => InitProjectType::Package,
     };
 
     let package_name = match args.name {
@@ -432,6 +438,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         maintainer: &maintainer,
         license: license.description_value(),
     });
+    set_project_type(&mut description, project_type.into())?;
     configure_base_repository(&mut description, base_repository)?;
     let development_relations = development_relations(&development_packages);
     add_dependencies(
@@ -485,6 +492,32 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     }
     status(next_step_message(&current_dir, &target));
     Ok(())
+}
+
+impl From<InitProjectType> for ProjectType {
+    fn from(project_type: InitProjectType) -> Self {
+        match project_type {
+            InitProjectType::Package => Self::Package,
+            InitProjectType::Project => Self::Project,
+        }
+    }
+}
+
+fn prompt_for_project_type() -> Result<InitProjectType, Error> {
+    cliclack::select("Project type")
+        .item(
+            InitProjectType::Package,
+            "Package",
+            "Build and install the project as an R package",
+        )
+        .item(
+            InitProjectType::Project,
+            "Project",
+            "Manage dependencies without installing the project",
+        )
+        .initial_value(InitProjectType::Package)
+        .interact()
+        .map_err(Error::InteractivePrompt)
 }
 
 fn prompt_for_target(current_dir: &Path) -> Result<PathBuf, Error> {
@@ -1173,6 +1206,28 @@ mod tests {
         ));
         assert!(rendered.contains("Author: Package Author [aut, cre]"));
         assert!(rendered.contains("Maintainer: Package Author <author@example.com>"));
+    }
+
+    #[test]
+    fn marks_dependency_only_projects_in_description() {
+        let mut description = initial_description(InitialDescriptionOptions {
+            package_name: "my.project",
+            title: "My Project",
+            description: "Describe what this project does.",
+            authors_at_r: r#"person(given = "Project Author", email = "author@example.com", role = c("aut", "cre"))"#,
+            author: "Project Author [aut, cre]",
+            maintainer: "Project Author <author@example.com>",
+            license: "MIT + file LICENSE",
+        });
+
+        set_project_type(&mut description, InitProjectType::Project.into()).unwrap();
+
+        assert_eq!(description.package().unwrap().as_str(), "my.project");
+        assert_eq!(description.version().unwrap().to_string(), "0.1.0");
+        assert_eq!(
+            crate::description::project_type(Path::new("."), &description).unwrap(),
+            ProjectType::Project
+        );
     }
 
     #[test]

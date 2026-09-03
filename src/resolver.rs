@@ -106,6 +106,7 @@ impl std::fmt::Display for PackageVersion {
 pub(crate) struct RDependencyProvider {
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
+    root_installable: bool,
     root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
     preferred_versions: BTreeMap<String, Version>,
     base_packages: BTreeSet<String>,
@@ -116,6 +117,7 @@ impl RDependencyProvider {
     fn new(
         repositories: Vec<Arc<dyn PackageRepository>>,
         root: Arc<LocalRepository>,
+        root_installable: bool,
         root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
         preferred_versions: BTreeMap<String, Version>,
         base_packages: BTreeSet<String>,
@@ -123,6 +125,7 @@ impl RDependencyProvider {
         Self {
             repositories,
             root,
+            root_installable,
             root_dependencies,
             preferred_versions,
             base_packages,
@@ -285,6 +288,7 @@ impl DependencyProvider for RDependencyProvider {
             format!("{package} {} from {}", version.version, version.repository),
             &description,
             &self.base_packages,
+            (!self.root_installable).then_some(root_package.as_str()),
         );
         let Dependencies::Available(constraints) = dependencies else {
             return Ok(dependencies);
@@ -380,11 +384,14 @@ fn dependencies_from_description(
     source_name: impl Into<String>,
     description: &Description,
     base_packages: &BTreeSet<String>,
+    unavailable_package: Option<&str>,
 ) -> Dependencies<String, Ranges<PackageVersion>, String> {
     match required_dependencies(source_name, description) {
-        Ok(relations) => {
-            Dependencies::Available(dependency_ranges_from_relations(&relations, base_packages))
-        }
+        Ok(relations) => Dependencies::Available(dependency_ranges_from_relations(
+            &relations,
+            base_packages,
+            unavailable_package,
+        )),
         Err(error) => Dependencies::Unavailable(format!(
             "invalid dependency metadata: {}",
             error.messages().join("; ")
@@ -429,6 +436,7 @@ fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVer
 pub(crate) async fn resolve_from_registry(
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
+    root_installable: bool,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, Version>,
 ) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
@@ -454,10 +462,15 @@ pub(crate) async fn resolve_from_registry(
         let (root_package, root_version) = tokio::runtime::Handle::current()
             .block_on(root.package())
             .map_err(ProviderError::from)?;
-        let root_dependencies = dependency_ranges_from_relations(&root_relations, &base_packages);
+        let root_dependencies = dependency_ranges_from_relations(
+            &root_relations,
+            &base_packages,
+            (!root_installable).then_some(root_package.as_str()),
+        );
         let provider = RDependencyProvider::new(
             repositories,
             root,
+            root_installable,
             root_dependencies,
             preferred_versions,
             base_packages,
@@ -482,14 +495,22 @@ pub(crate) async fn resolve_from_registry(
 fn dependency_ranges_from_relations(
     relations: &BTreeSet<Relation>,
     base_packages: &BTreeSet<String>,
+    unavailable_package: Option<&str>,
 ) -> DependencyConstraints<String, Ranges<PackageVersion>> {
     relations
         .iter()
-        .filter(|relation| !base_packages.contains(relation.package()))
+        .filter(|relation| {
+            unavailable_package == Some(relation.package())
+                || !base_packages.contains(relation.package())
+        })
         .fold(
             DependencyConstraints::default(),
             |mut dependencies, relation| {
-                let range = package_version_range_from_relation(relation);
+                let range = if unavailable_package == Some(relation.package()) {
+                    Ranges::empty()
+                } else {
+                    package_version_range_from_relation(relation)
+                };
                 dependencies
                     .entry(relation.package().to_string())
                     .and_modify(|existing| *existing = existing.intersection(&range))
@@ -612,7 +633,7 @@ mod tests {
         );
 
         let Dependencies::Unavailable(reason) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
         else {
             panic!("malformed Imports should make the package version unavailable");
         };
@@ -654,6 +675,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![Arc::new(remote_repository)],
             local_repository,
+            true,
             BTreeSet::from([Relation::any("example").expect("valid example relation")]),
             BTreeMap::new(),
         )
@@ -670,7 +692,7 @@ mod tests {
         );
 
         let Dependencies::Available(dependencies) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
         else {
             panic!("malformed Suggests should not make the package version unavailable");
         };
@@ -684,7 +706,7 @@ mod tests {
         );
 
         let Dependencies::Available(dependencies) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
         else {
             panic!("hard dependencies should be available");
         };
@@ -699,6 +721,36 @@ mod tests {
         assert!(!range.contains(&candidate("0.9.0")));
         assert!(range.contains(&candidate("1.5.0")));
         assert!(!range.contains(&candidate("2.0.0")));
+    }
+
+    #[test]
+    fn project_namespace_is_unsatisfiable_in_root_and_transitive_dependencies() {
+        let project_relation = Relation::any("project").expect("valid project relation");
+        let root_dependencies = dependency_ranges_from_relations(
+            &BTreeSet::from([project_relation]),
+            &BTreeSet::new(),
+            Some("project"),
+        );
+        assert_eq!(root_dependencies["project"], Ranges::empty());
+
+        let description =
+            Description::parse("Package: dependent\nVersion: 1.0.0\nImports: project\n");
+        let Dependencies::Available(transitive_dependencies) = dependencies_from_description(
+            "dependent 1.0.0",
+            &description,
+            &BTreeSet::new(),
+            Some("project"),
+        ) else {
+            panic!("dependency metadata should be available");
+        };
+        assert_eq!(transitive_dependencies["project"], Ranges::empty());
+
+        let base_namespace = dependency_ranges_from_relations(
+            &BTreeSet::from([Relation::any("stats").expect("valid base package relation")]),
+            &BTreeSet::from(["stats".to_string()]),
+            Some("stats"),
+        );
+        assert_eq!(base_namespace["stats"], Ranges::empty());
     }
 
     #[tokio::test]
@@ -857,6 +909,7 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
+            true,
             DependencyConstraints::default(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -890,6 +943,7 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
+            true,
             DependencyConstraints::default(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -919,10 +973,11 @@ mod tests {
         )
         .expect("valid suggested relation");
         let roots = BTreeSet::from([suggested]);
-        let root_dependencies = dependency_ranges_from_relations(&roots, &BTreeSet::new());
+        let root_dependencies = dependency_ranges_from_relations(&roots, &BTreeSet::new(), None);
         let provider = RDependencyProvider::new(
             Vec::new(),
             Arc::clone(&local_repository),
+            true,
             root_dependencies,
             BTreeMap::new(),
             BTreeSet::new(),
@@ -963,6 +1018,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
+            true,
             BTreeSet::from([Relation::any("testBasePackage").expect("valid base relation")]),
             BTreeMap::new(),
         )
@@ -985,6 +1041,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
+            true,
             BTreeSet::new(),
             BTreeMap::new(),
         )
@@ -996,6 +1053,54 @@ mod tests {
             BTreeMap::from([("project".to_string(), root_version)])
         );
         assert_eq!(remote_repository.package_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn package_depending_on_project_namespace_is_unsatisfiable() {
+        let local_repository = local_repository("project", "1.0.0");
+        let mut metadata_repository = TestRepository::empty("remote metadata");
+        metadata_repository.descriptions.insert(
+            (
+                "dependent".to_string(),
+                Version::from_str("1.0.0").expect("valid test version"),
+            ),
+            Arc::new(Description::parse(
+                "Package: dependent\nVersion: 1.0.0\nImports: project\n",
+            )),
+        );
+        let metadata: Arc<dyn PackageRepository> = Arc::new(metadata_repository);
+        let mut remote_repository = TestRepository::empty("remote index");
+        remote_repository.packages.insert(
+            "dependent".to_string(),
+            version("1.0.0", Arc::clone(&metadata)),
+        );
+        remote_repository
+            .packages
+            .insert("project".to_string(), version("9.0.0", metadata));
+        let remote_repository = Arc::new(remote_repository);
+
+        let error = resolve_from_registry(
+            vec![remote_repository.clone()],
+            local_repository,
+            false,
+            BTreeSet::from([Relation::any("dependent").expect("valid dependent relation")]),
+            BTreeMap::new(),
+        )
+        .await
+        .expect_err("dependency on project namespace should be unsatisfiable");
+
+        assert!(matches!(
+            error,
+            ResolutionError::PubGrub(PubGrubError::NoSolution(_))
+        ));
+        assert!(
+            !remote_repository
+                .version_queries
+                .lock()
+                .expect("version query lock should not be poisoned")
+                .iter()
+                .any(|package| package == "project")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1045,6 +1150,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
+            true,
             BTreeSet::from([Relation::new(
                 "testthat",
                 VersionRequirement::GreaterThanEqual(RequirementVersion::Version(
