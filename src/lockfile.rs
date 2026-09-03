@@ -367,9 +367,9 @@ mod tests {
                         "version": "6.2.3",
                         "repository": "https://api.rrepo.org/cran",
                         "dependencies": [
-                            "R (>= 4.1.0)",
                             "jsonlite (>= 1.8.0)",
-                            "methods"
+                            "methods",
+                            "R (>= 4.1.0)"
                         ]
                     }
                 }
