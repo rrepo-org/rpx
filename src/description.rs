@@ -30,12 +30,6 @@ pub enum ProjectType {
     Project,
 }
 
-impl ProjectType {
-    pub fn is_installable(self) -> bool {
-        self == Self::Package
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DependencyField {
     Depends,
@@ -240,62 +234,29 @@ pub fn root_package(
     )
 }
 
-pub fn project_type(
-    path: &Path,
-    description: &Description,
-) -> Result<ProjectType, DescriptionParseError> {
-    let fields = description.fields(PROJECT_TYPE_FIELD).collect::<Vec<_>>();
-    let Some(field) = fields.last() else {
-        return Ok(ProjectType::Package);
-    };
-    if fields.len() > 1 {
-        return Err(DescriptionParseError::new(
-            path.join(DESCRIPTION_NAME).display().to_string(),
-            description.to_string(),
-            fields
-                .into_iter()
-                .skip(1)
-                .map(|field| {
-                    let range = field.value().source_range();
-                    DescriptionParseIssue::positioned(
-                        std::io::Error::other("project type field is declared more than once"),
-                        range.start..range.end,
-                    )
-                })
-                .collect(),
-        ));
+pub fn project_type(description: &Description) -> ProjectType {
+    match description.field(PROJECT_TYPE_FIELD) {
+        Some(field) if field.value().as_str() == "project" => ProjectType::Project,
+        _ => ProjectType::Package,
     }
-    let value = field.value();
-    let project_type = match value.as_str() {
-        "package" => ProjectType::Package,
-        "project" => ProjectType::Project,
-        value => {
-            let range = field.value().source_range();
-            return Err(DescriptionParseError::new(
-                path.join(DESCRIPTION_NAME).display().to_string(),
-                description.to_string(),
-                vec![DescriptionParseIssue::positioned(
-                    std::io::Error::other(format!(
-                        "invalid project type `{value}`; expected `package` or `project`"
-                    )),
-                    range.start..range.end,
-                )],
-            ));
-        }
-    };
-    Ok(project_type)
 }
 
 pub fn set_project_type(
     description: &mut Description,
     project_type: ProjectType,
 ) -> Result<(), EditError> {
-    if project_type == ProjectType::Package {
-        return Ok(());
+    match project_type {
+        ProjectType::Package => {
+            if description.field(PROJECT_TYPE_FIELD).is_some() {
+                *description = description.remove_all(PROJECT_TYPE_FIELD)?;
+            }
+        }
+        ProjectType::Project => {
+            let name = FieldName::new(PROJECT_TYPE_FIELD).expect("constant field name is valid");
+            let value = LogicalValue::new("project").expect("constant field value is valid");
+            *description = description.set_field(&name, &value)?;
+        }
     }
-    let name = FieldName::new(PROJECT_TYPE_FIELD).expect("constant field name is valid");
-    let value = LogicalValue::new("project").expect("constant field value is valid");
-    *description = description.set_field(&name, &value)?;
     Ok(())
 }
 
@@ -1068,10 +1029,7 @@ mod tests {
     fn project_type_defaults_to_installable_package() {
         let description = Description::parse("Package: project\nVersion: 1.0.0\n");
 
-        assert_eq!(
-            project_type(Path::new("."), &description).unwrap(),
-            ProjectType::Package
-        );
+        assert_eq!(project_type(&description), ProjectType::Package);
     }
 
     #[test]
@@ -1079,36 +1037,36 @@ mod tests {
         let mut description = Description::parse("Package: project\nVersion: 1.0.0\n");
         set_project_type(&mut description, ProjectType::Project).unwrap();
 
-        assert_eq!(
-            project_type(Path::new("."), &description).unwrap(),
-            ProjectType::Project
-        );
+        assert_eq!(project_type(&description), ProjectType::Project);
         assert!(description.to_string().contains("Config/rpx/type: project"));
     }
 
     #[test]
-    fn rejects_unknown_project_type() {
+    fn treats_unknown_project_type_as_package() {
         let description =
             Description::parse("Package: project\nVersion: 1.0.0\nConfig/rpx/type: application\n");
 
-        let error = project_type(Path::new("."), &description).unwrap_err();
-        assert_eq!(
-            error.messages(),
-            ["invalid project type `application`; expected `package` or `project`"]
-        );
+        assert_eq!(project_type(&description), ProjectType::Package);
     }
 
     #[test]
-    fn rejects_duplicate_project_type_fields() {
+    fn project_type_uses_field_precedence() {
         let description = Description::parse(
             "Package: project\nVersion: 1.0.0\nConfig/rpx/type: project\nConfig/rpx/type: package\n",
         );
 
-        let error = project_type(Path::new("."), &description).unwrap_err();
-        assert_eq!(
-            error.messages(),
-            ["project type field is declared more than once"]
-        );
+        assert_eq!(project_type(&description), ProjectType::Package);
+    }
+
+    #[test]
+    fn setting_package_type_removes_existing_project_type() {
+        let mut description =
+            Description::parse("Package: project\nVersion: 1.0.0\nConfig/rpx/type: project\n");
+
+        set_project_type(&mut description, ProjectType::Package).unwrap();
+
+        assert_eq!(project_type(&description), ProjectType::Package);
+        assert!(description.field(PROJECT_TYPE_FIELD).is_none());
     }
 
     #[test]

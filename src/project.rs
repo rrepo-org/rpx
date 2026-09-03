@@ -21,7 +21,7 @@ use crate::{
         ConfiguredRepository, DESCRIPTION_NAME, DependencyField, DependencyMutationError,
         DescriptionParseError, DescriptionReadError, RepositoriesFromDescriptionError,
         add_dependencies, configured_repositories, dependencies_from_fields, project_dependencies,
-        project_type, read_description, repositories_from_description, root_package,
+        project_type, read_description, repositories_from_description,
     },
     git,
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
@@ -336,14 +336,6 @@ pub enum LockedResolutionFailure {
         locked: semver::Version,
         current: semver::Version,
     },
-
-    #[error("package `{package}` depends on unavailable project namespace `{namespace}`")]
-    #[diagnostic(code(rpx::project::unavailable_project_namespace))]
-    UnavailableProjectNamespace { package: String, namespace: String },
-
-    #[error("locked package `{namespace}` occupies the unavailable project namespace")]
-    #[diagnostic(code(rpx::project::locked_project_namespace))]
-    LockedProjectNamespace { namespace: String },
 }
 
 pub fn validate_locked_resolution(
@@ -352,9 +344,6 @@ pub fn validate_locked_resolution(
     r_version: &semver::Version,
     lockfile: &Lockfile,
 ) -> Result<(), LockedResolutionError> {
-    let (root_name, _) = root_package(project_path, description)?;
-    let unavailable_namespace =
-        (!project_type(project_path, description)?.is_installable()).then_some(root_name);
     let repositories = configured_repositories(project_path, description)?;
     let repository_validation = lockfile
         .repos
@@ -395,26 +384,6 @@ pub fn validate_locked_resolution(
             .iter()
             .any(|result| matches!(result, Ok(false)));
     let roots = project_dependencies(project_path, description)?;
-    let unavailable_dependents = unavailable_namespace
-        .as_ref()
-        .map(|namespace| {
-            roots
-                .iter()
-                .filter(|relation| relation.package() == namespace)
-                .map(|_| namespace.clone())
-                .chain(lockfile.packages.iter().filter_map(|(package, metadata)| {
-                    metadata
-                        .dependencies
-                        .iter()
-                        .any(|relation| relation.package() == namespace)
-                        .then(|| package.clone())
-                }))
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let locked_project_namespace = unavailable_namespace
-        .as_ref()
-        .filter(|namespace| lockfile.packages.contains_key(namespace.as_str()));
     let failures = repository_validation
         .into_iter()
         .filter_map(Result::err)
@@ -429,19 +398,6 @@ pub fn validate_locked_resolution(
                 current: r_version.clone(),
             }),
         )
-        .chain(locked_project_namespace.map(|namespace| {
-            LockedResolutionFailure::LockedProjectNamespace {
-                namespace: namespace.clone(),
-            }
-        }))
-        .chain(unavailable_dependents.into_iter().map(|package| {
-            LockedResolutionFailure::UnavailableProjectNamespace {
-                package,
-                namespace: unavailable_namespace
-                    .clone()
-                    .expect("unavailable dependents require a project namespace"),
-            }
-        }))
         .collect::<Vec<_>>();
 
     if failures.is_empty() {
@@ -852,8 +808,7 @@ pub(crate) async fn resolve_project(
     let previous = read_previous_lockfile(&project.root)?;
     let r_version = r_version_async().await?;
     let requirements = project_dependencies(&project.root, &project.description)?;
-    let root_installable =
-        crate::description::project_type(&project.root, &project.description)?.is_installable();
+    let root_type = project_type(&project.description);
 
     let repositories = match (policy, previous.as_ref()) {
         (ResolutionPolicy::ReuseIfValid, Some(lockfile)) => {
@@ -913,7 +868,7 @@ pub(crate) async fn resolve_project(
     let selected = resolve_from_registry(
         repositories.clone(),
         Arc::clone(&root),
-        root_installable,
+        root_type,
         requirements.clone(),
         preferred_versions,
     )
@@ -1736,33 +1691,6 @@ mod tests {
         let (path, description, r_version, lockfile) = validation_fixture();
         validate_locked_resolution(&path, &description, &r_version, &lockfile)
             .expect("matching resolution should validate");
-    }
-
-    #[test]
-    fn rejects_locked_dependencies_on_project_namespace() {
-        let (path, description, r_version, mut lockfile) = validation_fixture();
-        let description = Description::parse(&format!("{}Config/rpx/type: project\n", description));
-        lockfile.packages.insert(
-            "dependent".into(),
-            package("1.0.0", lockfile.repos[0].url().as_str(), &["project"]),
-        );
-        lockfile.packages.insert(
-            "project".into(),
-            package("9.0.0", lockfile.repos[0].url().as_str(), &[]),
-        );
-
-        let failures = failures(&path, &description, &r_version, &lockfile);
-
-        assert!(failures.iter().any(|failure| matches!(
-            failure,
-            LockedResolutionFailure::UnavailableProjectNamespace { package, namespace }
-                if package == "dependent" && namespace == "project"
-        )));
-        assert!(failures.iter().any(|failure| matches!(
-            failure,
-            LockedResolutionFailure::LockedProjectNamespace { namespace }
-                if namespace == "project"
-        )));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
     PubGrubError, Ranges, resolve,
 };
+#[cfg(test)]
 use r_description::Description;
 use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::{
@@ -14,7 +15,7 @@ use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
-    description::required_dependencies,
+    description::{ProjectType, required_dependencies},
     r::{BasePackagesError, base_packages},
     repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository},
 };
@@ -106,8 +107,8 @@ impl std::fmt::Display for PackageVersion {
 pub(crate) struct RDependencyProvider {
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
-    root_installable: bool,
-    root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
+    root_type: ProjectType,
+    root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, Version>,
     base_packages: BTreeSet<String>,
     description_prefetch_permits: Arc<Semaphore>,
@@ -117,16 +118,16 @@ impl RDependencyProvider {
     fn new(
         repositories: Vec<Arc<dyn PackageRepository>>,
         root: Arc<LocalRepository>,
-        root_installable: bool,
-        root_dependencies: DependencyConstraints<String, Ranges<PackageVersion>>,
+        root_type: ProjectType,
+        root_relations: BTreeSet<Relation>,
         preferred_versions: BTreeMap<String, Version>,
         base_packages: BTreeSet<String>,
     ) -> Self {
         Self {
             repositories,
             root,
-            root_installable,
-            root_dependencies,
+            root_type,
+            root_relations,
             preferred_versions,
             base_packages,
             description_prefetch_permits: Arc::new(Semaphore::new(DESCRIPTION_PREFETCH_WORKERS)),
@@ -218,6 +219,26 @@ impl RDependencyProvider {
             .block_on(self.root.package())
             .map_err(Into::into)
     }
+
+    fn dependency_ranges(
+        &self,
+        relations: &BTreeSet<Relation>,
+    ) -> Result<DependencyConstraints<String, Ranges<PackageVersion>>, ProviderError> {
+        let mut constraints = dependency_ranges_from_relations(relations, &self.base_packages);
+        match self.root_type {
+            ProjectType::Package => {}
+            ProjectType::Project => {
+                let (root_package, _) = self.root_package()?;
+                if relations
+                    .iter()
+                    .any(|relation| relation.package() == root_package)
+                {
+                    constraints.insert(root_package, Ranges::empty());
+                }
+            }
+        }
+        Ok(constraints)
+    }
 }
 
 impl DependencyProvider for RDependencyProvider {
@@ -262,11 +283,7 @@ impl DependencyProvider for RDependencyProvider {
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
         let (root_package, _) = self.root_package()?;
         if package == &root_package {
-            let constraints = self
-                .root_dependencies
-                .iter()
-                .map(|(package, range)| (package.clone(), range.clone()))
-                .collect::<DependencyConstraints<_, _>>();
+            let constraints = self.dependency_ranges(&self.root_relations)?;
 
             self.prefetch_descriptions(&constraints)?;
 
@@ -284,15 +301,17 @@ impl DependencyProvider for RDependencyProvider {
                 source,
             })?;
 
-        let dependencies = dependencies_from_description(
-            format!("{package} {} from {}", version.version, version.repository),
-            &description,
-            &self.base_packages,
-            (!self.root_installable).then_some(root_package.as_str()),
-        );
-        let Dependencies::Available(constraints) = dependencies else {
-            return Ok(dependencies);
+        let source_name = format!("{package} {} from {}", version.version, version.repository);
+        let relations = match required_dependencies(source_name, &description) {
+            Ok(relations) => relations,
+            Err(error) => {
+                return Ok(Dependencies::Unavailable(format!(
+                    "invalid dependency metadata: {}",
+                    error.messages().join("; ")
+                )));
+            }
         };
+        let constraints = self.dependency_ranges(&relations)?;
 
         self.prefetch_descriptions(&constraints)?;
 
@@ -380,25 +399,6 @@ async fn choose_repository_version(
         .max())
 }
 
-fn dependencies_from_description(
-    source_name: impl Into<String>,
-    description: &Description,
-    base_packages: &BTreeSet<String>,
-    unavailable_package: Option<&str>,
-) -> Dependencies<String, Ranges<PackageVersion>, String> {
-    match required_dependencies(source_name, description) {
-        Ok(relations) => Dependencies::Available(dependency_ranges_from_relations(
-            &relations,
-            base_packages,
-            unavailable_package,
-        )),
-        Err(error) => Dependencies::Unavailable(format!(
-            "invalid dependency metadata: {}",
-            error.messages().join("; ")
-        )),
-    }
-}
-
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
     let bound = |version: &Version| PackageVersion::new(version.clone(), built_in_repository());
 
@@ -436,7 +436,7 @@ fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVer
 pub(crate) async fn resolve_from_registry(
     repositories: Vec<Arc<dyn PackageRepository>>,
     root: Arc<LocalRepository>,
-    root_installable: bool,
+    root_type: ProjectType,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, Version>,
 ) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
@@ -462,16 +462,11 @@ pub(crate) async fn resolve_from_registry(
         let (root_package, root_version) = tokio::runtime::Handle::current()
             .block_on(root.package())
             .map_err(ProviderError::from)?;
-        let root_dependencies = dependency_ranges_from_relations(
-            &root_relations,
-            &base_packages,
-            (!root_installable).then_some(root_package.as_str()),
-        );
         let provider = RDependencyProvider::new(
             repositories,
             root,
-            root_installable,
-            root_dependencies,
+            root_type,
+            root_relations,
             preferred_versions,
             base_packages,
         );
@@ -495,22 +490,14 @@ pub(crate) async fn resolve_from_registry(
 fn dependency_ranges_from_relations(
     relations: &BTreeSet<Relation>,
     base_packages: &BTreeSet<String>,
-    unavailable_package: Option<&str>,
 ) -> DependencyConstraints<String, Ranges<PackageVersion>> {
     relations
         .iter()
-        .filter(|relation| {
-            unavailable_package == Some(relation.package())
-                || !base_packages.contains(relation.package())
-        })
+        .filter(|relation| !base_packages.contains(relation.package()))
         .fold(
             DependencyConstraints::default(),
             |mut dependencies, relation| {
-                let range = if unavailable_package == Some(relation.package()) {
-                    Ranges::empty()
-                } else {
-                    package_version_range_from_relation(relation)
-                };
+                let range = package_version_range_from_relation(relation);
                 dependencies
                     .entry(relation.package().to_string())
                     .and_modify(|existing| *existing = existing.intersection(&range))
@@ -626,6 +613,22 @@ mod tests {
         )
     }
 
+    fn dependencies_from_description(
+        source_name: impl Into<String>,
+        description: &Description,
+        base_packages: &BTreeSet<String>,
+    ) -> Dependencies<String, Ranges<PackageVersion>, String> {
+        match required_dependencies(source_name, description) {
+            Ok(relations) => {
+                Dependencies::Available(dependency_ranges_from_relations(&relations, base_packages))
+            }
+            Err(error) => Dependencies::Unavailable(format!(
+                "invalid dependency metadata: {}",
+                error.messages().join("; ")
+            )),
+        }
+    }
+
     #[test]
     fn rejects_malformed_hard_dependency_metadata() {
         let description = Description::parse(
@@ -633,7 +636,7 @@ mod tests {
         );
 
         let Dependencies::Unavailable(reason) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
         else {
             panic!("malformed Imports should make the package version unavailable");
         };
@@ -675,7 +678,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![Arc::new(remote_repository)],
             local_repository,
-            true,
+            ProjectType::Package,
             BTreeSet::from([Relation::any("example").expect("valid example relation")]),
             BTreeMap::new(),
         )
@@ -692,7 +695,7 @@ mod tests {
         );
 
         let Dependencies::Available(dependencies) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
         else {
             panic!("malformed Suggests should not make the package version unavailable");
         };
@@ -706,7 +709,7 @@ mod tests {
         );
 
         let Dependencies::Available(dependencies) =
-            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new(), None)
+            dependencies_from_description("example 1.0.0", &description, &BTreeSet::new())
         else {
             panic!("hard dependencies should be available");
         };
@@ -723,34 +726,40 @@ mod tests {
         assert!(!range.contains(&candidate("2.0.0")));
     }
 
-    #[test]
-    fn project_namespace_is_unsatisfiable_in_root_and_transitive_dependencies() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_namespace_is_unsatisfiable_even_when_it_is_a_base_package() {
         let project_relation = Relation::any("project").expect("valid project relation");
-        let root_dependencies = dependency_ranges_from_relations(
-            &BTreeSet::from([project_relation]),
-            &BTreeSet::new(),
-            Some("project"),
+        let provider = RDependencyProvider::new(
+            Vec::new(),
+            local_repository("project", "1.0.0"),
+            ProjectType::Project,
+            BTreeSet::from([project_relation]),
+            BTreeMap::new(),
+            BTreeSet::new(),
         );
-        assert_eq!(root_dependencies["project"], Ranges::empty());
+        let project_dependencies = tokio::task::spawn_blocking(move || {
+            provider.dependency_ranges(&provider.root_relations)
+        })
+        .await
+        .expect("dependency task should join")
+        .expect("project dependencies should resolve");
+        assert_eq!(project_dependencies["project"], Ranges::empty());
 
-        let description =
-            Description::parse("Package: dependent\nVersion: 1.0.0\nImports: project\n");
-        let Dependencies::Available(transitive_dependencies) = dependencies_from_description(
-            "dependent 1.0.0",
-            &description,
-            &BTreeSet::new(),
-            Some("project"),
-        ) else {
-            panic!("dependency metadata should be available");
-        };
-        assert_eq!(transitive_dependencies["project"], Ranges::empty());
-
-        let base_namespace = dependency_ranges_from_relations(
-            &BTreeSet::from([Relation::any("stats").expect("valid base package relation")]),
-            &BTreeSet::from(["stats".to_string()]),
-            Some("stats"),
+        let provider = RDependencyProvider::new(
+            Vec::new(),
+            local_repository("stats", "1.0.0"),
+            ProjectType::Project,
+            BTreeSet::from([Relation::any("stats").expect("valid base package relation")]),
+            BTreeMap::new(),
+            BTreeSet::from(["stats".to_string()]),
         );
-        assert_eq!(base_namespace["stats"], Ranges::empty());
+        let base_dependencies = tokio::task::spawn_blocking(move || {
+            provider.dependency_ranges(&provider.root_relations)
+        })
+        .await
+        .expect("dependency task should join")
+        .expect("base dependencies should resolve");
+        assert_eq!(base_dependencies["stats"], Ranges::empty());
     }
 
     #[tokio::test]
@@ -909,8 +918,8 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
-            true,
-            DependencyConstraints::default(),
+            ProjectType::Package,
+            BTreeSet::new(),
             BTreeMap::new(),
             BTreeSet::new(),
         );
@@ -943,8 +952,8 @@ mod tests {
         let provider = RDependencyProvider::new(
             vec![remote_repository.clone()],
             local_repository,
-            true,
-            DependencyConstraints::default(),
+            ProjectType::Package,
+            BTreeSet::new(),
             BTreeMap::new(),
             BTreeSet::new(),
         );
@@ -973,12 +982,11 @@ mod tests {
         )
         .expect("valid suggested relation");
         let roots = BTreeSet::from([suggested]);
-        let root_dependencies = dependency_ranges_from_relations(&roots, &BTreeSet::new(), None);
         let provider = RDependencyProvider::new(
             Vec::new(),
             Arc::clone(&local_repository),
-            true,
-            root_dependencies,
+            ProjectType::Package,
+            roots,
             BTreeMap::new(),
             BTreeSet::new(),
         );
@@ -1018,7 +1026,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
-            true,
+            ProjectType::Package,
             BTreeSet::from([Relation::any("testBasePackage").expect("valid base relation")]),
             BTreeMap::new(),
         )
@@ -1041,7 +1049,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
-            true,
+            ProjectType::Package,
             BTreeSet::new(),
             BTreeMap::new(),
         )
@@ -1082,7 +1090,7 @@ mod tests {
         let error = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
-            false,
+            ProjectType::Project,
             BTreeSet::from([Relation::any("dependent").expect("valid dependent relation")]),
             BTreeMap::new(),
         )
@@ -1150,7 +1158,7 @@ mod tests {
         let selected = resolve_from_registry(
             vec![remote_repository.clone()],
             local_repository,
-            true,
+            ProjectType::Package,
             BTreeSet::from([Relation::new(
                 "testthat",
                 VersionRequirement::GreaterThanEqual(RequirementVersion::Version(

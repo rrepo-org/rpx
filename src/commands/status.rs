@@ -1,5 +1,5 @@
 use crate::{
-    description::{DescriptionParseError, project_type, root_package},
+    description::{DescriptionParseError, ProjectType, project_type, root_package},
     output::status,
     project::{
         LibraryMismatches, LoadProjectResolutionError, ProjectLoadError, library_mismatches,
@@ -54,9 +54,10 @@ pub(crate) async fn run() -> Result<(), Error> {
         .map(|(name, package)| (name.clone(), package.version.clone()))
         .collect::<BTreeMap<_, _>>();
     let (root_name, _) = root_package(&project.root, &project.description)?;
-    let optional_root = project_type(&project.root, &project.description)?
-        .is_installable()
-        .then_some(root_name);
+    let optional_root = match project_type(&project.description) {
+        ProjectType::Package => Some(root_name),
+        ProjectType::Project => None,
+    };
 
     let project_library = project_library_path(&project.root);
     let installed = installed_packages(&project_library).await?;

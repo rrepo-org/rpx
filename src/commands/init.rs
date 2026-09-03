@@ -1225,7 +1225,7 @@ mod tests {
         assert_eq!(description.package().unwrap().as_str(), "my.project");
         assert_eq!(description.version().unwrap().to_string(), "0.1.0");
         assert_eq!(
-            crate::description::project_type(Path::new("."), &description).unwrap(),
+            crate::description::project_type(&description),
             ProjectType::Project
         );
     }
