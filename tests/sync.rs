@@ -251,6 +251,56 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
 }
 
 #[test]
+fn refuses_to_sync_cyclic_package_dependencies() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-cycle";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest, jsonlite",
+    );
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let create_cycle_command = format!(
+        r#"cd {project_path} && perl -0pi -e 's/("digest": \{{.*?"dependencies": )\[[^\]]*\]/${{1}}["jsonlite"]/s; s/("jsonlite": \{{.*?"dependencies": )\[[^\]]*\]/${{1}}["digest"]/s' rpx.lock"#
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &create_cycle_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lockfile =
+        serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
+            .expect("lockfile should parse");
+    assert_eq!(
+        lockfile["packages"]["digest"]["dependencies"],
+        json!(["jsonlite"])
+    );
+    assert_eq!(
+        lockfile["packages"]["jsonlite"]["dependencies"],
+        json!(["digest"])
+    );
+
+    let sync_command = format!("cd {project_path} && rpx sync --no-install-project");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::sync::dependency_cycle")
+            && stderr.contains("package `digest` is blocked by a dependency cycle")
+            && stderr.contains("package `jsonlite` is blocked by a dependency cycle"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn sync_installs_project_without_mutating_its_sources() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-clean-sources";

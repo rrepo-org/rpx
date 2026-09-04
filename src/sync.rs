@@ -11,7 +11,7 @@ use crate::{
     project::{
         Project, ProjectLibraryError, ProjectResolution, RequiredPackages, ensure_project_library,
     },
-    r::{self, BasePackagesError, base_packages, build_package_archive, installed_packages},
+    r::{self, build_package_archive, installed_packages},
     repository::{
         CranRepository, GitRepository, LocalRepository, RepositoryError, RrepoRepository,
     },
@@ -48,9 +48,6 @@ pub(crate) enum SyncError {
     ProjectLibrary(#[from] ProjectLibraryError),
     #[error(transparent)]
     #[diagnostic(transparent)]
-    BasePackages(#[from] BasePackagesError),
-    #[error(transparent)]
-    #[diagnostic(transparent)]
     InstalledPackages(#[from] r::InstalledPackagesError),
     #[error("failed to remove package {package}: {source}")]
     #[diagnostic(code(rpx::sync::package_remove_failed))]
@@ -78,7 +75,7 @@ pub(crate) enum SyncError {
     },
     #[error(transparent)]
     #[diagnostic(transparent)]
-    PackageGraph(#[from] PackageGraphError),
+    DependencyCycle(#[from] DependencyCycleError),
     #[error("failed to build package {package}: {source}")]
     #[diagnostic(code(rpx::sync::package_build_failed))]
     PackageBuild {
@@ -136,8 +133,6 @@ pub(crate) async fn sync_resolved_project(
         (ProjectType::Package, ProjectPackageMode::Omit) | (ProjectType::Project, _) => {}
     }
 
-    validate_package_graph(&required).await?;
-
     let project_library = ensure_project_library(&project.root)?;
     let installer = Installer::new(installer_cache_path());
     let installed = installed_packages(&project_library).await?;
@@ -189,9 +184,16 @@ pub(crate) async fn sync_resolved_project(
             break Ok(());
         }
         if running.is_empty() {
-            break Err(SyncError::DownloadArtifactsFailed {
-                details: "package task graph stalled with no runnable tasks".to_string(),
-            });
+            break Err(DependencyCycleError {
+                packages: tasks
+                    .iter()
+                    .filter(|row| row.task.1 == TaskKind::Install)
+                    .map(|row| CycleBlockedPackage {
+                        package: row.task.0.clone(),
+                    })
+                    .collect(),
+            }
+            .into());
         }
 
         match running
@@ -498,39 +500,14 @@ fn pending_package_count(tasks: &BTreeSet<TaskRow>) -> usize {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub(crate) enum PackageGraphError {
-    #[error("package dependency metadata for `{package}` is invalid: {details}")]
-    #[diagnostic(code(rpx::sync::invalid_package_dependencies))]
-    InvalidDependencies { package: String, details: String },
-
-    #[error("package dependency graph is incomplete")]
-    #[diagnostic(
-        code(rpx::sync::missing_package_dependencies),
-        help("Include the missing packages in the sync or update the package requirements.")
-    )]
-    MissingDependencies {
-        #[related]
-        dependencies: Vec<MissingPackageDependency>,
-    },
-
-    #[error("cannot determine package installation order")]
-    #[diagnostic(
-        code(rpx::sync::dependency_cycle),
-        help("Update the package requirements to break the dependency cycle before syncing.")
-    )]
-    DependencyCycle {
-        #[related]
-        packages: Vec<CycleBlockedPackage>,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-#[error(
-    "package `{package}` requires `{dependency}`, but `{dependency}` is not included in the sync"
+#[error("cannot determine package installation order")]
+#[diagnostic(
+    code(rpx::sync::dependency_cycle),
+    help("Update the package requirements to break the dependency cycle before syncing.")
 )]
-pub(crate) struct MissingPackageDependency {
-    package: String,
-    dependency: String,
+pub(crate) struct DependencyCycleError {
+    #[related]
+    packages: Vec<CycleBlockedPackage>,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -1379,111 +1356,6 @@ async fn publish_artifact_response(
     Ok(())
 }
 
-async fn validate_package_graph(packages: &RequiredPackages) -> Result<(), SyncError> {
-    let base_packages = base_packages().await?;
-    let required_names = packages.keys().cloned().collect::<BTreeSet<_>>();
-    let indegree = required_names
-        .iter()
-        .map(|name| (name.clone(), 0_usize))
-        .collect::<BTreeMap<_, _>>();
-    let dependents = required_names
-        .iter()
-        .map(|name| (name.clone(), BTreeSet::new()))
-        .collect::<BTreeMap<_, _>>();
-
-    let dependencies = packages
-        .iter()
-        .map(|(package, (version, description))| {
-            required_dependencies(format!("{package} {}", version.version()), description)
-                .map(|dependencies| {
-                    dependencies
-                        .into_iter()
-                        .map(|dependency| (package.clone(), dependency.package().to_string()))
-                        .collect::<BTreeSet<_>>()
-                })
-                .map_err(|error| PackageGraphError::InvalidDependencies {
-                    package: package.clone(),
-                    details: error.to_string(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .filter(|(_, dependency)| !base_packages.contains(dependency));
-    let (missing, internal): (Vec<_>, Vec<_>) =
-        dependencies.partition(|(_, dependency)| !required_names.contains(dependency));
-
-    if !missing.is_empty() {
-        return Err(PackageGraphError::MissingDependencies {
-            dependencies: missing
-                .into_iter()
-                .map(|(package, dependency)| MissingPackageDependency {
-                    package,
-                    dependency,
-                })
-                .collect(),
-        }
-        .into());
-    }
-
-    let (mut indegree, dependents) = internal.into_iter().fold(
-        (indegree, dependents),
-        |(mut indegree, mut dependents), (package, dependency)| {
-            *indegree
-                .get_mut(&package)
-                .expect("required package should have indegree") += 1;
-            dependents
-                .get_mut(&dependency)
-                .expect("required dependency should exist")
-                .insert(package);
-            (indegree, dependents)
-        },
-    );
-
-    let mut ready = indegree
-        .iter()
-        .filter(|(_, count)| **count == 0)
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut ordered = Vec::with_capacity(packages.len());
-
-    while let Some(name) = ready.pop_first() {
-        ordered.push(name.clone());
-
-        dependents
-            .get(&name)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .for_each(|dependent| {
-                let count = indegree
-                    .get_mut(&dependent)
-                    .expect("dependent should have indegree entry");
-                *count -= 1;
-                if *count == 0 {
-                    ready.insert(dependent);
-                }
-            });
-    }
-
-    if ordered.len() != packages.len() {
-        let unresolved = indegree
-            .into_iter()
-            .filter(|(_, count)| *count > 0)
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        return Err(PackageGraphError::DependencyCycle {
-            packages: unresolved
-                .into_iter()
-                .map(|package| CycleBlockedPackage { package })
-                .collect(),
-        }
-        .into());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,79 +1674,5 @@ mod tests {
             key(&[("a".into(), Some("1.0.0".into())), ("b".into(), None)]),
             key(&[("b".into(), None), ("a".into(), Some("1.0.0".into()))])
         );
-    }
-
-    #[tokio::test]
-    async fn package_graph_validation_accepts_complete_acyclic_graph() {
-        let packages = required_packages(&[
-            ("dependent", "Imports: dependency, testBasePackage\n"),
-            ("dependency", ""),
-            ("unrelated", ""),
-        ]);
-        validate_package_graph(&packages).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn package_graph_validation_deduplicates_dependency_constraints() {
-        let packages = required_packages(&[
-            (
-                "dependent",
-                "Imports: dependency (>= 1.0.0), dependency (< 2.0.0)\n",
-            ),
-            ("dependency", ""),
-        ]);
-        validate_package_graph(&packages).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn package_graph_validation_reports_missing_dependencies() {
-        let packages = required_packages(&[
-            ("a", "Imports: missingB, missingA\n"),
-            ("b", "Imports: missingA\n"),
-        ]);
-        let error = validate_package_graph(&packages).await.unwrap_err();
-        let SyncError::PackageGraph(PackageGraphError::MissingDependencies { dependencies }) =
-            error
-        else {
-            panic!("missing dependencies should produce a structured graph error");
-        };
-        assert_eq!(
-            dependencies
-                .iter()
-                .map(|dependency| { (dependency.package.as_str(), dependency.dependency.as_str()) })
-                .collect::<Vec<_>>(),
-            vec![("a", "missingA"), ("a", "missingB"), ("b", "missingA")]
-        );
-    }
-
-    #[tokio::test]
-    async fn package_graph_validation_reports_all_blocked_names() {
-        let packages = required_packages(&[
-            ("a", "Imports: b\n"),
-            ("b", "Imports: a\n"),
-            ("c", "Imports: a\n"),
-        ]);
-        let error = validate_package_graph(&packages).await.unwrap_err();
-        let SyncError::PackageGraph(PackageGraphError::DependencyCycle { packages }) = error else {
-            panic!("cycles should produce a structured graph error");
-        };
-        assert_eq!(
-            packages
-                .iter()
-                .map(|package| package.package.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
-        );
-    }
-
-    #[tokio::test]
-    async fn package_graph_validation_names_invalid_dependency_metadata() {
-        let packages = required_packages(&[("broken", "Imports: dependency (>= invalid)\n")]);
-        let error = validate_package_graph(&packages).await.unwrap_err();
-        assert!(matches!(
-            error,
-            SyncError::PackageGraph(PackageGraphError::InvalidDependencies { package, .. })
-                if package == "broken"
-        ));
     }
 }
