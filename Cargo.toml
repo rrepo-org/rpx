@@ -1,13 +1,20 @@
 [package]
 name = "rpx"
-version = "2.0.0"
+version = "2.0.0-azure.3"
 edition = "2024"
 description = "Rust CLI for managing R package project dependencies"
+authors = ["Adam Smielewski <adam@scalerail.de>"]
 license = "MIT"
 repository = "https://github.com/rrepo-org/rpx"
 readme = "README.md"
 keywords = ["r", "packages", "cli", "dependencies"]
 categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.wix]
+upgrade-guid = "04C600C1-C3D0-42A0-83C0-5A026045FD7A"
+path-guid = "7B14F12B-63E8-4305-84D3-2B98AEA6B479"
+license = false
+eula = false
 
 [dependencies]
 async-trait = "0.1"
