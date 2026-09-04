@@ -68,7 +68,7 @@ the selected field.
 
 ## Install
 
-`rpx` requires R and Git to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` and `git` work in your shell.
+`rpx` requires R to be installed and available on `PATH`. Git is also required when using Git package remotes or asking `rpx init` to create a repository. Before using `rpx`, confirm that `Rscript` works in your shell and, when needed, that `git` does too.
 
 Install R:
 
@@ -87,6 +87,8 @@ Install the latest release on Windows:
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://rrepo.org/rpx/latest/rpx-installer.ps1 | iex"
 ```
+
+The documentation on `main` describes the upcoming rpx 2 release. Until rpx 2 is published as the latest stable release, use the Cargo command below to install the current development version.
 
 Windows binary signing is still being worked on. The PowerShell installer is available, but Windows Defender or SmartScreen may warn until the signing flow is finalized.
 
@@ -225,13 +227,13 @@ rpx repo base reset
 
 `rpx repo add` and `rpx repo remove` are shortcuts for the corresponding `rpx repo additional` commands. Remote arguments use the same syntax as the `Remotes` field in `DESCRIPTION`.
 
-The base repository is always enabled. A useful setup is to keep the built-in base universe and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
+The base repository is always enabled. Additional CRAN or CRAN-like repositories make their package versions available to the resolver:
 
 ```bash
 rpx repo additional add https://packagemanager.posit.co/cran/latest
 ```
 
-During locking, `rpx` merges versions across enabled repositories. Existing locked versions are preferred when they are still available from enabled repositories. If the same version is available from multiple repositories, the earlier repository wins for the locked source URL.
+During locking, `rpx` merges versions across enabled repositories. Existing locked versions are preferred when they are still available from enabled repositories. If the same version is available from multiple repositories, the earlier repository wins for the locked source URL. Binary and source artifacts are retrieved from that locked repository; additional repositories are not artifact fallbacks for a package locked to another source.
 
 When a repository requires authentication, `rpx` prompts for an API key and stores it in the operating system keyring for that repository's origin.
 
@@ -255,13 +257,18 @@ For teams, rrepo provides the same registry model for private R packages: publis
 
 ## Documentation
 
-The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overview):
+The rpx user guide is maintained in this repository:
 
-- [Install rpx](https://rrepo.org/documentation/install-rpx)
-- [Start a project](https://rrepo.org/documentation/start-a-project)
-- [Use an existing project](https://rrepo.org/documentation/use-an-existing-project)
-- [Run R](https://rrepo.org/documentation/run-r)
-- [Private packages](https://rrepo.org/documentation/private-packages)
+- [Overview](docs/01.overview.md)
+- [Install rpx](docs/02.install-rpx.md)
+- [Start a project](docs/03.start-a-project.md)
+- [Use an existing project](docs/04.use-an-existing-project.md)
+- [Manage dependencies](docs/05.manage-dependencies.md)
+- [Run commands](docs/06.run-r.md)
+- [Configure repositories](docs/07.repositories.md)
+- [Changelog](CHANGELOG.md)
+
+Documentation for the hosted rrepo service, including [private packages](https://rrepo.org/documentation/private-packages), package publishing, and API keys, remains at [rrepo.org](https://rrepo.org/documentation/overview).
 
 ## How It Works
 
@@ -286,4 +293,6 @@ The test suite depends on Docker and uses `testcontainers`.
 
 Integration tests run against the official `r-base` image and execute realistic package-management workflows inside containers. This keeps tests close to real usage while avoiding changes to your local R installation or package library.
 
-Releases are created by pushing a version tag such as `v1.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases. The Docker workflow publishes `ghcr.io/rrepo-org/rpx` images for `linux/amd64` and `linux/arm64`.
+Before releasing, update the version in `Cargo.toml` and `Cargo.lock`, move the relevant entries from `Unreleased` into a matching version section in [`CHANGELOG.md`](CHANGELOG.md), and run the test suite. The changelog heading must contain the exact package version so cargo-dist can use it for the GitHub release title and body.
+
+Create a release by pushing a matching version tag such as `v2.0.0`. The cargo-dist workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, installers, and release notes to GitHub Releases. The Docker workflow publishes `ghcr.io/rrepo-org/rpx` images for `linux/amd64` and `linux/arm64`. Only stable `vMAJOR.MINOR.PATCH` tags update the `latest` download on `rrepo.org`.
