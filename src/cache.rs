@@ -14,7 +14,7 @@ use url::Url;
 
 const SOURCE_ARTIFACT_CACHE_VERSION: &str = "v1";
 const BINARY_ARTIFACT_CACHE_VERSION: &str = "v1";
-const COMPILED_PACKAGE_CACHE_VERSION: &str = "v1";
+pub(crate) const INSTALLER_CACHE_VERSION: &str = "v1";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RegistryIdentity {
@@ -114,40 +114,10 @@ pub(crate) fn binary_artifact_cache_path(key: &BinaryArtifactCacheKey) -> PathBu
         .join(file_name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CompiledPackageCacheKey {
-    repository: RegistryIdentity,
-    package: String,
-    version: Version,
-    target: Triple,
-    r_version: RVersion,
-}
-
-impl CompiledPackageCacheKey {
-    pub(crate) fn new(
-        repository: RegistryIdentity,
-        package: impl Into<String>,
-        version: Version,
-        target: Triple,
-        r_version: RVersion,
-    ) -> Self {
-        Self {
-            repository,
-            package: package.into(),
-            version,
-            target,
-            r_version,
-        }
-    }
-}
-
-pub(crate) fn compiled_package_cache_path(key: &CompiledPackageCacheKey) -> PathBuf {
+pub(crate) fn installer_cache_path() -> PathBuf {
     cache_dir_path()
-        .join("builds")
-        .join(COMPILED_PACKAGE_CACHE_VERSION)
-        .join(&key.package)
-        .join(cache_key_digest(key))
-        .join("package")
+        .join("installer")
+        .join(INSTALLER_CACHE_VERSION)
 }
 
 #[cfg(test)]
@@ -271,59 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_package_cache_uses_binary_compatibility_identity() {
-        let repository = || RegistryIdentity::Cran("https://example.test/cran".parse().unwrap());
-        let key = |repository, version: &str, target: &str, r_version: &str| {
-            CompiledPackageCacheKey::new(
-                repository,
-                "package",
-                version.parse().unwrap(),
-                target.parse().unwrap(),
-                r_version.parse().unwrap(),
-            )
-        };
-        let base = compiled_package_cache_path(&key(
-            repository(),
-            "1.2.3",
-            "x86_64-pc-windows-msvc",
-            "4.3.0",
-        ));
-
-        assert_ne!(
-            base,
-            compiled_package_cache_path(&key(
-                RegistryIdentity::Cran("https://mirror.example.test/cran".parse().unwrap()),
-                "1.2.3",
-                "x86_64-pc-windows-msvc",
-                "4.3.0",
-            ))
-        );
-        assert_ne!(
-            base,
-            compiled_package_cache_path(&key(
-                repository(),
-                "1.2.3",
-                "aarch64-pc-windows-msvc",
-                "4.3.0",
-            ))
-        );
-        assert_ne!(
-            base,
-            compiled_package_cache_path(&key(
-                repository(),
-                "1.2.3",
-                "x86_64-pc-windows-msvc",
-                "4.3.1",
-            ))
-        );
-        assert_eq!(
-            base,
-            compiled_package_cache_path(&key(
-                repository(),
-                "1.2.3.0",
-                "x86_64-pc-windows-msvc",
-                "4.3.0",
-            ))
-        );
+    fn installer_cache_is_versioned() {
+        assert!(installer_cache_path().ends_with("installer/v1"));
     }
 }

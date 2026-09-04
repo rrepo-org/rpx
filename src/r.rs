@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     path::{Path, PathBuf},
     process::Output,
 };
 
 use miette::Diagnostic;
 use r_metadata::Version;
+use r_package_installer::{LibraryEntry, scan_library};
 use thiserror::Error;
 use tokio::{process::Command, sync::OnceCell};
 
@@ -91,57 +91,37 @@ pub enum PackageBuildError {
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum PackageInstallError {
-    #[error("failed to {action} {target}: {source}")]
-    #[diagnostic(code(rpx::install::command_failed))]
-    Command {
-        action: &'static str,
-        target: String,
-        #[source]
-        source: Box<RSubprocessError>,
-    },
-}
-
-#[derive(Debug, Error, Diagnostic)]
 pub enum InstalledPackagesError {
-    #[error("failed to inspect project library at {}: {source}", path.display())]
+    #[error("failed to inspect project library: {source}")]
     #[diagnostic(code(rpx::runtime::project_library_inspection_failed))]
-    LibraryMetadata {
-        path: PathBuf,
+    Scan {
         #[source]
-        source: std::io::Error,
+        source: r_package_installer::Error,
     },
 
-    #[error("project library path is not a directory: {}", path.display())]
-    #[diagnostic(code(rpx::runtime::project_library_not_directory))]
-    LibraryNotDirectory { path: PathBuf },
-
-    #[error("failed to inspect installed R packages: {source}")]
-    #[diagnostic(code(rpx::runtime::installed_packages_failed))]
-    Command {
+    #[error("failed to join project library inspection: {source}")]
+    #[diagnostic(code(rpx::runtime::project_library_inspection_join_failed))]
+    Join {
         #[source]
-        source: RSubprocessError,
+        source: tokio::task::JoinError,
     },
 
-    #[error("installed package output is not valid UTF-8: {source}")]
-    #[diagnostic(code(rpx::runtime::installed_packages_invalid_utf8))]
-    InvalidUtf8 {
-        #[source]
-        source: std::string::FromUtf8Error,
-    },
-
-    #[error("invalid installed package output on line {line}: {contents}")]
-    #[diagnostic(code(rpx::runtime::installed_packages_invalid_row))]
-    InvalidRow { line: usize, contents: String },
-
-    #[error("invalid installed version {version} for {package} on line {line}: {details}")]
+    #[error("invalid installed version {version} for {package}: {details}")]
     #[diagnostic(code(rpx::runtime::installed_package_invalid_version))]
     InvalidVersion {
-        line: usize,
         package: String,
         version: String,
         details: String,
     },
+
+    #[error("project library contains an active or interrupted package transaction at {}", path.display())]
+    #[diagnostic(
+        code(rpx::runtime::project_library_locked),
+        help(
+            "Finish the other package operation or remove the stale lock after confirming its owner is no longer running."
+        )
+    )]
+    Locked { path: PathBuf },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -185,65 +165,8 @@ pub enum RVersionError {
     },
 }
 
-fn project_r_command(program: impl AsRef<OsStr>, project_library: &Path) -> Command {
-    let mut command = Command::new(program.as_ref());
-    command.env("R_LIBS_USER", project_library);
-    command
-}
-
 static BASE_PACKAGES: OnceCell<BTreeSet<String>> = OnceCell::const_new();
 static R_VERSION: OnceCell<semver::Version> = OnceCell::const_new();
-
-pub async fn install_package_artifact(
-    project_library: &Path,
-    artifact_path: &Path,
-    package: &str,
-    version: &str,
-    pkg_type: &str,
-    r_version: &semver::Version,
-    target_library: &Path,
-) -> Result<Output, PackageInstallError> {
-    let mut command = project_r_command("Rscript", project_library);
-    command
-        .arg("--vanilla")
-        .arg("-e")
-        .arg(concat!(
-            "args <- commandArgs(trailingOnly = TRUE);",
-            "artifact <- args[[1L]];",
-            "package_type <- args[[2L]];",
-            "target_library <- args[[3L]];",
-            "package_name <- args[[4L]];",
-            "expected_version <- args[[5L]];",
-            "utils::install.packages(artifact, repos = NULL, type = package_type, lib = target_library);",
-            "package_dir <- file.path(target_library, package_name);",
-            "description <- file.path(package_dir, 'DESCRIPTION');",
-            "if (!dir.exists(package_dir) || !file.exists(description)) ",
-            "stop(sprintf('Expected package %s at %s after installation. Library entries: %s', package_name, package_dir, paste(list.files(target_library, all.files = TRUE), collapse = ', ')));",
-            "metadata <- read.dcf(description, fields = c('Package', 'Version'));",
-            "installed_name <- unname(metadata[1L, 'Package']);",
-            "installed_version <- unname(metadata[1L, 'Version']);",
-            "if (!identical(installed_name, package_name)) ",
-            "stop(sprintf('Installed package name is %s, expected %s', installed_name, package_name));",
-            "if (!identical(installed_version, expected_version)) ",
-            "stop(sprintf('Installed %s version %s, expected %s', package_name, installed_version, expected_version))"
-        ))
-        .arg(artifact_path)
-        .arg(pkg_type)
-        .arg(target_library)
-        .arg(package)
-        .arg(version);
-    command.kill_on_drop(true);
-    run_subprocess(command)
-        .await
-        .map_err(|source| PackageInstallError::Command {
-            action: "install",
-            target: format!(
-                "{package}@{version} from {} as {pkg_type} with R {r_version}",
-                artifact_path.display()
-            ),
-            source: Box::new(source),
-        })
-}
 
 pub async fn build_package_archive(
     package_root: &Path,
@@ -371,135 +294,47 @@ pub async fn base_packages() -> Result<BTreeSet<String>, BasePackagesError> {
 pub async fn installed_packages(
     project_library: &Path,
 ) -> Result<BTreeMap<String, PackageVersion>, InstalledPackagesError> {
-    let metadata = match tokio::fs::metadata(project_library).await {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeMap::new());
-        }
-        Err(source) => {
-            return Err(InstalledPackagesError::LibraryMetadata {
-                path: project_library.to_path_buf(),
-                source,
-            });
-        }
-    };
-    if !metadata.is_dir() {
-        return Err(InstalledPackagesError::LibraryNotDirectory {
-            path: project_library.to_path_buf(),
-        });
-    }
-
-    let expression = concat!(
-        "args <- commandArgs(trailingOnly = TRUE);",
-        "packages <- utils::installed.packages(lib.loc = args[[1L]]);",
-        "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
-        "utils::write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
-        "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
-    );
-
-    let mut command = Command::new("Rscript");
-    command
-        .arg("--vanilla")
-        .arg("-e")
-        .arg(expression)
-        .arg(project_library);
-    let output = run_subprocess(command)
+    let project_library = project_library.to_path_buf();
+    let entries = tokio::task::spawn_blocking(move || scan_library(&project_library))
         .await
-        .map_err(|source| InstalledPackagesError::Command { source })?;
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|source| InstalledPackagesError::InvalidUtf8 { source })?;
-
-    parse_installed_packages(&stdout)
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum PackageRemovalError {
-    #[error("failed to remove package {package} at {}: {source}", path.display())]
-    #[diagnostic(code(rpx::library::package_remove_failed))]
-    Remove {
-        package: String,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-pub fn remove_packages_from_venv(
-    project_library: &Path,
-    packages: &BTreeSet<String>,
-) -> Result<(), PackageRemovalError> {
-    packages
-        .iter()
-        .try_for_each(|package| remove_package_from_venv(project_library, package))
-}
-
-pub fn remove_package_from_venv(
-    project_library: &Path,
-    package: &str,
-) -> Result<(), PackageRemovalError> {
-    let package_dir = project_library.join(package);
-
-    if !package_dir.exists() {
-        return Ok(());
-    }
-
-    std::fs::remove_dir_all(&package_dir).map_err(|source| PackageRemovalError::Remove {
-        package: package.to_string(),
-        path: package_dir,
-        source,
-    })
-}
-
-fn parse_installed_packages(
-    output: &str,
-) -> Result<BTreeMap<String, PackageVersion>, InstalledPackagesError> {
-    let mut lines = output.lines().enumerate();
-    let Some((_, header)) = lines.next() else {
-        return Ok(BTreeMap::new());
-    };
-    if header != "Package\tVersion" {
-        return Err(InstalledPackagesError::InvalidRow {
-            line: 1,
-            contents: header.to_string(),
-        });
-    }
-
+        .map_err(|source| InstalledPackagesError::Join { source })?
+        .map_err(|source| InstalledPackagesError::Scan { source })?;
     let repository = built_in_repository();
-    lines
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            let mut parts = line.split('\t');
-            let (Some(package), Some(version), None) = (parts.next(), parts.next(), parts.next())
-            else {
-                return Err(InstalledPackagesError::InvalidRow {
-                    line: index + 1,
-                    contents: line.to_string(),
-                });
-            };
-            let package = package.trim();
-            let version = version.trim();
-            if package.is_empty() || version.is_empty() {
-                return Err(InstalledPackagesError::InvalidRow {
-                    line: index + 1,
-                    contents: line.to_string(),
+    let mut installed = BTreeMap::new();
+    for entry in entries {
+        match entry {
+            LibraryEntry::Installed(package) => {
+                let version = package
+                    .metadata
+                    .version
+                    .parse::<Version>()
+                    .map_err(|source| InstalledPackagesError::InvalidVersion {
+                        package: package.metadata.name.clone(),
+                        version: package.metadata.version.clone(),
+                        details: source.to_string(),
+                    })?;
+                installed.insert(
+                    package.metadata.name,
+                    PackageVersion::new(version, repository.clone()),
+                );
+            }
+            LibraryEntry::Locked(lock) => {
+                return Err(InstalledPackagesError::Locked { path: lock.path });
+            }
+            LibraryEntry::Recoverable(plan) => {
+                return Err(InstalledPackagesError::Locked {
+                    path: plan.lock.path,
                 });
             }
-
-            let parsed_version = version.parse::<Version>().map_err(|source| {
-                InstalledPackagesError::InvalidVersion {
-                    line: index + 1,
-                    package: package.to_string(),
-                    version: version.to_string(),
-                    details: source.to_string(),
-                }
-            })?;
-
-            Ok((
-                package.to_string(),
-                PackageVersion::new(parsed_version, repository.clone()),
-            ))
-        })
-        .collect()
+            LibraryEntry::Incomplete { path, reason } => {
+                tracing::debug!(path = %path.display(), %reason, "found incomplete project library entry");
+            }
+            LibraryEntry::Foreign(path) => {
+                tracing::debug!(path = %path.display(), "ignoring foreign project library entry");
+            }
+        }
+    }
+    Ok(installed)
 }
 
 pub async fn r_version_async() -> Result<semver::Version, RVersionError> {
@@ -604,29 +439,27 @@ fn summarize_subprocess_output(stdout: &[u8], stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::fs;
 
     use super::*;
 
-    #[test]
-    fn parses_installed_packages_with_builtin_repository() {
-        let packages = parse_installed_packages("Package\tVersion\ndigest\t0.6.37\n").unwrap();
+    #[tokio::test]
+    async fn scans_installed_packages_with_builtin_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("digest");
+        fs::create_dir_all(package.join("Meta")).unwrap();
+        fs::write(
+            package.join("DESCRIPTION"),
+            "Package: digest\nVersion: 0.6.37\nBuilt: R 4.5.1; x86_64-pc-linux-gnu; 2026-01-01; unix\n",
+        )
+        .unwrap();
+        fs::write(package.join("Meta/package.rds"), "metadata").unwrap();
+
+        let packages = installed_packages(directory.path()).await.unwrap();
         let digest = packages.get("digest").unwrap();
 
         assert_eq!(digest.version().to_string(), "0.6.37");
-        assert!(Arc::ptr_eq(digest.repository(), &built_in_repository()));
-    }
-
-    #[test]
-    fn rejects_invalid_installed_package_version() {
-        let error =
-            parse_installed_packages("Package\tVersion\ndigest\tnot-a-version\n").unwrap_err();
-
-        assert!(matches!(
-            error,
-            InstalledPackagesError::InvalidVersion { package, version, .. }
-                if package == "digest" && version == "not-a-version"
-        ));
+        assert!(digest.repository().equals(built_in_repository().as_ref()));
     }
 
     #[tokio::test]
@@ -651,9 +484,6 @@ mod tests {
             .await
             .expect_err("file should not be accepted as a library");
 
-        assert!(matches!(
-            error,
-            InstalledPackagesError::LibraryNotDirectory { path: actual } if actual == path
-        ));
+        assert!(matches!(error, InstalledPackagesError::Scan { .. }));
     }
 }
