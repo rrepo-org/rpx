@@ -75,7 +75,6 @@ fn install_sync_failure_wrappers(
     let command = format!(
         r#"mkdir -p {wrapper_path}/real {state_path}
 ln -s "$(command -v R)" {wrapper_path}/real/R
-ln -s "$(command -v Rscript)" {wrapper_path}/real/Rscript
 cat > {wrapper_path}/R <<'EOF'
 #!/bin/sh
 case "$*" in
@@ -96,14 +95,11 @@ case "$*" in
             exit "$status"
         fi
         ;;
-esac
-exec {wrapper_path}/real/R "$@"
-EOF
-cat > {wrapper_path}/Rscript <<'EOF'
-#!/bin/sh
-case "$*" in
-    *install.packages*digest*)
-        if [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
+    *CMD*INSTALL*)
+        artifact=
+        for argument in "$@"; do artifact=$argument; done
+        package=$(tar -xOzf "$artifact" --wildcards '*/DESCRIPTION' 2>/dev/null | grep -m1 '^Package:' | cut -d' ' -f2)
+        if [ "$package" = digest ] && [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
             attempts=0
             while [ ! -f "$RPX_TEST_STATE/root-active" ] && [ "$attempts" -lt 100 ]; do
                 sleep 0.05
@@ -119,9 +115,9 @@ case "$*" in
         fi
         ;;
 esac
-exec {wrapper_path}/real/Rscript "$@"
+exec {wrapper_path}/real/R "$@"
 EOF
-chmod +x {wrapper_path}/R {wrapper_path}/Rscript"#
+chmod +x {wrapper_path}/R"#
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -138,28 +134,18 @@ fn install_lock_failure_wrapper(
 ) -> String {
     let command = format!(
         r#"mkdir -p {wrapper_path}/real {state_path}
-ln -s "$(command -v Rscript)" {wrapper_path}/real/Rscript
-cat > {wrapper_path}/Rscript <<'EOF'
+ln -s "$(command -v R)" {wrapper_path}/real/R
+cat > {wrapper_path}/R <<'EOF'
 #!/bin/sh
 case "$*" in
-    *install.packages*)
-        last=
-        second_last=
-        third_last=
-        for argument in "$@"; do
-            third_last=$second_last
-            second_last=$last
-            last=$argument
-        done
-        package=$second_last
-        library=$third_last
+    *CMD*INSTALL*)
+        artifact=
+        for argument in "$@"; do artifact=$argument; done
+        package=$(tar -xOzf "$artifact" --wildcards '*/DESCRIPTION' 2>/dev/null | grep -m1 '^Package:' | cut -d' ' -f2)
         case "$package" in
             testpkg)
                 if [ "${{RPX_TEST_ROOT_DELAY:-}}" = 1 ] && [ "${{RPX_TEST_FAIL_DIGEST:-}}" = 1 ]; then
                     rm -f "$RPX_TEST_STATE/root-cleaned" "$RPX_TEST_STATE/digest-failed"
-                    printf '%s\n' "$library" > "$RPX_TEST_STATE/root-library"
-                    printf '%s\n' "$R_LIBS_USER" > "$RPX_TEST_STATE/project-library"
-                    mkdir -p "$library/00LOCK-testpkg"
                     touch "$RPX_TEST_STATE/root-active"
                     attempts=0
                     while [ ! -f "$RPX_TEST_STATE/digest-failed" ] && [ "$attempts" -lt 1200 ]; do
@@ -167,7 +153,6 @@ case "$*" in
                         attempts=$((attempts + 1))
                     done
                     sleep 1
-                    rm -rf "$library/00LOCK-testpkg"
                     rm -f "$RPX_TEST_STATE/root-active"
                     touch "$RPX_TEST_STATE/root-cleaned"
                 fi
@@ -191,9 +176,9 @@ case "$*" in
         esac
         ;;
 esac
-exec {wrapper_path}/real/Rscript "$@"
+exec {wrapper_path}/real/R "$@"
 EOF
-chmod +x {wrapper_path}/Rscript"#
+chmod +x {wrapper_path}/R"#
     );
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -266,6 +251,56 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
 }
 
 #[test]
+fn refuses_to_sync_cyclic_package_dependencies() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-cycle";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest, jsonlite",
+    );
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let create_cycle_command = format!(
+        r#"cd {project_path} && perl -0pi -e 's/("digest": \{{.*?"dependencies": )\[[^\]]*\]/${{1}}["jsonlite"]/s; s/("jsonlite": \{{.*?"dependencies": )\[[^\]]*\]/${{1}}["digest"]/s' rpx.lock"#
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &create_cycle_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lockfile =
+        serde_json::from_str::<Value>(&read_project_file(&container, project_path, "rpx.lock"))
+            .expect("lockfile should parse");
+    assert_eq!(
+        lockfile["packages"]["digest"]["dependencies"],
+        json!(["jsonlite"])
+    );
+    assert_eq!(
+        lockfile["packages"]["jsonlite"]["dependencies"],
+        json!(["digest"])
+    );
+
+    let sync_command = format!("cd {project_path} && rpx sync --no-install-project");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("rpx::sync::dependency_cycle")
+            && stderr.contains("package `digest` is blocked by a dependency cycle")
+            && stderr.contains("package `jsonlite` is blocked by a dependency cycle"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn sync_installs_project_without_mutating_its_sources() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync-clean-sources";
@@ -287,7 +322,7 @@ fn sync_installs_project_without_mutating_its_sources() {
     assert_package_state(&container, project_path, "testpkg", "TRUE");
 
     let assert_clean = format!(
-        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test ! -e \"$1\""
+        "cd {project_path} && test ! -e configured-during-install && test ! -e src/native.o && test ! -e src/testpkg.so && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/installer/v1/.build\"/* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &assert_clean);
     assert_eq!(
@@ -342,12 +377,12 @@ Suggests: digest",
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("code Some(97)") && stderr.contains("injected digest"),
+        stderr.contains("status Some(97)") && stderr.contains("injected digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 
     let completed_root_command = format!(
-        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test ! -e \"$1\""
+        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- \"$HOME/.cache/rpx/artifacts/source/v1/testpkg\"/*/artifact.tar.gz && test -f \"$1\" && set -- \"$HOME/.cache/rpx/artifacts/source/v1\"/*/*/.rpx-build-* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/installer/v1/.build\"/* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &completed_root_command);
     assert_eq!(
@@ -397,12 +432,12 @@ Suggests: digest",
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("code Some(97)") && stderr.contains("injected digest install"),
+        stderr.contains("status Some(97)") && stderr.contains("injected digest install"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 
     let completed_root_command = format!(
-        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && root_library=$(cat {state_path}/root-library) && project_library=$(cat {state_path}/project-library) && test ! -e \"$root_library\" && set -- \"$project_library\"/00LOCK* && test ! -e \"$1\" && set -- \"$HOME/.cache/rpx/build-temp\"/rpx-install-* && test ! -e \"$1\""
+        "test -f {state_path}/root-cleaned && test ! -e {state_path}/root-active && set -- \"$HOME/.cache/rpx/installer/v1/.build\"/* && test ! -e \"$1\""
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &completed_root_command);
     assert_eq!(
