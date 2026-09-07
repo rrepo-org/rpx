@@ -953,10 +953,10 @@ impl InstallArtifact {
         }
     }
 
-    fn progress_action(&self) -> &'static str {
+    fn installation_action(&self) -> &'static str {
         match self.kind {
-            ArtifactKind::Binary(_) => "extracting",
-            ArtifactKind::Source => "installing",
+            ArtifactKind::Binary(_) => "installing binary",
+            ArtifactKind::Source => "installing source",
         }
     }
 
@@ -1139,10 +1139,11 @@ async fn install_package(
         let r_version_for_prepare = r_version.clone();
 
         span.record("stage", "preparing cache");
-        span.pb_set_message(&format!(
+        let installation_message = format!(
             "{package} {version} {}",
-            artifact.progress_action()
-        ));
+            artifact.installation_action()
+        );
+        span.pb_set_message(&installation_message);
         let entry = tokio::task::spawn_blocking(move || {
             let artifact_digest = artifact_digest(&artifact_path).map_err(|source| {
                 InstallPackageError::ArtifactDigest {
@@ -1182,7 +1183,7 @@ async fn install_package(
         .map_err(|source| InstallPackageError::Join { source })??;
 
         span.record("stage", "updating project library");
-        span.pb_set_message(&format!("{package} {version} publishing"));
+        span.pb_set_message(&installation_message);
         let installer = installer.clone();
         let project_library = project_library.to_path_buf();
         let outcome =
@@ -1362,6 +1363,21 @@ mod tests {
     use crate::repository::{PackageRepository, built_in_repository};
     use r_description::Description;
     use r_metadata::Remote;
+
+    #[test]
+    fn install_artifact_actions_use_r_installation_terms() {
+        let binary = InstallArtifact {
+            path: PathBuf::new(),
+            kind: ArtifactKind::Binary(BinaryFormat::Zip),
+        };
+        let source = InstallArtifact {
+            path: PathBuf::new(),
+            kind: ArtifactKind::Source,
+        };
+
+        assert_eq!(binary.installation_action(), "installing binary");
+        assert_eq!(source.installation_action(), "installing source");
+    }
 
     #[test]
     fn package_requires_install_respects_source_and_version() {
