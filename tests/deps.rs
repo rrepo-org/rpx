@@ -106,7 +106,7 @@ fn runs_rpx_add_inside_custom_r_image() {
     assert!(lockfile["packages"].get("testpkg").is_none());
     assert_eq!(
         lockfile["repos"][0]["url"],
-        "https://upstream.rrepo.dev/cran"
+        "https://rrepo.dev/upstream/cran"
     );
     assert!(
         lockfile["requirements"]
@@ -456,13 +456,13 @@ Imports: digest",
         lockfile["repos"].as_array().is_some_and(|repositories| {
             repositories
                 .iter()
-                .any(|repository| repository["url"] == "https://upstream.rrepo.dev/cran")
+                .any(|repository| repository["url"] == "https://rrepo.dev/upstream/cran")
         }),
         "lockfile was: {lockfile}"
     );
     assert_eq!(
         lockfile["packages"]["digest"]["repository"],
-        "https://upstream.rrepo.dev/cran"
+        "https://rrepo.dev/upstream/cran"
     );
 }
 

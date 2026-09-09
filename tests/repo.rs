@@ -91,7 +91,7 @@ fn resets_configured_base_and_relocks_with_builtin_repository() {
     assert_eq!(description.matches("Title:").count(), 1);
     assert!(description.contains("Title: Normalized Title"));
     assert!(description.find("Title:").unwrap() < description.find("Version:").unwrap());
-    assert!(lockfile.contains("https://upstream.rrepo.dev/cran"));
+    assert!(lockfile.contains("https://rrepo.dev/upstream/cran"));
 }
 
 #[test]
@@ -101,13 +101,13 @@ fn sets_normalized_base_repository() {
     create_package_project(&container, project_path);
 
     let command =
-        format!("cd {project_path} && rpx repo base set https://upstream.rrepo.dev/cran/");
+        format!("cd {project_path} && rpx repo base set https://rrepo.dev/upstream/cran/");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
-    assert!(description.contains("Config/rpx/base-repository: https://upstream.rrepo.dev/cran"));
-    assert!(!description.contains("https://upstream.rrepo.dev/cran/"));
+    assert!(description.contains("Config/rpx/base-repository: https://rrepo.dev/upstream/cran"));
+    assert!(!description.contains("https://rrepo.dev/upstream/cran/"));
 
     let command = format!("cd {project_path} && rpx lock");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
@@ -126,11 +126,11 @@ fn additional_shortcut_detects_normalized_duplicate_without_relocking() {
     append_description(
         &container,
         project_path,
-        "Additional_repositories: https://upstream.rrepo.dev/cran/",
+        "Additional_repositories: https://rrepo.dev/upstream/cran/",
     );
     let before = read_project_file(&container, project_path, "DESCRIPTION");
 
-    let command = format!("cd {project_path} && rpx repo add https://upstream.rrepo.dev/cran");
+    let command = format!("cd {project_path} && rpx repo add https://rrepo.dev/upstream/cran");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");

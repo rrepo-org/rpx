@@ -210,12 +210,12 @@ rpx clean
 
 The package universe is the set of package versions and metadata available to the resolver.
 
-By default, `rpx` uses the public rrepo-backed CRAN universe at `https://upstream.rrepo.dev/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
+By default, `rpx` uses the public rrepo-backed CRAN universe at `https://rrepo.dev/upstream/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
 
 Projects can configure a base repository, additional rrepo or CRAN-like repositories, and package remotes:
 
 ```bash
-rpx repo base set https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo base set https://rrepo.dev/<org-slug>/<repo-slug>
 rpx repo additional add https://cloud.r-project.org
 rpx repo add https://packagemanager.posit.co/cran/latest
 rpx repo remote add github::owner/repository@main
@@ -242,12 +242,12 @@ Projects can set `Config/rpx/base-repository` in `DESCRIPTION` to replace the bu
 For private package universes, add an rrepo repository for your organization:
 
 ```bash
-rpx repo additional add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo additional add https://rrepo.dev/<org-slug>/<repo-slug>
 ```
 
 ## rrepo
 
-`rpx` can use CRAN and CRAN-like repositories, but its default package universe is the rrepo-backed CRAN mirror at `https://upstream.rrepo.dev/cran`.
+`rpx` can use CRAN and CRAN-like repositories, but its default package universe is the rrepo-backed CRAN mirror at `https://rrepo.dev/upstream/cran`.
 
 A plain CRAN-style mirror is mostly a package distribution endpoint. It is enough for installing available packages, but it is not a registry API built around dependency solving, package history, artifact selection, authentication, and private packages.
 
