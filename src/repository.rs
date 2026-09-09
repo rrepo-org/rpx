@@ -25,7 +25,7 @@ pub use git::GitRepository;
 pub use local::LocalRepository;
 pub use rrepo::RrepoRepository;
 
-const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
+const BUILT_IN_REPOSITORY_BASE_URL: &str = "https://rrepo.dev/upstream/cran";
 
 static BUILT_IN_REPOSITORY_URL: LazyLock<Url> = LazyLock::new(|| {
     parse_repository_url(BUILT_IN_REPOSITORY_BASE_URL)
