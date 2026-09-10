@@ -5,6 +5,11 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0-github-main"
+# CI overrides branch installs with upstream main at
+# c65a1a932e2661e05d6640716850d36b0f47efd7 for unreleased Azure signing support.
+# After regenerating CI, restore the --rev pin in plan, local builds, and signing.
+# Remove these overrides when switching to a release containing the Azure support.
+allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app

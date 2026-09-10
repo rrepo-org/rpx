@@ -62,10 +62,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # Pin unreleased Azure signing support; restore this override after generation.
         shell: bash
-        run: "cargo install --git https://github.com/axodotdev/cargo-dist/ --branch=main --locked cargo-dist"
+        run: "cargo install --git https://github.com/axodotdev/cargo-dist/ --rev c65a1a932e2661e05d6640716850d36b0f47efd7 --locked cargo-dist"
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -130,7 +129,8 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # The generated matrix tracks main; use the same revision as the plan job.
+        run: "cargo install --git https://github.com/axodotdev/cargo-dist/ --rev c65a1a932e2661e05d6640716850d36b0f47efd7 --locked cargo-dist"
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -242,7 +242,8 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        run: "cargo install --git https://github.com/axodotdev/cargo-dist/ --branch=main --locked cargo-dist"
+        # Keep the Windows signing tool at the same revision as the artifact builds.
+        run: "cargo install --git https://github.com/axodotdev/cargo-dist/ --rev c65a1a932e2661e05d6640716850d36b0f47efd7 --locked cargo-dist"
       - name: Fetch artifacts
         uses: actions/download-artifact@v8
         with:
