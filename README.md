@@ -53,9 +53,24 @@ rpx lock
 rpx sync
 ```
 
+## How rpx compares
+
+| | rpx | rv | uvr | renv | pak | rig |
+|---|---|---|---|---|---|---|
+| **Primary focus** | Constraint-driven project environments | Declarative project environments | Package and R-version management | Project snapshot and restore | Package resolution and installation | R-version management |
+| **Dependency declaration** | `DESCRIPTION` | `rproject.toml` | `uvr.toml` | Project discovery or `DESCRIPTION` | Package requests or `DESCRIPTION` | — |
+| **Version selection** | Explicit ranges with automatic bounds | Repository snapshots and package sources | Version requirements | Recorded versions and explicit installs | Package requests and constraints | — |
+| **Lockfile** | `rpx.lock` | `rv.lock` | `uvr.lock` | `renv.lock` | CI-oriented lockfiles | — |
+| **Remove packages outside the locked set** | Default during sync | Supported during sync | Supported during sync | Optional during restore | Not its primary workflow | — |
+| **R-version management** | Planned; currently uses installed R | Selects installed R | Installs and selects R | Records R version; installation is external | Uses installed R | Installs and selects R |
+
+rpx focuses on resolving compatibility requirements expressed in standard R metadata and maintaining the resulting project environment. R-version management is on the roadmap; today, rpx uses the R installation available on `PATH` and validates its version against the lockfile.
+
+Sources: [rv](https://a2-ai.github.io/rv-docs/), [rv version selection](https://a2-ai.github.io/rv-docs/cookbook/pkg_version/), [uvr](https://github.com/nbafrank/uvr), [renv](https://rstudio.github.io/renv/), [renv restore](https://rstudio.github.io/renv/reference/restore.html), [pak](https://pak.r-lib.org/), [rig](https://github.com/r-lib/rig). Comparison reviewed September 2026.
+
 ## Package sources
 
-rpx uses the rrepo repository API to discover package versions and dependency metadata. We host a CRAN mirror as one of rrepo's repositories, giving rpx access to CRAN packages through that interface. You can also configure other repositories, private packages, and Git sources.
+Resolving across package versions requires access to their dependency metadata. The rrepo repository API exposes that information directly, including historical versions, so rpx can compare candidates before downloading package archives. We host a CRAN mirror as one of rrepo's repositories to make CRAN packages available through this interface. rpx also supports other repositories, private packages, and Git sources.
 
 ## Documentation
 
