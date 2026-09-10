@@ -1,6 +1,6 @@
 [package]
 name = "rpx"
-version = "2.0.0"
+version = "2.0.0-azure.4"
 edition = "2024"
 description = "Rust CLI for managing R package project dependencies"
 license = "MIT"
