@@ -4,10 +4,17 @@ All notable changes to rpx are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rpx adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/rrepo-org/rpx/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/rrepo-org/rpx/compare/v1.7.0...v2.0.0
 
 ## [Unreleased]
+
+## [2.0.1]
+
+### Fixed
+
+- Fixed `rpx sync` rejecting pak 0.11.1 and other source packages with embedded private build paths in debug metadata by updating `r-package-installer` to 0.1.2.
 
 ## [2.0.0]
 
