@@ -1,6 +1,6 @@
 use directories::ProjectDirs;
 use miette::Diagnostic;
-use pubgrub::{DefaultStringReporter, PubGrubError, Reporter};
+use pubgrub::PubGrubError;
 use r_description::Description;
 use r_metadata::{Relation, Version, VersionRequirement};
 use std::{
@@ -476,12 +476,12 @@ pub(crate) enum ResolveProjectError {
         source: RepositoryError,
     },
 
-    #[error("package requirements are incompatible\n\n{explanation}")]
-    #[diagnostic(
-        code(rpx::lock::no_solution),
-        help("Adjust package constraints in DESCRIPTION and try again.")
-    )]
-    NoSolution { explanation: String },
+    #[error("dependency resolution failed\n\n{explanation}")]
+    #[diagnostic(code(rpx::lock::no_solution), help("{help}"))]
+    NoSolution {
+        explanation: String,
+        help: &'static str,
+    },
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -518,11 +518,39 @@ pub(crate) enum ResolveProjectError {
 
 impl From<ResolutionError> for ResolveProjectError {
     fn from(error: ResolutionError) -> Self {
+        let provider = match &error {
+            ResolutionError::Provider(provider)
+            | ResolutionError::PubGrub(
+                PubGrubError::ErrorChoosingVersion {
+                    source: provider, ..
+                }
+                | PubGrubError::ErrorRetrievingDependencies {
+                    source: provider, ..
+                }
+                | PubGrubError::ErrorInShouldCancel(provider),
+            ) => Some(provider),
+            _ => None,
+        };
+        if let Some(
+            ProviderError::Repository(source) | ProviderError::DependencyMetadata { source, .. },
+        ) = provider
+            && let Some(repository) = inaccessible_git_repository(source)
+        {
+            return Self::GitRepositoryUnavailable {
+                repository: repository.to_owned(),
+                source: Box::new(error),
+            };
+        }
         match error {
-            ResolutionError::PubGrub(PubGrubError::NoSolution(mut derivation_tree)) => {
-                derivation_tree.collapse_no_versions();
+            ResolutionError::NoSolution(report) => Self::NoSolution {
+                explanation: report.explanation,
+                help: report.help,
+            },
+            ResolutionError::PubGrub(PubGrubError::NoSolution(derivation_tree)) => {
+                let report = crate::resolver::report::render(derivation_tree, None, BTreeMap::new());
                 Self::NoSolution {
-                    explanation: DefaultStringReporter::report(&derivation_tree),
+                    explanation: report.explanation,
+                    help: report.help,
                 }
             }
             ResolutionError::PubGrub(
@@ -554,18 +582,7 @@ impl From<ResolutionError> for ResolveProjectError {
             ) => Self::Repository(source),
             ResolutionError::BasePackages(source) => Self::BasePackages(source),
             ResolutionError::Provider(provider) => {
-                let repository = match &provider {
-                    ProviderError::Repository(source)
-                    | ProviderError::DependencyMetadata { source, .. } => {
-                        inaccessible_git_repository(source).map(str::to_owned)
-                    }
-                };
-                if let Some(repository) = repository {
-                    Self::GitRepositoryUnavailable {
-                        repository,
-                        source: Box::new(ResolutionError::Provider(provider)),
-                    }
-                } else if matches!(
+                if matches!(
                     provider,
                     ProviderError::Repository(RepositoryError::CranPackages(_))
                         | ProviderError::DependencyMetadata {

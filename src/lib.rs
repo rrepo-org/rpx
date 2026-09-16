@@ -155,7 +155,7 @@ mod tests {
         let error = ResolveProjectError::from(ResolutionError::PubGrub(source));
         assert!(matches!(
             &error,
-            ResolveProjectError::NoSolution { explanation } if explanation.contains("missing")
+            ResolveProjectError::NoSolution { explanation, .. } if explanation.contains("missing")
         ));
         assert_eq!(
             error.code().map(|code| code.to_string()).as_deref(),
