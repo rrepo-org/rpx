@@ -100,3 +100,40 @@ jobs:
         with:
           name: test-results-${{ matrix.os }}-${{ matrix.r }}-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
+
+  windows-diagnostic:
+    name: Diagnose Windows Rscript
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: nextest-windows-latest
+
+      - name: Compare direct and wrapped Rscript
+        env:
+          RPX_DIAGNOSTIC_REPORT: ${{ github.workspace }}/diagnostic-results.json
+        run: >-
+          cargo-nextest nextest run --profile ci
+          --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to .
+          --run-ignored only -E 'test(windows_diagnostic::compare_direct_and_wrapped_rscript)'
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-rscript-diagnostics
+          path: |
+            diagnostic-results.json
+            target/nextest/ci/junit.xml
