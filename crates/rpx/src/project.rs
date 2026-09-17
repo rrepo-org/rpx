@@ -1117,11 +1117,16 @@ pub fn project_library_root_path(path: &Path) -> PathBuf {
 }
 
 pub fn libraries_dir_path() -> PathBuf {
-    project_dirs().data_dir().join("libraries")
+    env::var_os("RPX_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dirs().data_dir().to_path_buf())
+        .join("libraries")
 }
 
 pub fn cache_dir_path() -> PathBuf {
-    project_dirs().cache_dir().to_path_buf()
+    env::var_os("RPX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dirs().cache_dir().to_path_buf())
 }
 
 fn project_dirs() -> ProjectDirs {
