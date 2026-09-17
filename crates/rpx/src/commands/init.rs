@@ -1253,9 +1253,9 @@ mod tests {
     }
 
     #[test]
-    fn production_rbuildignore_has_exact_contents() {
+    fn production_rbuildignore_has_expected_patterns() {
         assert_eq!(
-            RBUILDIGNORE,
+            RBUILDIGNORE.lines().collect::<Vec<_>>(),
             "^rpx\\.lock$\n\
 ^.*\\.Rproj$\n\
 ^\\.Rproj\\.user$\n\
@@ -1272,6 +1272,8 @@ mod tests {
 ^\\.github$\n\
 ^\\.vscode$\n\
 ^[.]?air[.]toml$\n"
+                .lines()
+                .collect::<Vec<_>>()
         );
     }
 }

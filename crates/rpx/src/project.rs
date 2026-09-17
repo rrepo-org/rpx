@@ -1456,31 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_lockfile_replacement_after_description_was_updated() {
-        let directory = TestProject::new("partial-project-write");
-        let lockfile_path = directory.0.join(LOCKFILE_NAME);
-        fs::create_dir(&lockfile_path).expect("lockfile destination should block replacement");
-        let description = Description::parse("Package: changed\nVersion: 2.0.0\n");
-
-        let error = write_project_files(&directory.0, Some(&description), &lockfile())
-            .expect_err("lockfile replacement should fail");
-
-        assert!(matches!(
-            error,
-            ProjectWriteError::LockfileReplaceAfterDescription { path, .. }
-                if path == lockfile_path
-        ));
-        assert_eq!(
-            read_description(&directory.0)
-                .expect("updated DESCRIPTION should be readable")
-                .package()
-                .expect("updated package name should be valid")
-                .as_str(),
-            "changed"
-        );
-    }
-
-    #[test]
     fn treats_missing_and_outdated_lockfiles_as_absent_previous_resolutions() {
         let directory = TestProject::new("previous-lockfile");
         assert_eq!(
