@@ -12,5 +12,3 @@ mod recovery;
 mod repositories;
 #[path = "e2e/support.rs"]
 mod support;
-#[path = "e2e/windows_diagnostic.rs"]
-mod windows_diagnostic;

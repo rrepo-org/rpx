@@ -225,7 +225,28 @@ impl Fixture {
     }
 
     pub fn r_assert(&self, project: &Path, script: &str) {
-        self.success(project, &["run", "Rscript", "--vanilla", "-e", script]);
+        // Windows Rscript does not reliably handle multiline expressions via -e.
+        let script_path = tempfile::Builder::new()
+            .prefix("assert-")
+            .suffix(".R")
+            .tempfile_in(&self.temp)
+            .unwrap()
+            .into_temp_path();
+        fs::write(&script_path, script).unwrap();
+        let output = self
+            .rpx_command(project)
+            .args(["run", "Rscript", "--vanilla"])
+            .arg(&script_path)
+            .output()
+            .expect("rpx should start");
+        script_path
+            .close()
+            .expect("assertion script should be removed");
+        assert!(
+            output.status.success(),
+            "R assertion failed:\n{script}\n{}",
+            diagnostic(&output)
+        );
     }
 
     pub fn assert_state_empty(&self) {
