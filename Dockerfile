@@ -3,12 +3,11 @@ FROM rust:1-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
-COPY assets ./assets
-COPY src ./src
+COPY crates ./crates
 
-RUN cargo build --release --locked
+RUN cargo build -p rpx --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
@@ -19,3 +18,12 @@ RUN cp /usr/local/bin/rpx /rpx
 
 ENTRYPOINT ["rpx"]
 CMD ["--help"]
+
+FROM r-base:latest AS test
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/rpx /usr/local/bin/rpx
+CMD ["sleep", "infinity"]

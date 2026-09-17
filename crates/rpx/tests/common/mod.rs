@@ -8,14 +8,13 @@ use testcontainers::{
 };
 
 pub fn rpx_test_image() -> testcontainers::GenericImage {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
 
     GenericBuildableImage::new("rpx-test", "latest")
-        .with_dockerfile(root.join("tests/docker/rpx.Dockerfile"))
+        .with_dockerfile(root.join("Dockerfile"))
         .with_file(root.join("Cargo.toml"), "./Cargo.toml")
         .with_file(root.join("Cargo.lock"), "./Cargo.lock")
-        .with_file(root.join("assets"), "./assets")
-        .with_file(root.join("src"), "./src")
+        .with_file(root.join("crates"), "./crates")
         .build_image()
         .expect("image should build")
 }
