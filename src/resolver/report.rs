@@ -21,11 +21,17 @@ type Conclusion = Derived<String, Range, String>;
 type Terms = Map<String, Term<Range>>;
 type Versions = BTreeMap<String, BTreeSet<PackageVersion>>;
 
+#[derive(Debug)]
+pub(crate) enum FailureKind {
+    Requirements,
+    DependencyMetadata,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{explanation}")]
 pub(crate) struct ResolutionReport {
     pub(crate) explanation: String,
-    pub(crate) help: &'static str,
+    pub(crate) kind: FailureKind,
 }
 
 pub(crate) fn render(mut tree: Tree, root: Option<String>, versions: Versions) -> ResolutionReport {
@@ -36,10 +42,10 @@ pub(crate) fn render(mut tree: Tree, root: Option<String>, versions: Versions) -
     tree = simplify(tree, &formatter);
     ResolutionReport {
         explanation: DefaultStringReporter::report_with_formatter(&tree, &formatter),
-        help: if metadata_failure {
-            "Dependency metadata could not be parsed. Check the affected package's DESCRIPTION or use a version/repository with valid metadata."
+        kind: if metadata_failure {
+            FailureKind::DependencyMetadata
         } else {
-            "Check the requested versions in DESCRIPTION and the packages available in your configured repositories."
+            FailureKind::Requirements
         },
     }
 }

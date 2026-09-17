@@ -27,7 +27,11 @@ use crate::{
     lockfile::{self, LOCKFILE_NAME, Lockfile, LockfileReadError, read_lockfile},
     r::{BasePackagesError, RVersionError, r_version_async},
     repository::{GitRepository, LocalRepository, PackageRepository, RepositoryError},
-    resolver::{PackageVersion, ProviderError, ResolutionError, resolve_from_registry},
+    resolver::{
+        PackageVersion, ProviderError, ResolutionError,
+        report::{FailureKind, ResolutionReport},
+        resolve_from_registry,
+    },
 };
 
 pub type RequiredPackages = BTreeMap<String, (PackageVersion, Arc<Description>)>;
@@ -477,11 +481,18 @@ pub(crate) enum ResolveProjectError {
     },
 
     #[error("dependency resolution failed\n\n{explanation}")]
-    #[diagnostic(code(rpx::lock::no_solution), help("{help}"))]
-    NoSolution {
-        explanation: String,
-        help: &'static str,
-    },
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Check the requested versions in DESCRIPTION and the packages available in your configured repositories.")
+    )]
+    NoSolution { explanation: String },
+
+    #[error("dependency resolution failed\n\n{explanation}")]
+    #[diagnostic(
+        code(rpx::lock::no_solution),
+        help("Dependency metadata could not be parsed. Check the affected package's DESCRIPTION or use a version/repository with valid metadata.")
+    )]
+    NoSolutionWithInvalidMetadata { explanation: String },
 
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -516,6 +527,19 @@ pub(crate) enum ResolveProjectError {
     BuildLockfile(#[from] LockfileBuildError),
 }
 
+impl From<ResolutionReport> for ResolveProjectError {
+    fn from(report: ResolutionReport) -> Self {
+        match report.kind {
+            FailureKind::Requirements => Self::NoSolution {
+                explanation: report.explanation,
+            },
+            FailureKind::DependencyMetadata => Self::NoSolutionWithInvalidMetadata {
+                explanation: report.explanation,
+            },
+        }
+    }
+}
+
 impl From<ResolutionError> for ResolveProjectError {
     fn from(error: ResolutionError) -> Self {
         let provider = match &error {
@@ -542,16 +566,9 @@ impl From<ResolutionError> for ResolveProjectError {
             };
         }
         match error {
-            ResolutionError::NoSolution(report) => Self::NoSolution {
-                explanation: report.explanation,
-                help: report.help,
-            },
+            ResolutionError::NoSolution(report) => (*report).into(),
             ResolutionError::PubGrub(PubGrubError::NoSolution(derivation_tree)) => {
-                let report = crate::resolver::report::render(derivation_tree, None, BTreeMap::new());
-                Self::NoSolution {
-                    explanation: report.explanation,
-                    help: report.help,
-                }
+                crate::resolver::report::render(derivation_tree, None, BTreeMap::new()).into()
             }
             ResolutionError::PubGrub(
                 PubGrubError::ErrorChoosingVersion {
