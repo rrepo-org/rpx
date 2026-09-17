@@ -4,11 +4,27 @@ All notable changes to rpx are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rpx adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.0.2-rc.1...HEAD
+[2.0.2-rc.1]: https://github.com/rrepo-org/rpx/compare/v2.0.1...v2.0.2-rc.1
 [2.0.1]: https://github.com/rrepo-org/rpx/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/rrepo-org/rpx/compare/v1.7.0...v2.0.0
 
 ## [Unreleased]
+
+## [2.0.2-rc.1]
+
+Prerelease for validating the Cargo workspace migration and release pipeline.
+
+### Added
+
+- Added `RPX_DATA_DIR` and `RPX_CACHE_DIR` overrides for isolated application state.
+
+### Changed
+
+- Moved the application into the `crates/rpx` workspace member while retaining the single `rpx` executable.
+- Replaced container-based end-to-end tests with native cross-platform tests and reusable nextest build archives.
+- Updated cargo-dist to 0.33.0 and consolidated Docker builds into the root Dockerfile.
+- Refreshed the dependency lockfile.
 
 ## [2.0.1]
 

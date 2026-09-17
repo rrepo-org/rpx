@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "rpx"
-version = "2.0.1"
+version = "2.0.2-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
