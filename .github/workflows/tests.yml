@@ -74,6 +74,18 @@ jobs:
       - name: Run archived tests
         run: cargo-nextest nextest run --profile ci --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to .
 
+      - name: Summarize test results
+        if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: Tests / ${{ matrix.os }}
+          annotate_only: true
+          skip_annotations: true
+          job_summary: true
+          detailed_summary: true
+          include_time_in_summary: true
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v7
