@@ -1,0 +1,56 @@
+[package]
+name = "rpx"
+version = "2.0.1"
+edition = "2024"
+description = "Rust CLI for managing R package project dependencies"
+license = "MIT"
+repository = "https://github.com/rrepo-org/rpx"
+readme = "../../README.md"
+keywords = ["r", "packages", "cli", "dependencies"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.6.0", features = ["derive"] }
+bytes = "1"
+cliclack = "0.5.6"
+directories = "6.0.0"
+flate2 = "1.1.5"
+futures-core = "0.3"
+futures-util = "0.3"
+http = "1"
+indicatif = "0.18.4"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
+miette = { version = "7.6.0", features = ["fancy"] }
+moka = { version = "0.12", features = ["future"] }
+pathdiff = "0.2"
+petname = { version = "3.2.0", default-features = false, features = ["default-rng", "default-words"] }
+pubgrub = "0.3.0"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
+reqwest-middleware = "0.5"
+reqwest-tracing = "0.7"
+rpassword = "7.3.1"
+r-description = { package = "r-description-parser", version = "=0.2.0" }
+r-metadata = "=0.2.0"
+r-package-installer = "0.1.2"
+r-packages = { package = "r-packages-parser", version = "=0.2.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4.44"
+target-lexicon = "0.13.3"
+tempfile = "3"
+thiserror = "2.0.17"
+time = "0.3.53"
+tokio = { version = "1.51.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync"] }
+tracing = "0.1.41"
+tracing-indicatif = "0.3.13"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+semver = { version = "1.0.28", features = ["serde"] }
+url = { version = "2.5.8", features = ["serde"] }
+relative-path = { version = "2.0.1", features = ["serde"] }
+[dev-dependencies]
+mockito = "1.7.0"
+
+[lints.clippy]
+pedantic = "warn"

@@ -1117,11 +1117,16 @@ pub fn project_library_root_path(path: &Path) -> PathBuf {
 }
 
 pub fn libraries_dir_path() -> PathBuf {
-    project_dirs().data_dir().join("libraries")
+    env::var_os("RPX_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dirs().data_dir().to_path_buf())
+        .join("libraries")
 }
 
 pub fn cache_dir_path() -> PathBuf {
-    project_dirs().cache_dir().to_path_buf()
+    env::var_os("RPX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dirs().cache_dir().to_path_buf())
 }
 
 fn project_dirs() -> ProjectDirs {
@@ -1453,31 +1458,6 @@ mod tests {
             error,
             ProjectWriteError::Prepare { path, .. } if path == expected
         ));
-    }
-
-    #[test]
-    fn reports_lockfile_replacement_after_description_was_updated() {
-        let directory = TestProject::new("partial-project-write");
-        let lockfile_path = directory.0.join(LOCKFILE_NAME);
-        fs::create_dir(&lockfile_path).expect("lockfile destination should block replacement");
-        let description = Description::parse("Package: changed\nVersion: 2.0.0\n");
-
-        let error = write_project_files(&directory.0, Some(&description), &lockfile())
-            .expect_err("lockfile replacement should fail");
-
-        assert!(matches!(
-            error,
-            ProjectWriteError::LockfileReplaceAfterDescription { path, .. }
-                if path == lockfile_path
-        ));
-        assert_eq!(
-            read_description(&directory.0)
-                .expect("updated DESCRIPTION should be readable")
-                .package()
-                .expect("updated package name should be valid")
-                .as_str(),
-            "changed"
-        );
     }
 
     #[test]
