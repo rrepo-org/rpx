@@ -18,12 +18,3 @@ RUN cp /usr/local/bin/rpx /rpx
 
 ENTRYPOINT ["rpx"]
 CMD ["--help"]
-
-FROM r-base:latest AS test
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git openssh-client \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/target/release/rpx /usr/local/bin/rpx
-CMD ["sleep", "infinity"]
