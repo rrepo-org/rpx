@@ -29,7 +29,7 @@ Install the revision to benchmark as the baseline:
 
 ```shell
 git checkout <baseline-revision>
-cargo install --path . --force
+cargo install --path crates/rpx --force
 ```
 
 Return to the benchmark suite and run the installed binary:

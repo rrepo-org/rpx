@@ -84,7 +84,7 @@ Resolving across package versions requires access to their dependency metadata. 
 Run the test suite with:
 
 ```bash
-cargo test
+cargo test --workspace --locked
 ```
 
 Integration tests require Docker and use `testcontainers` with the official `r-base` image to exercise package-management workflows without modifying your local R library.

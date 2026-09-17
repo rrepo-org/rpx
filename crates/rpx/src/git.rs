@@ -1150,12 +1150,18 @@ pub(crate) mod tests {
         assert_eq!(first, reused);
         assert_ne!(first, second);
         assert_eq!(
-            fs::read_to_string(first.join("DESCRIPTION")).expect("first file should exist"),
-            "Package: example\nVersion: 1.0.0\n"
+            fs::read_to_string(first.join("DESCRIPTION"))
+                .expect("first file should exist")
+                .lines()
+                .collect::<Vec<_>>(),
+            ["Package: example", "Version: 1.0.0"]
         );
         assert_eq!(
-            fs::read_to_string(second.join("DESCRIPTION")).expect("second file should exist"),
-            "Package: example\nVersion: 2.0.0\n"
+            fs::read_to_string(second.join("DESCRIPTION"))
+                .expect("second file should exist")
+                .lines()
+                .collect::<Vec<_>>(),
+            ["Package: example", "Version: 2.0.0"]
         );
 
         remove_git_cache(&remote, initial);
@@ -1175,8 +1181,11 @@ pub(crate) mod tests {
             .expect("old commit should checkout");
 
         assert_eq!(
-            fs::read_to_string(path.join("DESCRIPTION")).expect("file should exist"),
-            "Package: example\nVersion: 1.0.0\n"
+            fs::read_to_string(path.join("DESCRIPTION"))
+                .expect("file should exist")
+                .lines()
+                .collect::<Vec<_>>(),
+            ["Package: example", "Version: 1.0.0"]
         );
         remove_git_cache(&remote, initial);
         fs::remove_dir_all(source_path).expect("source should be removed");
@@ -1198,8 +1207,11 @@ pub(crate) mod tests {
 
         assert_eq!(repaired, path);
         assert_eq!(
-            fs::read_to_string(repaired.join("DESCRIPTION")).expect("file should exist"),
-            "Package: example\nVersion: 1.0.0\n"
+            fs::read_to_string(repaired.join("DESCRIPTION"))
+                .expect("file should exist")
+                .lines()
+                .collect::<Vec<_>>(),
+            ["Package: example", "Version: 1.0.0"]
         );
         remove_git_cache(&remote, initial);
         fs::remove_dir_all(source_path).expect("source should be removed");

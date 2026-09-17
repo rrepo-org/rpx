@@ -3,12 +3,11 @@ FROM rust:1-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
-COPY assets ./assets
-COPY src ./src
+COPY crates ./crates
 
-RUN cargo build --release --locked
+RUN cargo build -p rpx --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
