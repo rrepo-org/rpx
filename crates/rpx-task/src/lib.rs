@@ -493,4 +493,49 @@ mod tests {
         assert!(matches!(error, ExecutionError::Join { node, .. } if node == task.id()));
         assert!(dependent.output().is_none());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_operations_obey_resource_limits_and_deliver_all_results() {
+        let mut graph = GraphBuilder::<&'static str>::new();
+        let worker = graph.resource(5);
+        let limited = graph.resource(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut producers = Vec::new();
+        for value in 0..40 {
+            let active = active.clone();
+            producers.push(
+                graph
+                    .task((), vec![(worker, 1), (limited, 1)], move |()| async move {
+                        assert!(active.fetch_add(1, Ordering::SeqCst) < 2);
+                        for _ in 0..5 {
+                            tokio::task::yield_now().await;
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(value)
+                    })
+                    .unwrap(),
+            );
+        }
+        let result = graph
+            .task(producers, vec![(worker, 1)], |values| async move {
+                Ok(values.iter().map(|n| **n).sum::<usize>())
+            })
+            .unwrap();
+        let mut running = 0;
+        graph
+            .finish()
+            .unwrap()
+            .execute(|event| {
+                match event {
+                    ExecutionEvent::Started(_) => running += 1,
+                    ExecutionEvent::Succeeded(_) | ExecutionEvent::Failed(_) => running -= 1,
+                }
+                assert!(running <= 2);
+            })
+            .await
+            .unwrap();
+        assert_eq!(running, 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(**result.output().unwrap(), (0..40).sum::<usize>());
+    }
 }
