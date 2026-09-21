@@ -1989,6 +1989,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpx-scheduler"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "rtoolbox"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
