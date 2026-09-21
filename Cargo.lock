@@ -1972,6 +1972,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-tracing",
  "rpassword",
+ "rpx-task",
  "semver",
  "serde",
  "serde_json",

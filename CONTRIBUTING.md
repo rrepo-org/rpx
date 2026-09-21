@@ -8,7 +8,23 @@ Run the test suite with:
 cargo test --workspace --locked
 ```
 
-The integration tests require Docker and use `testcontainers` with the official `r-base` image. They exercise package-management workflows without changing your local R installation or package library.
+The integration tests run native R processes and require R on `PATH`, plus the
+toolchain needed to compile R source packages. They isolate project libraries,
+caches, and temporary files. Some tests access the live built-in repository.
+
+For the same concurrency settings used by the native E2E suite, run:
+
+```bash
+cargo nextest run --workspace --locked
+```
+
+The scheduler and task runner can be tested without R:
+
+```bash
+cargo test -p rpx-scheduler -p rpx-task --locked
+```
+
+See [sync execution](docs/sync-engine.md) for crate boundaries and test coverage.
 
 ## Preparing a release
 

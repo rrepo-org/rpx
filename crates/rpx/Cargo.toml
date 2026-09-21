@@ -10,6 +10,7 @@ keywords = ["r", "packages", "cli", "dependencies"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+rpx-task = { path = "../rpx-task" }
 async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }
 bytes = "1"

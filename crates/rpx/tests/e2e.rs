@@ -1,3 +1,5 @@
+#[path = "e2e/artifacts.rs"]
+mod artifacts;
 #[path = "e2e/dependencies.rs"]
 mod dependencies;
 #[path = "e2e/execution.rs"]

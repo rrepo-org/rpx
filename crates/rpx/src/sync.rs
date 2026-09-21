@@ -1,3 +1,7 @@
+mod artifact;
+mod plan;
+use artifact::{ArtifactKind, PreparedArtifact};
+
 use crate::{
     cache::{
         BinaryArtifactCacheKey, INSTALLER_CACHE_VERSION, RegistryIdentity, SourceArtifactCacheKey,
@@ -12,17 +16,15 @@ use crate::{
         Project, ProjectLibraryError, ProjectResolution, RequiredPackages, ensure_project_library,
     },
     r::{self, build_package_archive, installed_packages},
-    repository::{
-        CranRepository, GitRepository, LocalRepository, RepositoryError, RrepoRepository,
-    },
+    repository::{CranRepository, GitRepository, LocalRepository, RrepoRepository},
     resolver::PackageVersion,
     ui::{progress_bar_style, progress_count_style, progress_spinner_style},
 };
 use futures_util::StreamExt;
 use miette::Diagnostic;
 use r_package_installer::{
-    Artifact, BinaryArtifact, BinaryFormat, CacheKey, Digest as InstallerDigest, ExpectedPackage,
-    InstallOutcome, Installer, PrepareRequest, RemovalOutcome, SourceArtifact, SourceOptions,
+    BinaryFormat, CacheKey, Digest as InstallerDigest, ExpectedPackage, InstallOutcome, Installer,
+    PrepareRequest, RemovalOutcome,
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -40,6 +42,8 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum SyncError {
+    #[error("sync task engine failed: {details}")]
+    TaskEngine { details: String },
     #[error(transparent)]
     #[diagnostic(transparent)]
     DescriptionParse(#[from] DescriptionParseError),
@@ -136,102 +140,66 @@ pub(crate) async fn sync_resolved_project(
     let project_library = ensure_project_library(&project.root)?;
     let installer = Installer::new(installer_cache_path());
     let installed = installed_packages(&project_library).await?;
-    let mut tasks = sync_tasks(&required, &installed)?;
-    let total_packages = pending_package_count(&tasks) as u64;
     let sync_span = tracing::info_span!(
         "sync_packages",
-        total = total_packages,
+        total = tracing::field::Empty,
         completed = 0_u64,
         running = 0_u64,
-        pending = total_packages,
+        pending = tracing::field::Empty,
         stage = tracing::field::Empty,
         indicatif.pb_show = true,
     );
+    let plan = plan::sync_plan(
+        &required,
+        &installed,
+        SyncTaskContext {
+            installer,
+            project_library,
+            r_version: Arc::new(resolution.r_version),
+            span: sync_span.clone(),
+        },
+    )?;
+    let total_packages = plan.install_count as u64;
+    sync_span.record("total", total_packages);
+    sync_span.record("pending", total_packages);
     sync_span.pb_set_style(&progress_count_style());
     sync_span.pb_set_message("sync packages");
     sync_span.pb_set_length(total_packages);
     sync_span.pb_start();
 
-    let context = SyncTaskContext {
-        installer,
-        project_library,
-        r_version: Arc::new(resolution.r_version),
-    };
-    let mut resources = ResourcePool::new();
-    let mut running = tokio::task::JoinSet::<(TaskRow, Result<(), SyncError>)>::new();
     let mut completed = 0_u64;
-
-    let result = loop {
-        while let Some(row) = pop_startable(&mut tasks, &resources) {
-            resources.reserve(row.task.1);
-            let task = row.task.clone();
-            let version = row.version.clone();
-            let dependencies = row.dependencies.clone();
-            let context = context.clone();
-            running.spawn(
-                async move {
-                    let result = run_sync_task(task, version, dependencies, context).await;
-                    (row, result)
+    let mut running = 0_u64;
+    let result = plan
+        .graph
+        .execute(|event| {
+            use rpx_task::ExecutionEvent;
+            match event {
+                ExecutionEvent::Started(_) => running += 1,
+                ExecutionEvent::Succeeded(node) => {
+                    running -= 1;
+                    if plan.tasks[&node].1 == TaskKind::Install {
+                        completed += 1;
+                        sync_span.pb_inc(1);
+                    }
                 }
-                .instrument(sync_span.clone()),
-            );
-        }
-
-        sync_span.record("running", running.len() as u64);
-        sync_span.record("pending", pending_package_count(&tasks) as u64);
-
-        if running.is_empty() && tasks.is_empty() {
-            break Ok(());
-        }
-        if running.is_empty() {
-            break Err(DependencyCycleError {
-                packages: tasks
-                    .iter()
-                    .filter(|row| row.task.1 == TaskKind::Install)
-                    .map(|row| CycleBlockedPackage {
-                        package: row.task.0.clone(),
-                    })
-                    .collect(),
+                ExecutionEvent::Failed(_) => running -= 1,
             }
-            .into());
-        }
-
-        match running
-            .join_next()
-            .await
-            .expect("running task set should not be empty")
-        {
-            Ok((row, Ok(()))) => {
-                resources.release(row.task.1);
-                if row.task.1 == TaskKind::Install {
-                    completed += 1;
-                    sync_span.pb_inc(1);
-                }
-                complete_task(&mut tasks, row);
-            }
-            Ok((row, Err(error))) => {
-                resources.release(row.task.1);
-                break Err(error);
-            }
-            Err(error) => {
-                break Err(SyncError::DownloadArtifactsFailed {
-                    details: format!("sync task failed to join: {error}"),
-                });
-            }
-        }
-
-        sync_span.record("completed", completed);
-        sync_span.record("running", running.len() as u64);
-        sync_span.record("pending", pending_package_count(&tasks) as u64);
-    };
-
-    if result.is_err() {
-        while running.join_next().await.is_some() {}
-    }
+            sync_span.record("running", running);
+            sync_span.record("completed", completed);
+            sync_span.record("pending", total_packages - completed);
+        })
+        .instrument(sync_span.clone())
+        .await
+        .map_err(|error| match error {
+            rpx_task::ExecutionError::Operation { source, .. } => source,
+            other => SyncError::TaskEngine {
+                details: other.to_string(),
+            },
+        });
 
     sync_span.record("completed", completed);
     sync_span.record("running", 0_u64);
-    sync_span.record("pending", 0_u64);
+    sync_span.record("pending", total_packages - completed);
     sync_span.record("stage", "done");
     sync_span.pb_set_finish_message(&format!("sync packages {completed}/{total_packages}"));
     result?;
@@ -257,6 +225,7 @@ struct SyncTaskContext {
     installer: Installer,
     project_library: PathBuf,
     r_version: Arc<semver::Version>,
+    span: tracing::Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -276,229 +245,6 @@ struct DependencyInput {
     version: Option<String>,
 }
 
-#[derive(Clone)]
-struct TaskRow {
-    blockers: usize,
-    task: TaskId,
-    version: PackageVersion,
-    dependencies: Vec<DependencyInput>,
-    dependents: BTreeSet<TaskId>,
-}
-
-impl Ord for TaskRow {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (&self.blockers, &self.task).cmp(&(&other.blockers, &other.task))
-    }
-}
-
-impl PartialOrd for TaskRow {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for TaskRow {
-    fn eq(&self, other: &Self) -> bool {
-        self.blockers == other.blockers && self.task == other.task
-    }
-}
-
-impl Eq for TaskRow {}
-
-struct ResourcePool {
-    shared: usize,
-    checkout: usize,
-    r: usize,
-}
-
-impl ResourcePool {
-    fn new() -> Self {
-        Self {
-            shared: 0,
-            checkout: 0,
-            r: 0,
-        }
-    }
-
-    fn can_reserve(&self, kind: TaskKind) -> bool {
-        self.shared < SYNC_SHARED_WORKERS
-            && (kind != TaskKind::Checkout || self.checkout < SYNC_CHECKOUT_WORKERS)
-            && (!matches!(kind, TaskKind::Build | TaskKind::Install) || self.r < SYNC_R_WORKERS)
-    }
-
-    fn reserve(&mut self, kind: TaskKind) {
-        debug_assert!(self.can_reserve(kind));
-        self.shared += 1;
-        if kind == TaskKind::Checkout {
-            self.checkout += 1;
-        }
-        if matches!(kind, TaskKind::Build | TaskKind::Install) {
-            self.r += 1;
-        }
-    }
-
-    fn release(&mut self, kind: TaskKind) {
-        self.shared -= 1;
-        if kind == TaskKind::Checkout {
-            self.checkout -= 1;
-        }
-        if matches!(kind, TaskKind::Build | TaskKind::Install) {
-            self.r -= 1;
-        }
-    }
-}
-
-fn sync_tasks(
-    required: &RequiredPackages,
-    installed: &BTreeMap<String, PackageVersion>,
-) -> Result<BTreeSet<TaskRow>, SyncError> {
-    let package_names = required
-        .iter()
-        .filter(|(name, (version, _))| package_requires_install(version, installed.get(*name)))
-        .map(|(name, _)| name.clone())
-        .collect::<BTreeSet<_>>();
-    let packages = required
-        .iter()
-        .filter(|(package, _)| package_names.contains(*package))
-        .map(|(package, (version, description))| {
-            let dependencies =
-                required_dependencies(format!("{package} {}", version.version()), description)?
-                    .into_iter()
-                    .map(|relation| relation.package().to_string())
-                    .collect::<BTreeSet<_>>();
-            Ok((package.clone(), version.clone(), dependencies))
-        })
-        .collect::<Result<Vec<_>, SyncError>>()?;
-    let install_tasks = packages
-        .iter()
-        .flat_map(|(package, package_version, dependencies)| {
-            let install = (package.clone(), TaskKind::Install);
-            let install_blockers = 1 + dependencies
-                .iter()
-                .filter(|dependency| package_names.contains(*dependency))
-                .count();
-            let install_dependents = packages
-                .iter()
-                .filter(|(_, _, dependencies)| dependencies.contains(package))
-                .map(|(dependent, _, _)| (dependent.clone(), TaskKind::Install))
-                .collect::<BTreeSet<_>>();
-            let dependency_inputs = dependencies
-                .iter()
-                .map(|dependency| DependencyInput {
-                    name: dependency.clone(),
-                    version: required
-                        .get(dependency)
-                        .map(|(version, _)| version.version().to_string()),
-                })
-                .collect::<Vec<_>>();
-            let repository = package_version.repository();
-
-            match (
-                repository.as_ref().downcast_ref::<LocalRepository>(),
-                repository.as_ref().downcast_ref::<GitRepository>(),
-            ) {
-                (Some(_), _) => vec![
-                    TaskRow {
-                        blockers: 0,
-                        task: (package.clone(), TaskKind::Build),
-                        version: package_version.clone(),
-                        dependencies: Vec::new(),
-                        dependents: BTreeSet::from([install.clone()]),
-                    },
-                    TaskRow {
-                        blockers: install_blockers,
-                        task: install,
-                        version: package_version.clone(),
-                        dependencies: dependency_inputs,
-                        dependents: install_dependents,
-                    },
-                ],
-                (_, Some(_)) => {
-                    let build = (package.clone(), TaskKind::Build);
-                    vec![
-                        TaskRow {
-                            blockers: 0,
-                            task: (package.clone(), TaskKind::Checkout),
-                            version: package_version.clone(),
-                            dependencies: Vec::new(),
-                            dependents: BTreeSet::from([build.clone()]),
-                        },
-                        TaskRow {
-                            blockers: 1,
-                            task: build,
-                            version: package_version.clone(),
-                            dependencies: Vec::new(),
-                            dependents: BTreeSet::from([install.clone()]),
-                        },
-                        TaskRow {
-                            blockers: install_blockers,
-                            task: install,
-                            version: package_version.clone(),
-                            dependencies: dependency_inputs,
-                            dependents: install_dependents,
-                        },
-                    ]
-                }
-                (None, None) => vec![
-                    TaskRow {
-                        blockers: 0,
-                        task: (package.clone(), TaskKind::Download),
-                        version: package_version.clone(),
-                        dependencies: Vec::new(),
-                        dependents: BTreeSet::from([install.clone()]),
-                    },
-                    TaskRow {
-                        blockers: install_blockers,
-                        task: install,
-                        version: package_version.clone(),
-                        dependencies: dependency_inputs,
-                        dependents: install_dependents,
-                    },
-                ],
-            }
-        });
-    let remove_tasks = installed
-        .iter()
-        .filter(|(package, _)| !required.contains_key(*package))
-        .map(|(package, version)| TaskRow {
-            blockers: 0,
-            task: (package.clone(), TaskKind::Remove),
-            version: version.clone(),
-            dependencies: Vec::new(),
-            dependents: BTreeSet::new(),
-        });
-    Ok(install_tasks.chain(remove_tasks).collect())
-}
-
-fn pop_startable(tasks: &mut BTreeSet<TaskRow>, resources: &ResourcePool) -> Option<TaskRow> {
-    let task = tasks
-        .iter()
-        .take_while(|row| row.blockers == 0)
-        .find(|row| resources.can_reserve(row.task.1))?
-        .clone();
-    tasks.take(&task)
-}
-
-fn complete_task(tasks: &mut BTreeSet<TaskRow>, completed: TaskRow) {
-    for dependent in completed.dependents {
-        let mut row = tasks
-            .iter()
-            .find(|row| row.task == dependent)
-            .cloned()
-            .expect("dependent task should exist");
-        tasks.take(&row);
-        row.blockers -= 1;
-        tasks.insert(row);
-    }
-}
-
-fn pending_package_count(tasks: &BTreeSet<TaskRow>) -> usize {
-    tasks
-        .iter()
-        .filter(|row| row.task.1 == TaskKind::Install)
-        .count()
-}
-
 #[derive(Debug, Error, Diagnostic)]
 #[error("cannot determine package installation order")]
 #[diagnostic(
@@ -516,121 +262,23 @@ pub(crate) struct CycleBlockedPackage {
     package: String,
 }
 
-async fn run_sync_task(
-    (package, kind): TaskId,
-    package_version: PackageVersion,
-    dependencies: Vec<DependencyInput>,
-    context: SyncTaskContext,
-) -> Result<(), SyncError> {
-    match kind {
-        TaskKind::Remove => {
-            let installer = context.installer;
-            let project_library = context.project_library;
-            let package_for_remove = package.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                installer.remove(&project_library, &package_for_remove)
-            })
-            .await
-            .map_err(|source| SyncError::BlockingTask { source })?
-            .map_err(|source| SyncError::RemovePackage {
-                package: package.clone(),
-                source,
-            })?;
-            if let RemovalOutcome::CommittedCleanupPending { lock } = outcome {
-                tracing::warn!(package, path = %lock.display(), "package removal committed but cleanup remains pending");
-            }
-            Ok(())
-        }
-        TaskKind::Download => {
-            let version = package_version.version().to_string();
-            download_package_artifact(package.clone(), package_version, context.r_version)
-                .await
-                .map_err(|source| SyncError::DownloadPackageArtifact {
-                    package,
-                    version,
-                    source,
-                })
-        }
-        TaskKind::Checkout => {
-            let repository = package_version
-                .repository()
-                .as_ref()
-                .downcast_ref::<GitRepository>()
-                .expect("checkout task should use a Git repository")
-                .clone();
-            repository
-                .checkout()
-                .await
-                .map_err(|error| SyncError::DownloadArtifactsFailed {
-                    details: format!("failed to checkout {package}: {error}"),
-                })?;
-            Ok(())
-        }
-        TaskKind::Build => {
-            let repository = package_version.repository().as_ref();
-            let (package_root, source) =
-                if let Some(repository) = repository.downcast_ref::<LocalRepository>() {
-                    (
-                        repository.path().to_path_buf(),
-                        SourceArtifactIdentity::Local(repository.path().to_path_buf()),
-                    )
-                } else {
-                    let repository = repository
-                        .downcast_ref::<GitRepository>()
-                        .expect("build task should use a local or Git repository");
-                    let checkout = repository.checkout_path().await.map_err(|error| {
-                        SyncError::DownloadArtifactsFailed {
-                            details: format!("failed to locate checkout for {package}: {error}"),
-                        }
-                    })?;
-                    let package_root = repository
-                        .subdirectory()
-                        .map_or(checkout.clone(), |subdirectory| checkout.join(subdirectory));
-                    let commit = repository.commit().await.map_err(|error| {
-                        SyncError::DownloadArtifactsFailed {
-                            details: format!("failed to resolve Git commit for {package}: {error}"),
-                        }
-                    })?;
-                    (
-                        package_root,
-                        SourceArtifactIdentity::Git {
-                            remote: repository.remote().clone(),
-                            commit,
-                            subdirectory: repository.subdirectory().map(Path::to_path_buf),
-                        },
-                    )
-                };
-            let archive = source_artifact_cache_path(&SourceArtifactCacheKey::new(
-                source,
-                &package,
-                package_version.version().clone(),
-            ));
-            build_package_archive(
-                &package_root,
-                &package,
-                package_version.version().as_ref(),
-                &archive,
-            )
-            .await
-            .map_err(|source| SyncError::PackageBuild {
-                package,
-                source: Box::new(source),
-            })
-        }
-        TaskKind::Install => install_package(
-            &context.installer,
-            &context.project_library,
-            &package,
-            &package_version,
-            context.r_version.as_ref(),
-            &dependencies,
-        )
-        .await
-        .map_err(|source| SyncError::PackageInstall {
-            package,
-            source: Box::new(source),
-        }),
+async fn remove_package(package: String, context: SyncTaskContext) -> Result<(), SyncError> {
+    let installer = context.installer;
+    let project_library = context.project_library;
+    let package_for_remove = package.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        installer.remove(&project_library, &package_for_remove)
+    })
+    .await
+    .map_err(|source| SyncError::BlockingTask { source })?
+    .map_err(|source| SyncError::RemovePackage {
+        package: package.clone(),
+        source,
+    })?;
+    if let RemovalOutcome::CommittedCleanupPending { lock } = outcome {
+        tracing::warn!(package, path = %lock.display(), "package removal committed but cleanup remains pending");
     }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -711,7 +359,7 @@ async fn download_package_artifact(
     package: String,
     package_version: PackageVersion,
     r_version: Arc<semver::Version>,
-) -> Result<(), DownloadPackageArtifactError> {
+) -> Result<PreparedArtifact, DownloadPackageArtifactError> {
     let version = package_version.version().to_string();
     let span = tracing::info_span!(
         "download_package_artifact",
@@ -738,14 +386,14 @@ async fn download_package_artifact(
         );
         span.record("stage", "downloading binary");
         span.pb_set_message(&format!("{package} {version} downloading binary"));
-        match registry_binary_artifact(&repository, &package, &package_version, r_version.as_ref()) {
-            Ok(Some(binary)) => {
+        match registry_binary_location(&repository, &package, &package_version, r_version.as_ref()) {
+            Ok(Some((path, format))) => {
                 let binary_result = async {
-                    match artifact_cache_entry(&binary.path) {
+                    match artifact_cache_entry(&path) {
                         ArtifactCacheEntry::File => return Ok(()),
                         ArtifactCacheEntry::Invalid => {
                             return Err(DownloadPackageArtifactError::InvalidArtifact {
-                                path: binary.path,
+                                path: path.clone(),
                             });
                         }
                         ArtifactCacheEntry::Missing => {}
@@ -775,7 +423,7 @@ async fn download_package_artifact(
                         source,
                     })?;
                     span.record("artifact_kind", "binary");
-                    publish_artifact_response(binary.path, response, &span).await
+                    publish_artifact_response(path.clone(), response, &span).await
                 }
                 .await;
 
@@ -783,7 +431,7 @@ async fn download_package_artifact(
                     Ok(()) => {
                         span.record("stage", "prepared");
                         span.pb_set_message(&format!("{package} {version} prepared"));
-                        return Ok(());
+                        return Ok(PreparedArtifact::Binary { path, format });
                     }
                     Err(error @ DownloadPackageArtifactError::InvalidArtifact { .. }) => {
                         return Err(error);
@@ -810,13 +458,12 @@ async fn download_package_artifact(
         span.pb_set_message(&format!("{package} {version} falling back to source"));
         span.record("stage", "downloading source");
         span.pb_set_message(&format!("{package} {version} downloading source"));
-        let source = registry_source_artifact(&repository, &package, &package_version);
-        let path = source.path;
+        let path = registry_source_path(&repository, &package, &package_version);
         match artifact_cache_entry(&path) {
             ArtifactCacheEntry::File => {
                 span.record("stage", "prepared");
                 span.pb_set_message(&format!("{package} {version} prepared"));
-                return Ok(());
+                return Ok(PreparedArtifact::Source { path });
             }
             ArtifactCacheEntry::Invalid => {
                 return Err(DownloadPackageArtifactError::InvalidArtifact { path });
@@ -871,10 +518,10 @@ async fn download_package_artifact(
             }
         };
         span.record("artifact_kind", "source");
-        publish_artifact_response(path, response, &span).await?;
+        publish_artifact_response(path.clone(), response, &span).await?;
         span.record("stage", "prepared");
         span.pb_set_message(&format!("{package} {version} prepared"));
-        Ok(())
+        Ok(PreparedArtifact::Source { path })
     }
     .instrument(span.clone())
     .await
@@ -882,23 +529,6 @@ async fn download_package_artifact(
 
 #[derive(Debug, Error)]
 pub(crate) enum InstallPackageError {
-    #[error("unsupported package repository")]
-    UnsupportedRepository,
-    #[error("failed to resolve Git commit for {package}: {source}")]
-    GitCommit {
-        package: String,
-        #[source]
-        source: RepositoryError,
-    },
-    #[error("failed to determine the macOS binary package type: {source}")]
-    MacBinaryType {
-        #[source]
-        source: http::BinaryArtifactRequestError,
-    },
-    #[error("no installable artifact exists for {package} {version}")]
-    MissingArtifact { package: String, version: String },
-    #[error("artifact cache entry is not a file: {}", path.display())]
-    InvalidArtifact { path: PathBuf },
     #[error("failed to determine the artifact digest at {}: {source}", path.display())]
     ArtifactDigest {
         path: PathBuf,
@@ -918,17 +548,6 @@ pub(crate) enum InstallPackageError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArtifactKind {
-    Binary(BinaryFormat),
-    Source,
-}
-
-struct InstallArtifact {
-    path: PathBuf,
-    kind: ArtifactKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtifactCacheEntry {
     File,
     Missing,
@@ -945,39 +564,6 @@ fn artifact_cache_entry(path: &Path) -> ArtifactCacheEntry {
     }
 }
 
-impl InstallArtifact {
-    fn trace_kind(&self) -> &'static str {
-        match self.kind {
-            ArtifactKind::Binary(_) => "binary",
-            ArtifactKind::Source => "source",
-        }
-    }
-
-    fn installation_action(&self) -> &'static str {
-        match self.kind {
-            ArtifactKind::Binary(_) => "installing binary",
-            ArtifactKind::Source => "installing source",
-        }
-    }
-
-    fn into_installer_artifact(self, project_library: PathBuf) -> Artifact {
-        match self.kind {
-            ArtifactKind::Binary(format) => Artifact::Binary(BinaryArtifact {
-                path: self.path,
-                format,
-            }),
-            ArtifactKind::Source => Artifact::Source(SourceArtifact {
-                path: self.path,
-                options: SourceOptions {
-                    dependency_libraries: vec![project_library],
-                    allow_non_staged: true,
-                    ..SourceOptions::default()
-                },
-            }),
-        }
-    }
-}
-
 fn registry_identity(package_version: &PackageVersion) -> Option<RegistryIdentity> {
     let repository = package_version.repository();
     let repository = repository.as_ref();
@@ -990,12 +576,12 @@ fn registry_identity(package_version: &PackageVersion) -> Option<RegistryIdentit
     }
 }
 
-fn registry_binary_artifact(
+fn registry_binary_location(
     registry: &RegistryIdentity,
     package: &str,
     package_version: &PackageVersion,
     r_version: &semver::Version,
-) -> Result<Option<InstallArtifact>, http::BinaryArtifactRequestError> {
+) -> Result<Option<(PathBuf, BinaryFormat)>, http::BinaryArtifactRequestError> {
     let format = match HOST.operating_system {
         OperatingSystem::Windows => BinaryFormat::Zip,
         OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
@@ -1011,106 +597,31 @@ fn registry_binary_artifact(
         HOST.clone(),
         r_version.clone(),
     ));
-    Ok(Some(InstallArtifact {
-        path,
-        kind: ArtifactKind::Binary(format),
-    }))
+    Ok(Some((path, format)))
 }
 
-fn registry_source_artifact(
+fn registry_source_path(
     registry: &RegistryIdentity,
     package: &str,
     package_version: &PackageVersion,
-) -> InstallArtifact {
-    InstallArtifact {
-        path: source_artifact_cache_path(&SourceArtifactCacheKey::new(
-            SourceArtifactIdentity::Registry(registry.clone()),
-            package,
-            package_version.version().clone(),
-        )),
-        kind: ArtifactKind::Source,
-    }
-}
-
-async fn select_install_artifact(
-    package: &str,
-    package_version: &PackageVersion,
-    r_version: &semver::Version,
-) -> Result<InstallArtifact, InstallPackageError> {
-    let repository = package_version.repository();
-    let repository = repository.as_ref();
-    let artifact = if let Some(registry) = registry_identity(package_version) {
-        if let Some(binary) =
-            registry_binary_artifact(&registry, package, package_version, r_version)
-                .map_err(|source| InstallPackageError::MacBinaryType { source })?
-        {
-            match artifact_cache_entry(&binary.path) {
-                ArtifactCacheEntry::File => binary,
-                ArtifactCacheEntry::Invalid => {
-                    return Err(InstallPackageError::InvalidArtifact { path: binary.path });
-                }
-                ArtifactCacheEntry::Missing => {
-                    registry_source_artifact(&registry, package, package_version)
-                }
-            }
-        } else {
-            registry_source_artifact(&registry, package, package_version)
-        }
-    } else if let Some(repository) = repository.downcast_ref::<LocalRepository>() {
-        InstallArtifact {
-            path: source_artifact_cache_path(&SourceArtifactCacheKey::new(
-                SourceArtifactIdentity::Local(repository.path().to_path_buf()),
-                package,
-                package_version.version().clone(),
-            )),
-            kind: ArtifactKind::Source,
-        }
-    } else if let Some(repository) = repository.downcast_ref::<GitRepository>() {
-        let commit =
-            repository
-                .commit()
-                .await
-                .map_err(|source| InstallPackageError::GitCommit {
-                    package: package.to_string(),
-                    source,
-                })?;
-        InstallArtifact {
-            path: source_artifact_cache_path(&SourceArtifactCacheKey::new(
-                SourceArtifactIdentity::Git {
-                    remote: repository.remote().clone(),
-                    commit,
-                    subdirectory: repository.subdirectory().map(Path::to_path_buf),
-                },
-                package,
-                package_version.version().clone(),
-            )),
-            kind: ArtifactKind::Source,
-        }
-    } else {
-        return Err(InstallPackageError::UnsupportedRepository);
-    };
-
-    match artifact_cache_entry(&artifact.path) {
-        ArtifactCacheEntry::File => Ok(artifact),
-        ArtifactCacheEntry::Invalid => Err(InstallPackageError::InvalidArtifact {
-            path: artifact.path,
-        }),
-        ArtifactCacheEntry::Missing => Err(InstallPackageError::MissingArtifact {
-            package: package.to_string(),
-            version: package_version.version().to_string(),
-        }),
-    }
+) -> PathBuf {
+    source_artifact_cache_path(&SourceArtifactCacheKey::new(
+        SourceArtifactIdentity::Registry(registry.clone()),
+        package,
+        package_version.version().clone(),
+    ))
 }
 
 async fn install_package(
     installer: &Installer,
     project_library: &Path,
     package: &str,
-    package_version: &PackageVersion,
+    package_version: &r_metadata::Version,
     r_version: &semver::Version,
     dependencies: &[DependencyInput],
+    artifact: Arc<PreparedArtifact>,
 ) -> Result<(), InstallPackageError> {
-    let version = package_version.version().to_string();
+    let version = package_version.to_string();
     let span = tracing::info_span!(
         "install_package",
         package = %package,
@@ -1123,7 +634,6 @@ async fn install_package(
     span.pb_start();
 
     async {
-        let artifact = select_install_artifact(package, package_version, r_version).await?;
         span.record("artifact_kind", artifact.trace_kind());
 
         let dependency_inputs = dependencies
@@ -1131,8 +641,8 @@ async fn install_package(
             .map(|dependency| (dependency.name.clone(), dependency.version.clone()))
             .collect::<Vec<_>>();
         let prepare_installer = installer.clone();
-        let artifact_path = artifact.path.clone();
-        let artifact_kind = artifact.kind;
+        let artifact_path = artifact.path().to_path_buf();
+        let artifact_kind = artifact.kind();
         let project_library_for_prepare = project_library.to_path_buf();
         let package_for_prepare = package.to_string();
         let version_for_prepare = version.clone();
@@ -1169,7 +679,7 @@ async fn install_package(
                 platform: None,
                 architecture: None,
             };
-            let artifact = artifact.into_installer_artifact(project_library_for_prepare);
+            let artifact = artifact.to_installer_artifact(project_library_for_prepare);
             prepare_installer
                 .prepare(&PrepareRequest {
                     key,
@@ -1363,16 +873,16 @@ mod tests {
     use crate::repository::{PackageRepository, built_in_repository};
     use r_description::Description;
     use r_metadata::Remote;
+    use r_package_installer::Artifact;
 
     #[test]
     fn install_artifact_actions_use_r_installation_terms() {
-        let binary = InstallArtifact {
+        let binary = PreparedArtifact::Binary {
             path: PathBuf::new(),
-            kind: ArtifactKind::Binary(BinaryFormat::Zip),
+            format: BinaryFormat::Zip,
         };
-        let source = InstallArtifact {
+        let source = PreparedArtifact::Source {
             path: PathBuf::new(),
-            kind: ArtifactKind::Source,
         };
 
         assert_eq!(binary.installation_action(), "installing binary");
@@ -1424,36 +934,33 @@ mod tests {
     }
 
     #[test]
-    fn sync_tasks_release_by_kind_and_package_dependency() {
-        let packages =
-            required_packages(&[("dependency", ""), ("dependent", "Imports: dependency\n")]);
-        let mut tasks = sync_tasks(&packages, &BTreeMap::new()).unwrap();
-        let resources = ResourcePool::new();
-
-        let dependency_download = pop_startable(&mut tasks, &resources).unwrap();
-        assert_eq!(dependency_download.task.0, "dependency");
-        assert_eq!(dependency_download.task.1, TaskKind::Download);
-        complete_task(&mut tasks, dependency_download);
-
-        let dependency_install = pop_startable(&mut tasks, &resources).unwrap();
-        assert_eq!(dependency_install.task.0, "dependency");
-        assert_eq!(dependency_install.task.1, TaskKind::Install);
-        complete_task(&mut tasks, dependency_install);
-
-        let dependent_download = pop_startable(&mut tasks, &resources).unwrap();
-        assert_eq!(dependent_download.task.0, "dependent");
-        assert_eq!(dependent_download.task.1, TaskKind::Download);
-        complete_task(&mut tasks, dependent_download);
-
-        let dependent_install = pop_startable(&mut tasks, &resources).unwrap();
-        assert_eq!(dependent_install.task.0, "dependent");
-        assert_eq!(dependent_install.task.1, TaskKind::Install);
-        assert_eq!(dependent_install.dependencies.len(), 1);
-        assert_eq!(dependent_install.dependencies[0].name, "dependency");
+    fn sync_plan_rejects_cycles_before_executing_operations() {
+        let packages = required_packages(&[
+            ("a", "Imports: b\n"),
+            ("b", "Imports: a\n"),
+            ("blocked", "Imports: b\n"),
+        ]);
+        let result = plan::sync_plan(&packages, &BTreeMap::new(), test_context());
+        let Err(SyncError::DependencyCycle(error)) = result else {
+            panic!("expected cycle error")
+        };
         assert_eq!(
-            dependent_install.dependencies[0].version.as_deref(),
-            Some("1.0.0")
+            error
+                .packages
+                .iter()
+                .map(|p| p.package.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "blocked"]
         );
+    }
+
+    fn test_context() -> SyncTaskContext {
+        SyncTaskContext {
+            installer: Installer::new(PathBuf::from("unused-cache")),
+            project_library: PathBuf::from("unused-library"),
+            r_version: Arc::new(semver::Version::new(4, 5, 0)),
+            span: tracing::Span::none(),
+        }
     }
 
     #[test]
@@ -1470,32 +977,14 @@ mod tests {
             ),
         ]);
 
-        let tasks = sync_tasks(&required, &installed).unwrap();
-
-        assert_eq!(tasks.len(), 1);
-        assert!(tasks.iter().any(|row| {
-            row.task == ("extra".to_string(), TaskKind::Remove) && row.blockers == 0
-        }));
-    }
-
-    #[test]
-    fn resource_pool_enforces_shared_and_subset_limits() {
-        let mut resources = ResourcePool::new();
-        resources.reserve(TaskKind::Checkout);
-        assert!(!resources.can_reserve(TaskKind::Checkout));
-        assert!(resources.can_reserve(TaskKind::Build));
-
-        resources.release(TaskKind::Checkout);
-        for _ in 0..SYNC_R_WORKERS {
-            resources.reserve(TaskKind::Build);
-        }
-        assert!(!resources.can_reserve(TaskKind::Install));
-        assert!(resources.can_reserve(TaskKind::Download));
-
-        for _ in SYNC_R_WORKERS..SYNC_SHARED_WORKERS {
-            resources.reserve(TaskKind::Download);
-        }
-        assert!(!resources.can_reserve(TaskKind::Download));
+        let plan = plan::sync_plan(&required, &installed, test_context()).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.install_count, 0);
+        assert!(
+            plan.tasks
+                .values()
+                .any(|task| task == &("extra".to_string(), TaskKind::Remove))
+        );
     }
 
     #[test]
@@ -1528,15 +1017,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_publication_cleans_up_the_temporary_download() {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/archive")
+            .with_status(200)
+            .with_body("artifact bytes")
+            .create_async()
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing-directory");
+        fs::create_dir(&destination).unwrap();
+        let body = reqwest::get(format!("{}/archive", server.url()))
+            .await
+            .unwrap();
+        let error = publish_artifact_response(destination.clone(), body, &tracing::Span::none())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DownloadPackageArtifactError::PublishArtifact { path, .. } if path == destination)
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+        response.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn installation_reports_the_producer_supplied_path_if_it_disappears() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected_path = directory.path().join("selected-source.tar.gz");
+        // Another file must not become an implicit replacement for this result.
+        fs::write(directory.path().join("other-binary.zip"), "other artifact").unwrap();
+        let error = install_package(
+            &Installer::new(directory.path().join("installer")),
+            &directory.path().join("library"),
+            "example",
+            &"1.0.0".parse().unwrap(),
+            &semver::Version::new(4, 5, 0),
+            &[],
+            Arc::new(PreparedArtifact::Source {
+                path: selected_path.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, InstallPackageError::ArtifactDigest { path, .. } if path == selected_path)
+        );
+    }
+
     #[test]
     fn install_artifact_maps_source_options_for_the_installer() {
         let artifact_path = PathBuf::from("package.tar.gz");
         let project_library = PathBuf::from("project-library");
-        let artifact = InstallArtifact {
+        let artifact = PreparedArtifact::Source {
             path: artifact_path.clone(),
-            kind: ArtifactKind::Source,
         }
-        .into_installer_artifact(project_library.clone());
+        .to_installer_artifact(project_library.clone());
 
         let Artifact::Source(source) = artifact else {
             panic!("source selection should produce a source artifact");
@@ -1549,11 +1087,11 @@ mod tests {
     #[test]
     fn install_artifact_preserves_binary_format() {
         let artifact_path = PathBuf::from("package.zip");
-        let artifact = InstallArtifact {
+        let artifact = PreparedArtifact::Binary {
             path: artifact_path.clone(),
-            kind: ArtifactKind::Binary(BinaryFormat::Zip),
+            format: BinaryFormat::Zip,
         }
-        .into_installer_artifact(PathBuf::from("unused-library"));
+        .to_installer_artifact(PathBuf::from("unused-library"));
 
         let Artifact::Binary(binary) = artifact else {
             panic!("binary selection should produce a binary artifact");
