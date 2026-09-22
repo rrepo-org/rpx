@@ -43,8 +43,10 @@ metadata, progress spans, and diagnostics.
 
 Sync has three application modules:
 
-- `sync.rs`: project setup, execution context, running the graph, and progress.
-- `sync/plan.rs`: installation/removal policy, graph edges, and resource requests.
+- `sync.rs`: adapt the resolved project and root-package policy, prepare the target,
+  and render package progress. It does not interpret graph IDs or task kinds.
+- `sync/plan.rs`: bind the library snapshot, reconcile packages, assemble and run
+  the private graph, and translate its events and errors into package terms.
 - `sync/operations.rs`: download, checkout, build, install, and remove functions,
   together with their inputs, outputs, errors, and artifact/cache helpers.
 
@@ -68,6 +70,33 @@ binary-first fallback, and cache-key construction retain their existing policy.
 Cycles are now rejected during graph finalization, before artifact operations
 or removals start. Normal CLI entry points and repository dispatch remain in rpx.
 
+## Plan invariants
+
+`SyncTarget::inspect` binds one installed-version snapshot to the library that
+execution will modify and to the R version supplied by resolution. It does not
+use the scanner's placeholder repositories as installed-source provenance.
+This is a snapshot, not a library-wide lock against concurrent processes.
+
+`SyncPlan::prepare` performs two phases:
+
+1. Pure `reconcile`: classify retained, installed, and removed packages, then
+   validate dependency metadata for all installation requests. Installation and
+   removal sets are disjoint. Dependency versions come from the same resolution,
+   even for retained packages; runtime-provided dependencies keep optional versions.
+2. Fold the changes into a private `Assembly`: reserve every installation handle,
+   register one artifact-producing pipeline per installation, wire dependency
+   installations, register removals, and finalize the graph.
+
+All operation definitions use one helper that assigns resources, attaches the
+current tracing span, and records package metadata together. Metadata and graph
+handles stay private. Local archive destinations are computed when their build
+operation runs; dependency versions are formatted only by installer preparation.
+
+`SyncPlan::run` owns execution, reports `SyncProgress` counts, and attributes task
+panics internally. Its caller only needs `install_count()` and the progress
+observer; it never indexes a task metadata map. Tracing instrumentation is bound
+by constructing the plan under the parent span, not passed as execution data.
+
 ## Error boundaries
 
 Operations return their own errors, not `SyncError`:
@@ -86,12 +115,12 @@ are preserved. Checkout has its own diagnostic, with distinct commit-resolution
 and checkout causes. Installer preparation and materialization (including their
 blocking-task join failures) are distinguished. All retain typed source errors.
 
-`PlanError` separately reports dependency metadata errors, package-labelled cycles,
-and task-graph construction failures. `SyncError` handles setup and forwards plan
-or operation diagnostics at the command boundary. Executor panics/join failures
-are attributed to the package and operation kind and preserve the `JoinError`;
-internal invariant messages remain a distinct failure. Errors are not flattened
-into a generic message string.
+`PlanError` reports dependency metadata errors, package-labelled cycles, and
+task-graph construction failures. `RunError` forwards contextual operation errors
+and attributes executor panics/join failures to a package and operation while
+preserving the `JoinError`. Internal invariant messages remain distinct.
+`SyncError` handles project setup and transparently forwards plan/run diagnostics
+at the command boundary. Errors are not flattened into a generic message string.
 
 ## Tests
 

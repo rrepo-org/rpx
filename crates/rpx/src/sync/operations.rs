@@ -218,7 +218,7 @@ pub(crate) enum OperationError {
 #[derive(Clone)]
 pub(super) struct DependencyInput {
     pub name: String,
-    pub version: Option<String>,
+    pub version: Option<Version>,
 }
 
 #[derive(Debug, Error)]
@@ -622,7 +622,7 @@ pub(super) async fn install_package(
 
         let dependency_inputs = dependencies
             .iter()
-            .map(|dependency| (dependency.name.clone(), dependency.version.clone()))
+            .map(|dependency| (dependency.name.clone(), dependency.version.as_ref().map(ToString::to_string)))
             .collect::<Vec<_>>();
         let prepare_installer = installer.clone();
         let artifact_path = artifact.path().to_path_buf();
