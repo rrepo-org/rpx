@@ -1,12 +1,6 @@
 use r_package_installer::{Artifact, BinaryArtifact, BinaryFormat, SourceArtifact, SourceOptions};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ArtifactKind {
-    Binary(BinaryFormat),
-    Source,
-}
-
 /// The result of successful artifact acquisition. Producers publish this value
 /// only after building, downloading, or finding the file in the cache.
 #[derive(Debug)]
@@ -19,13 +13,6 @@ impl PreparedArtifact {
     pub fn path(&self) -> &Path {
         match self {
             Self::Binary { path, .. } | Self::Source { path } => path,
-        }
-    }
-
-    pub fn kind(&self) -> ArtifactKind {
-        match self {
-            Self::Binary { format, .. } => ArtifactKind::Binary(*format),
-            Self::Source { .. } => ArtifactKind::Source,
         }
     }
 

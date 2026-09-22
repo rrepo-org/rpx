@@ -1,6 +1,6 @@
 mod artifact;
 mod plan;
-use artifact::{ArtifactKind, PreparedArtifact};
+use artifact::PreparedArtifact;
 
 use crate::{
     cache::{
@@ -642,7 +642,6 @@ async fn install_package(
             .collect::<Vec<_>>();
         let prepare_installer = installer.clone();
         let artifact_path = artifact.path().to_path_buf();
-        let artifact_kind = artifact.kind();
         let project_library_for_prepare = project_library.to_path_buf();
         let package_for_prepare = package.to_string();
         let version_for_prepare = version.clone();
@@ -662,7 +661,7 @@ async fn install_package(
                 }
             })?;
             let key = installer_build_key(
-                artifact_kind,
+                &artifact,
                 artifact_digest,
                 &package_for_prepare,
                 &version_for_prepare,
@@ -728,7 +727,7 @@ fn artifact_digest(path: &Path) -> Result<InstallerDigest, std::io::Error> {
 }
 
 fn installer_build_key(
-    artifact_kind: ArtifactKind,
+    artifact: &PreparedArtifact,
     artifact_digest: InstallerDigest,
     package: &str,
     version: &str,
@@ -741,17 +740,23 @@ fn installer_build_key(
         hasher.update(value);
     };
     field(INSTALLER_CACHE_VERSION.as_bytes());
-    field(match artifact_kind {
-        ArtifactKind::Binary(BinaryFormat::Zip) => b"binary-zip",
-        ArtifactKind::Binary(BinaryFormat::TarGz) => b"binary-tar-gz",
-        ArtifactKind::Source => b"source",
+    field(match artifact {
+        PreparedArtifact::Binary {
+            format: BinaryFormat::Zip,
+            ..
+        } => b"binary-zip",
+        PreparedArtifact::Binary {
+            format: BinaryFormat::TarGz,
+            ..
+        } => b"binary-tar-gz",
+        PreparedArtifact::Source { .. } => b"source",
     });
     field(artifact_digest.as_bytes());
     field(package.as_bytes());
     field(version.as_bytes());
     field(r_version.to_string().as_bytes());
     field(HOST.to_string().as_bytes());
-    if matches!(artifact_kind, ArtifactKind::Source) {
+    if matches!(artifact, PreparedArtifact::Source { .. }) {
         field(b"allow-non-staged=true");
         let mut dependencies = dependencies.to_vec();
         dependencies.sort();
@@ -1103,7 +1108,7 @@ mod tests {
     #[test]
     fn installer_build_key_tracks_build_inputs() {
         fn key(
-            kind: ArtifactKind,
+            artifact: &PreparedArtifact,
             digest: u8,
             package: &str,
             version: &str,
@@ -1111,7 +1116,7 @@ mod tests {
             dependencies: &[(String, Option<String>)],
         ) -> String {
             installer_build_key(
-                kind,
+                artifact,
                 InstallerDigest::from_bytes([digest; 32]),
                 package,
                 version,
@@ -1121,19 +1126,18 @@ mod tests {
             .to_string()
         }
         let dependencies = vec![("dependency".into(), Some("1.0.0".into()))];
-        let baseline = key(
-            ArtifactKind::Source,
-            1,
-            "package",
-            "1.0.0",
-            "4.5.1",
-            &dependencies,
-        );
+        let source = PreparedArtifact::Source {
+            path: PathBuf::from("source.tar.gz"),
+        };
+        let baseline = key(&source, 1, "package", "1.0.0", "4.5.1", &dependencies);
 
         assert_ne!(
             baseline,
             key(
-                ArtifactKind::Binary(BinaryFormat::Zip),
+                &PreparedArtifact::Binary {
+                    path: PathBuf::from("binary.zip"),
+                    format: BinaryFormat::Zip
+                },
                 1,
                 "package",
                 "1.0.0",
@@ -1143,52 +1147,24 @@ mod tests {
         );
         assert_ne!(
             baseline,
-            key(
-                ArtifactKind::Source,
-                2,
-                "package",
-                "1.0.0",
-                "4.5.1",
-                &dependencies
-            )
+            key(&source, 2, "package", "1.0.0", "4.5.1", &dependencies)
+        );
+        assert_ne!(
+            baseline,
+            key(&source, 1, "other", "1.0.0", "4.5.1", &dependencies)
+        );
+        assert_ne!(
+            baseline,
+            key(&source, 1, "package", "2.0.0", "4.5.1", &dependencies)
+        );
+        assert_ne!(
+            baseline,
+            key(&source, 1, "package", "1.0.0", "4.4.2", &dependencies)
         );
         assert_ne!(
             baseline,
             key(
-                ArtifactKind::Source,
-                1,
-                "other",
-                "1.0.0",
-                "4.5.1",
-                &dependencies
-            )
-        );
-        assert_ne!(
-            baseline,
-            key(
-                ArtifactKind::Source,
-                1,
-                "package",
-                "2.0.0",
-                "4.5.1",
-                &dependencies
-            )
-        );
-        assert_ne!(
-            baseline,
-            key(
-                ArtifactKind::Source,
-                1,
-                "package",
-                "1.0.0",
-                "4.4.2",
-                &dependencies
-            )
-        );
-        assert_ne!(
-            baseline,
-            key(
-                ArtifactKind::Source,
+                &source,
                 1,
                 "package",
                 "1.0.0",
@@ -1199,7 +1175,7 @@ mod tests {
         assert_ne!(
             baseline,
             key(
-                ArtifactKind::Source,
+                &source,
                 1,
                 "package",
                 "1.0.0",
@@ -1210,11 +1186,47 @@ mod tests {
     }
 
     #[test]
+    fn installer_build_key_ignores_location_but_distinguishes_artifact_formats() {
+        let key = |artifact: &PreparedArtifact| {
+            installer_build_key(
+                artifact,
+                InstallerDigest::from_bytes([1; 32]),
+                "package",
+                "1.0.0",
+                &semver::Version::new(4, 5, 1),
+                &[],
+            )
+            .to_string()
+        };
+        let artifacts = |path: &str| {
+            [
+                PreparedArtifact::Source {
+                    path: PathBuf::from(path),
+                },
+                PreparedArtifact::Binary {
+                    path: PathBuf::from(path),
+                    format: BinaryFormat::Zip,
+                },
+                PreparedArtifact::Binary {
+                    path: PathBuf::from(path),
+                    format: BinaryFormat::TarGz,
+                },
+            ]
+        };
+        let original = artifacts("cache/original").each_ref().map(key);
+        let relocated = artifacts("cache/relocated").each_ref().map(key);
+        assert_eq!(original, relocated);
+        assert_eq!(original.iter().collect::<BTreeSet<_>>().len(), 3);
+    }
+
+    #[test]
     fn installer_build_key_sorts_dependencies() {
         let digest = InstallerDigest::from_bytes([1; 32]);
         let key = |dependencies: &[(String, Option<String>)]| {
             installer_build_key(
-                ArtifactKind::Source,
+                &PreparedArtifact::Source {
+                    path: PathBuf::from("source.tar.gz"),
+                },
                 digest,
                 "package",
                 "1.0.0",
