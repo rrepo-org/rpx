@@ -1,21 +1,16 @@
-use super::{PackageRepository, RepositoryError};
-use crate::{http, resolver::PackageVersion};
-use async_trait::async_trait;
+use super::RepositoryError;
+use crate::http;
 use moka::future::Cache;
 use r_description::Description;
 use r_metadata::Version;
 use reqwest::Url;
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
     url: Url,
     packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
-    versions: Cache<String, BTreeSet<Version>>,
+    versions: Cache<String, Arc<BTreeMap<Version, String>>>,
     descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
@@ -38,25 +33,8 @@ impl RrepoRepository {
     pub fn url(&self) -> &Url {
         &self.url
     }
-}
-
-#[async_trait]
-impl PackageRepository for RrepoRepository {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn equals(&self, other: &dyn PackageRepository) -> bool {
-        other
-            .as_any()
-            .downcast_ref::<Self>()
-            .is_some_and(|other| self.url == other.url)
-    }
-
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let response = self
-            .packages
+    pub async fn packages(&self) -> Result<Arc<http::RrepoPackagesResponse>, RepositoryError> {
+        self.packages
             .try_get_with((), async {
                 let response = http::rrepo_repository_packages(&self.url)
                     .await
@@ -76,36 +54,14 @@ impl PackageRepository for RrepoRepository {
                 Ok::<Arc<http::RrepoPackagesResponse>, RepositoryError>(Arc::new(response))
             })
             .await
-            .map_err(Arc::unwrap_or_clone)?;
-
-        Ok(response
-            .packages
-            .iter()
-            .filter_map(|package| {
-                let version = match package.latest_version.parse::<Version>() {
-                    Ok(version) => version,
-                    Err(error) => {
-                        tracing::debug!(
-                            package = %package.name,
-                            version = %package.latest_version,
-                            repository = %self.url,
-                            error = %error,
-                            "skipping package with invalid latest version"
-                        );
-                        return None;
-                    }
-                };
-
-                Some((
-                    package.name.clone(),
-                    PackageVersion::new(version, Arc::clone(&repository)),
-                ))
-            })
-            .collect())
+            .map_err(Arc::unwrap_or_clone)
     }
 
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
+    /// Version -> source URL, retaining the endpoint's native artifact references.
+    pub async fn versions(
+        &self,
+        package: &str,
+    ) -> Result<Arc<BTreeMap<Version, String>>, RepositoryError> {
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
@@ -128,17 +84,20 @@ impl PackageRepository for RrepoRepository {
                     .versions
                     .into_iter()
                     .map(|summary| {
-                        summary.version.parse::<Version>().map_err(|source| {
-                            RepositoryError::InvalidData {
+                        summary
+                            .version
+                            .parse::<Version>()
+                            .map(|version| (version, summary.source_url))
+                            .map_err(|source| RepositoryError::InvalidData {
                                 resource: format!(
                                     "package version {} for {package}",
                                     summary.version
                                 ),
                                 details: source.to_string(),
-                            }
-                        })
+                            })
                     })
-                    .collect::<Result<BTreeSet<_>, RepositoryError>>()
+                    .collect::<Result<BTreeMap<_, _>, RepositoryError>>()
+                    .map(Arc::new)
             })
             .await
             .map_err(Arc::unwrap_or_clone)?;
@@ -150,13 +109,10 @@ impl PackageRepository for RrepoRepository {
             "loaded package versions"
         );
 
-        Ok(versions
-            .into_iter()
-            .map(|version| PackageVersion::new(version, Arc::clone(&repository)))
-            .collect())
+        Ok(versions)
     }
 
-    async fn description(
+    pub async fn description(
         &self,
         package: &str,
         version: &Version,
@@ -193,5 +149,23 @@ impl PackageRepository for RrepoRepository {
             })
             .await
             .map_err(Arc::unwrap_or_clone)
+    }
+
+    pub async fn source(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        http::rrepo_source_artifact(&self.url, package, version.as_ref()).await
+    }
+
+    pub async fn binary(
+        &self,
+        package: &str,
+        version: &Version,
+        target: &target_lexicon::Triple,
+        r_version: &semver::Version,
+    ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
+        http::rrepo_binary(&self.url, package, version.as_ref(), target, r_version).await
     }
 }

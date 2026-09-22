@@ -257,6 +257,11 @@ pub(crate) enum LockedPackagesError {
 fn required_packages_from_lockfile(
     lockfile: &Lockfile,
 ) -> Result<RequiredPackages, LockedPackagesError> {
+    let repositories: Vec<_> = lockfile
+        .repos
+        .iter()
+        .map(PackageRepository::from_lockfile)
+        .collect();
     let packages = lockfile
         .packages
         .iter()
@@ -264,18 +269,20 @@ fn required_packages_from_lockfile(
             let repository = lockfile
                 .repos
                 .iter()
-                .find(|repository| repository.url() == &package.repository)
+                .zip(&repositories)
+                .find(|(repository, _)| repository.url() == &package.repository)
                 .ok_or_else(|| LockedPackagesError::RepositoryNotFound {
                     package: name.clone(),
                     repository: package.repository.clone(),
                 })?;
             let repository =
-                <dyn PackageRepository>::from_lockfile(repository).map_err(|source| {
-                    LockedPackagesError::Repository {
+                repository
+                    .1
+                    .clone()
+                    .map_err(|source| LockedPackagesError::Repository {
                         package: name.clone(),
                         source,
-                    }
-                })?;
+                    })?;
 
             let description = locked_package_description(name, package)?;
 
@@ -362,13 +369,7 @@ pub fn validate_locked_resolution(
                     )
                 }
                 ConfiguredRepository::Git(remote) => {
-                    GitRepository::new(remote.clone()).and_then(|current| match locked {
-                        lockfile::Repository::Git { .. } => {
-                            <dyn PackageRepository>::from_lockfile(locked)
-                                .map(|locked| locked.equals(&current))
-                        }
-                        _ => Ok(false),
-                    })
+                    GitRepository::matches_lockfile(remote, locked)
                 }
             };
 
@@ -838,7 +839,7 @@ pub(crate) async fn resolve_project(
                     lockfile
                         .repos
                         .iter()
-                        .map(<dyn PackageRepository>::from_lockfile)
+                        .map(PackageRepository::from_lockfile)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|source| ResolveProjectError::LockedRepository { source })?
                 }
@@ -876,7 +877,11 @@ pub(crate) async fn resolve_project(
     let mut packages = hydrate_resolved_packages(selected)
         .await
         .map_err(|source| ResolveProjectError::PackageMetadata { source })?;
-    packages.retain(|_, (version, _)| !version.repository().equals(root.as_ref()));
+    packages.retain(|_, (version, _)| {
+        !version
+            .repository()
+            .same_instance(&PackageRepository::Local(root.clone()))
+    });
     let lockfile =
         lockfile_from_resolution(requirements, &packages, &repositories, &r_version).await?;
     let lockfile_changed = previous.as_ref() != Some(&lockfile);
@@ -993,10 +998,9 @@ pub(crate) async fn hydrate_resolved_packages(
 ) -> Result<RequiredPackages, RepositoryError> {
     // TODO: make sure the web requests are under a central semaphore in the repos not here
     futures_util::future::join_all(selected.into_iter().map(|(name, version)| async move {
-        let description = version
-            .repository()
-            .description(&name, version.version())
-            .await?;
+        let description =
+            crate::resolver::package_description(version.repository(), &name, version.version())
+                .await?;
 
         Ok::<_, RepositoryError>((name, (version, description)))
     }))
@@ -1008,7 +1012,7 @@ pub(crate) async fn hydrate_resolved_packages(
 pub(crate) async fn lockfile_from_resolution(
     requirements: BTreeSet<Relation>,
     resolved_packages: &RequiredPackages,
-    repositories: &[Arc<dyn PackageRepository>],
+    repositories: &[PackageRepository],
     r_version: &semver::Version,
 ) -> Result<Lockfile, LockfileBuildError> {
     let repos = futures_util::future::join_all(
@@ -1027,7 +1031,7 @@ pub(crate) async fn lockfile_from_resolution(
             let repository = repositories
                 .iter()
                 .zip(&repos)
-                .find(|(runtime, _)| version.repository().equals(runtime.as_ref()))
+                .find(|(runtime, _)| version.repository() == *runtime)
                 .map(|(_, locked)| locked.url().clone())
                 .ok_or_else(|| LockfileBuildError::UnsupportedRepository {
                     repository: version.repository().to_string(),
@@ -1147,7 +1151,7 @@ mod tests {
             ArchiveSupport as LockedArchiveSupport, GitReference, LOCKFILE_REVISION,
             LOCKFILE_VERSION, Package, Repository,
         },
-        repository::{ArchiveSupport, CranRepository, RrepoRepository, built_in_repository},
+        repository::{ArchiveSupport, built_in_repository},
     };
     use r_metadata::{Relation, Version};
     use std::{
@@ -1575,24 +1579,18 @@ mod tests {
             );
         }
 
-        let rrepo = packages["rrepoPkg"]
-            .0
-            .repository()
-            .downcast_ref::<RrepoRepository>()
-            .expect("Rrepo repository should reconstruct");
+        let PackageRepository::Rrepo(rrepo) = packages["rrepoPkg"].0.repository() else {
+            panic!("expected rrepo")
+        };
         assert_eq!(rrepo.url(), &url(rrepo_url));
-        let cran = packages["cranPkg"]
-            .0
-            .repository()
-            .downcast_ref::<CranRepository>()
-            .expect("CRAN repository should reconstruct");
+        let PackageRepository::Cran(cran) = packages["cranPkg"].0.repository() else {
+            panic!("expected CRAN")
+        };
         assert_eq!(cran.url(), &url(cran_url));
         assert_eq!(cran.archive_support(), ArchiveSupport::Unavailable);
-        let git = packages["gitPkg"]
-            .0
-            .repository()
-            .downcast_ref::<GitRepository>()
-            .expect("Git repository should reconstruct");
+        let PackageRepository::Git(git) = packages["gitPkg"].0.repository() else {
+            panic!("expected Git")
+        };
         assert_eq!(git.remote().to_string(), git_url);
         assert_eq!(git.reference(), Some("main"));
         assert_eq!(git.subdirectory(), Some(Path::new("pkg")));
@@ -1618,12 +1616,28 @@ mod tests {
             .insert("fixture".into(), package("1.0.0", repository, &[]));
         let packages =
             required_packages_from_lockfile(&lockfile).expect("package should reconstruct");
-        let repository = packages["fixture"]
-            .0
-            .repository()
-            .downcast_ref::<GitRepository>()
-            .expect("repository should be Git");
+        let PackageRepository::Git(repository) = packages["fixture"].0.repository() else {
+            panic!("expected Git")
+        };
         assert_eq!(repository.reference(), Some("first"));
+    }
+
+    #[test]
+    fn locked_packages_share_one_runtime_repository_per_record() {
+        let mut locked = lockfile();
+        let url = "https://example.test/rrepo";
+        locked.repos = vec![rrepo(url)];
+        locked.packages = BTreeMap::from([
+            ("first".into(), package("1.0.0", url, &[])),
+            ("second".into(), package("2.0.0", url, &[])),
+        ]);
+        let loaded = required_packages_from_lockfile(&locked).unwrap();
+        assert!(
+            loaded["first"]
+                .0
+                .repository()
+                .same_instance(loaded["second"].0.repository())
+        );
     }
 
     #[test]

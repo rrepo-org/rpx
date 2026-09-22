@@ -7,7 +7,7 @@ use crate::{
     description::{DescriptionParseError, required_dependencies},
     project::RequiredPackages,
     r::{InstalledPackagesError, installed_packages},
-    repository::{GitRepository, LocalRepository},
+    repository::PackageRepository,
     resolver::PackageVersion,
 };
 use miette::Diagnostic;
@@ -103,11 +103,12 @@ fn reconcile(
 }
 
 fn package_requires_install(required: &PackageVersion, installed: Option<&Version>) -> bool {
-    let repository = required.repository().as_ref();
+    let repository = required.repository();
     // Preserve the existing policy for sources that can change without a version bump.
-    repository.downcast_ref::<GitRepository>().is_some()
-        || repository.downcast_ref::<LocalRepository>().is_some()
-        || installed != Some(required.version())
+    matches!(
+        repository,
+        PackageRepository::Git(_) | PackageRepository::Local(_)
+    ) || installed != Some(required.version())
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -357,51 +358,55 @@ impl Assembly {
     ) -> Result<TaskRef<PreparedArtifact>, PlanError> {
         let name = package.to_string();
         let version = selected.version().clone();
-        let repository = selected.repository().as_ref();
-        if let Some(local) = repository.downcast_ref::<LocalRepository>() {
-            let root = local.path().to_path_buf();
-            self.register(package, TaskKind::Build, (), move |()| async move {
-                let input = Arc::new(BuildInput::local(root, name.clone(), version));
-                operations::build(input)
-                    .await
-                    .map_err(|source| OperationError::Build {
-                        package: name,
-                        source: Box::new(source),
-                    })
-            })
-        } else if let Some(git) = repository.downcast_ref::<GitRepository>() {
-            let git = git.clone();
-            let source = self.register(package, TaskKind::Checkout, (), move |()| async move {
-                let version_string = version.to_string();
-                operations::checkout(git, name.clone(), version)
-                    .await
-                    .map_err(|source| OperationError::Checkout {
-                        package: name,
-                        version: version_string,
-                        source,
-                    })
-            })?;
-            let name = package.to_string();
-            self.register(package, TaskKind::Build, source, move |input| async move {
-                operations::build(input)
-                    .await
-                    .map_err(|source| OperationError::Build {
-                        package: name,
-                        source: Box::new(source),
-                    })
-            })
-        } else {
-            let selected = selected.clone();
-            let r_version = self.r_version.clone();
-            self.register(package, TaskKind::Download, (), move |()| async move {
-                operations::download_package_artifact(name.clone(), selected, r_version)
-                    .await
-                    .map_err(|source| OperationError::Download {
-                        package: name,
-                        version: version.to_string(),
-                        source,
-                    })
-            })
+        match selected.repository() {
+            PackageRepository::Local(local) => {
+                let root = local.path().to_path_buf();
+                self.register(package, TaskKind::Build, (), move |()| async move {
+                    let input = Arc::new(BuildInput::local(root, name.clone(), version));
+                    operations::build(input)
+                        .await
+                        .map_err(|source| OperationError::Build {
+                            package: name,
+                            source: Box::new(source),
+                        })
+                })
+            }
+            PackageRepository::Git(git) => {
+                let git = git.as_ref().clone();
+                let source =
+                    self.register(package, TaskKind::Checkout, (), move |()| async move {
+                        let version_string = version.to_string();
+                        operations::checkout(git, name.clone(), version)
+                            .await
+                            .map_err(|source| OperationError::Checkout {
+                                package: name,
+                                version: version_string,
+                                source,
+                            })
+                    })?;
+                let name = package.to_string();
+                self.register(package, TaskKind::Build, source, move |input| async move {
+                    operations::build(input)
+                        .await
+                        .map_err(|source| OperationError::Build {
+                            package: name,
+                            source: Box::new(source),
+                        })
+                })
+            }
+            PackageRepository::Cran(_) | PackageRepository::Rrepo(_) => {
+                let selected = selected.clone();
+                let r_version = self.r_version.clone();
+                self.register(package, TaskKind::Download, (), move |()| async move {
+                    operations::download_package_artifact(name.clone(), selected, r_version)
+                        .await
+                        .map_err(|source| OperationError::Download {
+                            package: name,
+                            version: version.to_string(),
+                            source,
+                        })
+                })
+            }
         }
     }
 
@@ -489,7 +494,7 @@ impl Assembly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::{PackageRepository, built_in_repository};
+    use crate::repository::{GitRepository, LocalRepository, built_in_repository};
     use r_description::Description;
     use r_metadata::Remote;
     use std::error::Error;
@@ -581,9 +586,8 @@ mod tests {
             &registry,
             Some(&"0.9.0".parse().unwrap())
         ));
-        let local: Arc<dyn PackageRepository> =
-            Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
-        let git: Arc<dyn PackageRepository> = Arc::new(
+        let local = Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
+        let git = Arc::new(
             GitRepository::new("github::owner/repository".parse::<Remote>().unwrap()).unwrap(),
         );
         assert!(package_requires_install(

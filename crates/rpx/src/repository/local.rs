@@ -1,11 +1,8 @@
-use super::{PackageRepository, RepositoryError};
-use crate::{description::root_package, resolver::PackageVersion};
-use async_trait::async_trait;
+use super::RepositoryError;
+use crate::description::root_package;
 use r_description::Description;
 use r_metadata::Version;
 use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -61,62 +58,11 @@ impl LocalRepository {
         Ok(Arc::new(description))
     }
 
-    pub async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
+    pub async fn package(&self) -> Result<(String, Version), RepositoryError> {
         let description = self.description().await?;
         let (package, version) = root_package(&self.path, &description)?;
 
-        let repository: Arc<dyn PackageRepository> = self.clone();
-        Ok((package, PackageVersion::new(version, repository)))
-    }
-}
-
-#[async_trait]
-impl PackageRepository for LocalRepository {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn equals(&self, other: &dyn PackageRepository) -> bool {
-        other
-            .as_any()
-            .downcast_ref::<Self>()
-            .is_some_and(|other| self.path == other.path)
-    }
-
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository = Arc::new(self.clone());
-        let (package, version) = repository.package().await?;
-        Ok(BTreeMap::from([(package, version)]))
-    }
-
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository = Arc::new(self.clone());
-        let (local_package, version) = repository.package().await?;
-
-        if package == local_package {
-            Ok(BTreeSet::from([version]))
-        } else {
-            Ok(BTreeSet::new())
-        }
-    }
-
-    async fn description(
-        &self,
-        package: &str,
-        version: &Version,
-    ) -> Result<Arc<Description>, RepositoryError> {
-        let description = self.description().await?;
-        let (local_package, local_version) = root_package(&self.path, &description)?;
-
-        if package != local_package || version != &local_version {
-            return Err(RepositoryError::PackageVersionNotFound {
-                path: self.path.clone(),
-                package: package.to_string(),
-                version: version.clone(),
-            });
-        }
-
-        Ok(description)
+        Ok((package, version))
     }
 }
 
@@ -133,7 +79,8 @@ mod tests {
             LocalRepository::new(PathBuf::from("unused")).with_description(initial);
         repository.set_description(staged);
         let repository = Arc::new(repository);
-        let expected_repository: Arc<dyn PackageRepository> = repository.clone();
+        let wrapped = super::super::PackageRepository::Local(repository.clone());
+        let cloned = wrapped.clone();
 
         let description = repository
             .description()
@@ -143,8 +90,15 @@ mod tests {
 
         assert_eq!(description.package().unwrap().as_str(), "project");
         assert_eq!(package, "project");
-        assert_eq!(version.version().to_string(), "1.2.3");
-        assert!(Arc::ptr_eq(version.repository(), &expected_repository));
+        assert_eq!(version.to_string(), "1.2.3");
+        assert!(wrapped.same_instance(&cloned));
+        let super::super::PackageRepository::Local(cloned) = cloned else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(
+            &description,
+            &cloned.description().await.unwrap()
+        ));
     }
 
     #[tokio::test]

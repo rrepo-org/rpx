@@ -275,8 +275,9 @@ mod tests {
 
     #[tokio::test]
     async fn lockfile_from_resolution_rejects_unprovided_repository() {
-        let local: Arc<dyn PackageRepository> =
-            Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
+        let local = PackageRepository::Local(Arc::new(LocalRepository::new(PathBuf::from(
+            "vendor/selected",
+        ))));
         let resolved = BTreeMap::from([(
             "selected".into(),
             (

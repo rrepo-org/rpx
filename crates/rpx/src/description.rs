@@ -880,31 +880,38 @@ pub enum RepositoriesFromDescriptionError {
 pub async fn repositories_from_description(
     path: &Path,
     description: &Description,
-) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoriesFromDescriptionError> {
-    futures_util::future::join_all(configured_repositories(path, description)?.into_iter().map(
-        |repository| async move {
+) -> Result<Vec<PackageRepository>, RepositoriesFromDescriptionError> {
+    let configured = configured_repositories(path, description)?;
+    // Share discovery and its populated caches within this configuration load,
+    // while retaining every entry's original precedence position.
+    let discovered = moka::future::Cache::new(configured.len() as u64);
+    futures_util::future::join_all(configured.into_iter().map(|repository| {
+        let discovered = &discovered;
+        async move {
             match repository {
-                ConfiguredRepository::Base(url) => <dyn PackageRepository>::from_url(url)
+                ConfiguredRepository::Base(url) => discovered
+                    .try_get_with(url.clone(), PackageRepository::from_url(url))
                     .await
                     .map_err(|source| RepositoriesFromDescriptionError::Repository {
                         kind: "base",
-                        source,
+                        source: Arc::unwrap_or_clone(source),
                     }),
                 ConfiguredRepository::Git(remote) => GitRepository::new(remote)
-                    .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+                    .map(|repository| PackageRepository::Git(Arc::new(repository)))
                     .map_err(|source| RepositoriesFromDescriptionError::Repository {
                         kind: "Git",
                         source,
                     }),
-                ConfiguredRepository::Additional(url) => <dyn PackageRepository>::from_url(url)
+                ConfiguredRepository::Additional(url) => discovered
+                    .try_get_with(url.clone(), PackageRepository::from_url(url))
                     .await
                     .map_err(|source| RepositoriesFromDescriptionError::Repository {
                         kind: "additional",
-                        source,
+                        source: Arc::unwrap_or_clone(source),
                     }),
             }
-        },
-    ))
+        }
+    }))
     .await
     .into_iter()
     .collect()

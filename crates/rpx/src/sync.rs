@@ -132,7 +132,7 @@ pub(crate) async fn sync_resolved_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::built_in_repository;
+    use crate::repository::{PackageRepository, built_in_repository};
     use r_description::Description;
     use std::{collections::BTreeMap, path::PathBuf};
 
@@ -167,19 +167,12 @@ mod tests {
         let desired =
             desired_packages(&project("package"), resolved(), ProjectPackageMode::Install).unwrap();
         assert_eq!(desired["root"].0.version().to_string(), "2.0.0");
-        let local = desired["root"]
-            .0
-            .repository()
-            .downcast_ref::<LocalRepository>()
-            .unwrap();
+        let PackageRepository::Local(local) = desired["root"].0.repository() else {
+            panic!("expected local root")
+        };
         assert_eq!(local.path(), std::path::Path::new("unused-project"));
         assert_eq!(desired["dependency"].0.version().to_string(), "1.0.0");
-        assert!(
-            desired["dependency"]
-                .0
-                .repository()
-                .equals(built_in_repository().as_ref())
-        );
+        assert_eq!(desired["dependency"].0.repository(), &built_in_repository());
     }
 
     #[test]

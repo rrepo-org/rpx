@@ -1,18 +1,12 @@
-use super::{ArchiveSupport, PackageRepository, RepositoryError};
-use crate::{http, resolver::PackageVersion};
-use async_trait::async_trait;
+use super::{ArchiveSupport, RepositoryError};
+use crate::http;
 use futures_util::TryStreamExt;
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
 use r_metadata::Version;
 use r_packages::{PackageRecord, Packages};
 use reqwest::Url;
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, io::Read, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct CranRepository {
@@ -48,7 +42,12 @@ impl CranRepository {
         self.archives
     }
 
-    async fn packages_index(&self) -> Result<Arc<Packages>, RepositoryError> {
+    pub(crate) fn with_archive_support(mut self, archives: ArchiveSupport) -> Self {
+        self.archives = archives;
+        self
+    }
+
+    pub async fn packages_index(&self) -> Result<Arc<Packages>, RepositoryError> {
         self.packages
             .try_get_with((), async {
                 let response = http::cran_packages(&self.url)
@@ -79,110 +78,41 @@ impl CranRepository {
             .await
             .map_err(Arc::unwrap_or_clone)
     }
-}
 
-#[async_trait]
-impl PackageRepository for CranRepository {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn equals(&self, other: &dyn PackageRepository) -> bool {
-        other
-            .as_any()
-            .downcast_ref::<Self>()
-            .is_some_and(|other| self.url == other.url && self.archives == other.archives)
-    }
-
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let index = self.packages_index().await?;
-
-        Ok(index
-            .records()
-            .map(|record| {
-                let package = record.package().expect("validated Package should exist");
-                let version = record
-                    .parsed_version()
-                    .expect("validated Version should exist")
-                    .expect("validated Version should parse");
-                (
-                    package.as_str().to_owned(),
-                    PackageVersion::new(version, Arc::clone(&repository)),
-                )
-            })
-            .collect())
-    }
-
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let index = self.packages_index().await?;
-        let mut versions = index
-            .records()
-            .filter(|record| {
-                record
-                    .package()
-                    .is_some_and(|value| value.as_str() == package)
-            })
-            .map(|record| {
-                record
-                    .parsed_version()
-                    .expect("validated Version should exist")
-                    .expect("validated Version should parse")
-            })
-            .collect::<BTreeSet<_>>();
-
-        if versions.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-
-        if self.archives == ArchiveSupport::Available {
-            let archived_versions = self
-                .archive_versions
-                .try_get_with(package.to_string(), async {
-                    let text = http::cran_package_archive_listing(&self.url, package)
-                        .await
-                        .map_err(|source| RepositoryError::Request {
-                            source: Arc::new(source),
-                        })?
-                        .error_for_status()
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?
-                        .text()
-                        .await
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
+    pub async fn archive_versions(
+        &self,
+        package: &str,
+    ) -> Result<BTreeSet<Version>, RepositoryError> {
+        self.archive_versions
+            .try_get_with(package.to_string(), async {
+                let text = http::cran_package_archive_listing(&self.url, package)
+                    .await
+                    .map_err(|source| RepositoryError::Request {
+                        source: Arc::new(source),
+                    })?
+                    .error_for_status()
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?
+                    .text()
+                    .await
+                    .map_err(|source| RepositoryError::Response {
+                        source: Arc::new(source),
+                    })?;
+                let listing =
+                    text.parse::<http::CranPackageArchiveListing>()
+                        .map_err(|source| RepositoryError::InvalidData {
+                            resource: "CRAN package archive listing".to_string(),
+                            details: source.to_string(),
                         })?;
-                    let listing =
-                        text.parse::<http::CranPackageArchiveListing>()
-                            .map_err(|source| RepositoryError::InvalidData {
-                                resource: "CRAN package archive listing".to_string(),
-                                details: source.to_string(),
-                            })?;
 
-                    Ok::<BTreeSet<Version>, RepositoryError>(listing.versions.into_iter().collect())
-                })
-                .await
-                .map_err(Arc::unwrap_or_clone)?;
-
-            versions.extend(archived_versions);
-        }
-
-        tracing::trace!(
-            package,
-            repository = %self.url,
-            versions = versions.len(),
-            "loaded package versions"
-        );
-
-        Ok(versions
-            .into_iter()
-            .map(|version| PackageVersion::new(version, Arc::clone(&repository)))
-            .collect())
+                Ok::<BTreeSet<Version>, RepositoryError>(listing.versions.into_iter().collect())
+            })
+            .await
+            .map_err(Arc::unwrap_or_clone)
     }
 
-    async fn description(
+    pub async fn description(
         &self,
         package: &str,
         version: &Version,
@@ -228,6 +158,32 @@ impl PackageRepository for CranRepository {
             })
             .await
             .map_err(Arc::unwrap_or_clone)
+    }
+
+    pub async fn current_source(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        http::cran_current_source_tarball(&self.url, package, version.as_ref()).await
+    }
+
+    pub async fn archive_source(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        http::cran_archive_source_tarball(&self.url, package, version.as_ref()).await
+    }
+
+    pub async fn binary(
+        &self,
+        package: &str,
+        version: &Version,
+        target: &target_lexicon::Triple,
+        r_version: &semver::Version,
+    ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
+        http::cran_binary(&self.url, package, version.as_ref(), target, r_version).await
     }
 }
 
