@@ -415,10 +415,6 @@ pub(crate) async fn checkout(
     .map_err(GitError::Join)?
 }
 
-pub(crate) fn checkout_path(remote: &GitUrl, commit: GitOid) -> PathBuf {
-    GitCachePaths::new(remote, commit).checkout
-}
-
 fn checkout_blocking(
     remote: &GitUrl,
     reference: Option<&str>,

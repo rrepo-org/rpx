@@ -1972,6 +1972,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-tracing",
  "rpassword",
+ "rpx-task",
  "semver",
  "serde",
  "serde_json",
@@ -1986,6 +1987,14 @@ dependencies = [
  "tracing-indicatif",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "rpx-task"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
