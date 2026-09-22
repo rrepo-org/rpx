@@ -1,16 +1,14 @@
 # rpx-task
 
-Typed async workflows over `rpx-scheduler`:
+Typed async workflows with resource-aware execution:
 
 ```text
-application operations → rpx-task → rpx-scheduler
-                             ↓
-                           Tokio
+application operations → rpx-task → Tokio
 ```
 
-The scheduler decides when a node can run. This crate executes its async function
-and delivers the function's successful return value to its consumers. Declaring a
-task result as an input establishes both a scheduling edge and a typed data edge;
+This crate schedules and executes async functions and delivers their successful
+return values to consumers. Declaring a task result as an input establishes both
+a scheduling edge and a typed data edge;
 applications do not maintain separate output lookup tables.
 
 ## Construction and execution
@@ -43,5 +41,21 @@ operations. Callers requiring orderly shutdown must continue awaiting execution.
 
 This is an in-memory workflow runner, not a durable execution system. It does not
 journal results, retry operations, or provide exactly-once external side effects.
+
+## Internal scheduling
+
+Kahn readiness and resource accounting live in the private `scheduler` module.
+Each scheduled node owns its operation; admission reserves capacity and returns
+the operation directly to the executor. There is no separate public scheduling
+protocol or parallel operation table.
+
+The ready set selects the lowest-ID eligible node, skipping ready nodes whose
+resource requests do not fit. Completion releases resources; only success releases
+dependency edges. Graph finalization normalizes duplicate edges, sums repeated
+resource requests, and rejects cycles and impossible requests through `BuildError`.
+Cycle errors identify all cycle-blocked nodes, including downstream consumers.
+
+Scheduling decisions have synchronous unit tests alongside the async execution
+tests, without requiring a separate crate.
 
 Run tests independently with `cargo test -p rpx-task --locked`.

@@ -6,7 +6,6 @@ license = "MIT"
 description = "Typed async task graphs for rpx"
 
 [dependencies]
-rpx-scheduler = { path = "../rpx-scheduler" }
 tokio = { version = "1.51.1", features = ["rt", "sync"] }
 thiserror = "2.0.17"
 

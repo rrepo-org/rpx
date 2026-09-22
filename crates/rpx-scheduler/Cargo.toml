@@ -1,9 +1,0 @@
-[package]
-name = "rpx-scheduler"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-description = "Synchronous resource-aware DAG scheduling for rpx"
-
-[dependencies]
-thiserror = "2.0.17"

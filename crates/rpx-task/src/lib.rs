@@ -1,12 +1,13 @@
 //! Typed async operations joined by value-carrying dependency edges.
 //!
-//! The scheduler owns readiness and capacity; this crate owns executing operations
-//! and publishing their results. On failure, execution stops admitting new work
-//! and drains running operations before returning. Dropping the execution future
+//! Kahn scheduling and resource admission are internal to the task runner.
+//! On failure, execution stops admitting new work and drains running operations
+//! before returning. Dropping the execution future
 //! instead aborts its Tokio tasks, and cannot stop already-running blocking work.
 
-use rpx_scheduler::{Completion, NodeSpec, Scheduler, Status};
-pub use rpx_scheduler::{GraphError, NodeId, ResourceId};
+mod scheduler;
+
+use scheduler::Scheduler;
 use std::{
     collections::HashMap,
     future::Future,
@@ -15,6 +16,14 @@ use std::{
 };
 use thiserror::Error;
 use tokio::task::JoinSet;
+
+/// An opaque task identity used in execution events and diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(usize);
+
+/// A resource pool created by [`GraphBuilder::resource`]. IDs are graph-local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResourceId(usize);
 
 /// A reference to one producer's result, reusable by multiple consumers.
 pub struct TaskRef<T> {
@@ -118,8 +127,10 @@ pub enum BuildError {
     AlreadyDefined(NodeId),
     #[error("task {0:?} was reserved but never defined")]
     Undefined(NodeId),
-    #[error(transparent)]
-    Graph(#[from] GraphError),
+    #[error("task {node:?} has an invalid request for resource {resource:?}")]
+    InvalidResource { node: NodeId, resource: ResourceId },
+    #[error("tasks are blocked by a dependency cycle: {blocked:?}")]
+    Cycle { blocked: Vec<NodeId> },
 }
 
 #[derive(Debug, Error)]
@@ -144,7 +155,8 @@ pub enum ExecutionEvent {
 
 type Operation<E> = Pin<Box<dyn Future<Output = Result<(), ExecutionError<E>>> + Send>>;
 struct Node<E> {
-    spec: NodeSpec,
+    dependencies: Vec<NodeId>,
+    resources: Vec<(ResourceId, usize)>,
     operation: Operation<E>,
 }
 
@@ -222,10 +234,8 @@ impl<E: Send + 'static> GraphBuilder<E> {
             Ok(())
         });
         self.nodes[node.0] = Some(Node {
-            spec: NodeSpec {
-                dependencies,
-                resources,
-            },
+            dependencies,
+            resources,
             operation,
         });
         Ok(())
@@ -257,20 +267,14 @@ impl<E: Send + 'static> GraphBuilder<E> {
             .enumerate()
             .map(|(index, node)| node.ok_or(BuildError::Undefined(NodeId(index))))
             .collect::<Result<Vec<_>, _>>()?;
-        let scheduler = Scheduler::new(
-            nodes.iter().map(|node| node.spec.clone()).collect(),
-            self.capacities,
-        )?;
         Ok(ExecutableGraph {
-            scheduler,
-            operations: nodes.into_iter().map(|node| Some(node.operation)).collect(),
+            scheduler: Scheduler::new(nodes, self.capacities)?,
         })
     }
 }
 
 pub struct ExecutableGraph<E> {
-    scheduler: Scheduler,
-    operations: Vec<Option<Operation<E>>>,
+    scheduler: Scheduler<E>,
 }
 
 impl<E: Send + 'static> ExecutableGraph<E> {
@@ -285,10 +289,7 @@ impl<E: Send + 'static> ExecutableGraph<E> {
         let mut failure = None;
         loop {
             if failure.is_none() {
-                while let Some(node) = self.scheduler.admit_next() {
-                    let operation = self.operations[node.0]
-                        .take()
-                        .expect("admitted task executes once");
+                while let Some((node, operation)) = self.scheduler.admit_next() {
                     let handle = running.spawn(operation);
                     ids.insert(handle.id(), node);
                     observe(ExecutionEvent::Started(node));
@@ -304,14 +305,7 @@ impl<E: Send + 'static> ExecutableGraph<E> {
                     (node, Err(ExecutionError::Join { node, source }))
                 }
             };
-            let outcome = if result.is_ok() {
-                Completion::Succeeded
-            } else {
-                Completion::Failed
-            };
-            self.scheduler
-                .complete(node, outcome)
-                .expect("only running tasks can complete");
+            self.scheduler.complete(node, result.is_ok());
             observe(if result.is_ok() {
                 ExecutionEvent::Succeeded(node)
             } else {
@@ -324,7 +318,7 @@ impl<E: Send + 'static> ExecutableGraph<E> {
         if let Some(error) = failure {
             return Err(error);
         }
-        if self.scheduler.status() != Status::Complete {
+        if !self.scheduler.is_complete() {
             return Err(ExecutionError::Invariant(
                 "unfinished graph has no runnable operations",
             ));
@@ -429,10 +423,7 @@ mod tests {
             Err(BuildError::AlreadyDefined(_))
         ));
         graph.define(&b, a, vec![], |_| async { Ok(()) }).unwrap();
-        assert!(matches!(
-            graph.finish(),
-            Err(BuildError::Graph(GraphError::Cycle { .. }))
-        ));
+        assert!(matches!(graph.finish(), Err(BuildError::Cycle { .. })));
     }
 
     #[tokio::test]

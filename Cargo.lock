@@ -1990,17 +1990,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpx-scheduler"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "rpx-task"
 version = "0.1.0"
 dependencies = [
- "rpx-scheduler",
  "thiserror",
  "tokio",
 ]

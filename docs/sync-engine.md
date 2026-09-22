@@ -1,12 +1,13 @@
 # Sync execution
 
-The dependency direction is `rpx -> rpx-task -> rpx-scheduler`. Only `rpx-task`
-requires Tokio; the scheduler is synchronous and has no application payloads.
+The dependency direction is `rpx -> rpx-task -> Tokio`. Package operations belong
+to rpx; typed composition, scheduling, and execution belong to one task-runner
+crate. Scheduling is a private implementation detail, not a separate library API.
 
-## Scheduler
+## Internal scheduler
 
-`rpx-scheduler` validates the DAG before execution and uses Kahn's algorithm.
-Nodes become ready when all distinct predecessors succeed. Admission atomically
+The private scheduler module validates the DAG before execution and uses Kahn's
+algorithm. Nodes become ready when all distinct predecessors succeed. Admission atomically
 reserves all requested resources, and completion releases those resources.
 Edges are released on success, not admission. Failed nodes leave their consumers
 blocked. The ready set is deterministic for a given sequence of completions.
@@ -14,6 +15,11 @@ blocked. The ready set is deterministic for a given sequence of completions.
 Ready nodes that cannot obtain capacity are skipped so other eligible work can
 run. Sync configures 50 shared workers, one checkout slot, and eight shared
 build/install slots. Waiting consumers occupy no worker slots.
+
+Each node keeps its operation with its resource and dependency bookkeeping.
+Admission returns the ready operation directly to the executor. There is no
+parallel executor operation table, public completion/status protocol, or separate
+graph-error wrapper. Graph-construction errors are reported through `BuildError`.
 
 ## Tasks
 
@@ -58,7 +64,7 @@ or removals start. Normal CLI entry points and repository dispatch remain in rpx
 ## Tests
 
 ```sh
-cargo test -p rpx-scheduler -p rpx-task --locked
+cargo test -p rpx-task --locked
 cargo nextest run --workspace --locked
 cargo test --workspace --doc --locked
 ```

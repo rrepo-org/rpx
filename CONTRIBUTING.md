@@ -18,10 +18,10 @@ For the same concurrency settings used by the native E2E suite, run:
 cargo nextest run --workspace --locked
 ```
 
-The scheduler and task runner can be tested without R:
+The task runner, including its internal scheduler, can be tested without R:
 
 ```bash
-cargo test -p rpx-scheduler -p rpx-task --locked
+cargo test -p rpx-task --locked
 ```
 
 See [sync execution](docs/sync-engine.md) for crate boundaries and test coverage.

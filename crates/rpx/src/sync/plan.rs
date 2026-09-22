@@ -225,7 +225,7 @@ pub(super) fn sync_plan(
         tasks.insert(task.id(), (name.clone(), TaskKind::Remove));
     }
     let graph = graph.finish().map_err(|error| match error {
-        BuildError::Graph(rpx_task::GraphError::Cycle { blocked }) => {
+        BuildError::Cycle { blocked } => {
             let packages = blocked
                 .into_iter()
                 .filter_map(|node| {
