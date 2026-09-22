@@ -41,6 +41,13 @@ metadata, progress spans, and diagnostics.
 
 ## Package operations
 
+Sync has three application modules:
+
+- `sync.rs`: project setup, execution context, running the graph, and progress.
+- `sync/plan.rs`: installation/removal policy, graph edges, and resource requests.
+- `sync/operations.rs`: download, checkout, build, install, and remove functions,
+  together with their inputs, outputs, errors, and artifact/cache helpers.
+
 `sync/plan.rs` constructs the workflow using existing repository implementations:
 
 ```text
@@ -60,6 +67,31 @@ Package version, R version, dependency fingerprint inputs, installer options,
 binary-first fallback, and cache-key construction retain their existing policy.
 Cycles are now rejected during graph finalization, before artifact operations
 or removals start. Normal CLI entry points and repository dispatch remain in rpx.
+
+## Error boundaries
+
+Operations return their own errors, not `SyncError`:
+
+| Operation | Result | Error |
+| --- | --- | --- |
+| Download | `PreparedArtifact` | `DownloadPackageArtifactError` |
+| Checkout | `BuildInput` | `CheckoutError` |
+| Build | `PreparedArtifact` | `r::PackageBuildError` |
+| Install | `()` | `InstallPackageError` |
+| Remove | `()` | `RemovePackageError` |
+
+Graph registration attaches package context and converts those failures to the
+common `OperationError`. Existing download/build/install/removal diagnostic codes
+are preserved. Checkout has its own diagnostic, with distinct commit-resolution
+and checkout causes. Installer preparation and materialization (including their
+blocking-task join failures) are distinguished. All retain typed source errors.
+
+`PlanError` separately reports dependency metadata errors, package-labelled cycles,
+and task-graph construction failures. `SyncError` handles setup and forwards plan
+or operation diagnostics at the command boundary. Executor panics/join failures
+are attributed to the package and operation kind and preserve the `JoinError`;
+internal invariant messages remain a distinct failure. Errors are not flattened
+into a generic message string.
 
 ## Tests
 

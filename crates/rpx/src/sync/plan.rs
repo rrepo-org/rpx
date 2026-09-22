@@ -1,90 +1,97 @@
-//! Package-specific graph construction. Operations return values; scheduling
-//! and result delivery are handled by rpx-task.
+//! Select package operations, connect their inputs, and assign resources.
 
-use super::*;
-use r_metadata::Version;
+use super::{
+    SyncTaskContext,
+    operations::{self, BuildInput, DependencyInput, OperationError},
+};
+use crate::{
+    description::{DescriptionParseError, required_dependencies},
+    project::RequiredPackages,
+    repository::{GitRepository, LocalRepository},
+    resolver::PackageVersion,
+};
+use miette::Diagnostic;
 use rpx_task::{BuildError, ExecutableGraph, GraphBuilder, NodeId, TaskRef};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
+use thiserror::Error;
+use tracing::Instrument;
+
+const SYNC_SHARED_WORKERS: usize = 50;
+const SYNC_CHECKOUT_WORKERS: usize = 1;
+const SYNC_R_WORKERS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskKind {
+    Remove,
+    Download,
+    Checkout,
+    Build,
+    Install,
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Remove => "remove",
+            Self::Download => "download",
+            Self::Checkout => "checkout",
+            Self::Build => "build",
+            Self::Install => "install",
+        })
+    }
+}
+
+pub(super) type TaskId = (String, TaskKind);
 
 pub(super) struct SyncPlan {
-    pub graph: ExecutableGraph<SyncError>,
+    pub graph: ExecutableGraph<OperationError>,
     pub tasks: BTreeMap<NodeId, TaskId>,
     pub install_count: usize,
 }
 
-struct BuildInput {
-    package_root: PathBuf,
-    archive_path: PathBuf,
+#[derive(Debug, Error, Diagnostic)]
+pub(crate) enum PlanError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Dependencies(#[from] DescriptionParseError),
+    #[error("cannot determine package installation order")]
+    #[diagnostic(
+        code(rpx::sync::dependency_cycle),
+        help("Update the package requirements to break the dependency cycle before syncing.")
+    )]
+    DependencyCycle {
+        #[related]
+        packages: Vec<CycleBlockedPackage>,
+    },
+    #[error("failed to construct sync task graph: {0}")]
+    #[diagnostic(code(rpx::sync::task_graph_invalid))]
+    Graph(#[from] BuildError),
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("package `{package}` is blocked by a dependency cycle")]
+pub(crate) struct CycleBlockedPackage {
     package: String,
-    version: Version,
 }
 
-async fn build(input: Arc<BuildInput>) -> Result<PreparedArtifact, SyncError> {
-    build_package_archive(
-        &input.package_root,
-        &input.package,
-        input.version.as_ref(),
-        &input.archive_path,
-    )
-    .await
-    .map_err(|source| SyncError::PackageBuild {
-        package: input.package.clone(),
-        source: Box::new(source),
-    })?;
-    Ok(PreparedArtifact::Source {
-        path: input.archive_path.clone(),
-    })
-}
-
-async fn checkout(
-    repository: GitRepository,
-    package: String,
-    version: Version,
-) -> Result<BuildInput, SyncError> {
-    let checkout =
-        repository
-            .checkout()
-            .await
-            .map_err(|error| SyncError::DownloadArtifactsFailed {
-                details: format!("failed to checkout {package}: {error}"),
-            })?;
-    let commit = repository
-        .commit()
-        .await
-        .map_err(|error| SyncError::DownloadArtifactsFailed {
-            details: format!("failed to resolve Git commit for {package}: {error}"),
-        })?;
-    let package_root = repository
-        .subdirectory()
-        .map_or_else(|| checkout.clone(), |path| checkout.join(path));
-    let archive_path = source_artifact_cache_path(&SourceArtifactCacheKey::new(
-        SourceArtifactIdentity::Git {
-            remote: repository.remote().clone(),
-            commit,
-            subdirectory: repository.subdirectory().map(Path::to_path_buf),
-        },
-        &package,
-        version.clone(),
-    ));
-    Ok(BuildInput {
-        package_root,
-        archive_path,
-        package,
-        version,
-    })
-}
-
-fn engine_error(error: BuildError) -> SyncError {
-    SyncError::TaskEngine {
-        details: error.to_string(),
-    }
+fn package_requires_install(required: &PackageVersion, installed: Option<&PackageVersion>) -> bool {
+    let repository = required.repository().as_ref();
+    // Git and local sources can change without changing their package version.
+    repository.downcast_ref::<GitRepository>().is_some()
+        || repository.downcast_ref::<LocalRepository>().is_some()
+        || installed != Some(required)
 }
 
 pub(super) fn sync_plan(
     required: &RequiredPackages,
     installed: &BTreeMap<String, PackageVersion>,
     context: SyncTaskContext,
-) -> Result<SyncPlan, SyncError> {
-    let mut graph = GraphBuilder::<SyncError>::new();
+) -> Result<SyncPlan, PlanError> {
+    let mut graph = GraphBuilder::<OperationError>::new();
     let shared = graph.resource(SYNC_SHARED_WORKERS);
     let checkout_slot = graph.resource(SYNC_CHECKOUT_WORKERS);
     let r = graph.resource(SYNC_R_WORKERS);
@@ -100,14 +107,12 @@ pub(super) fn sync_plan(
         .collect();
 
     for (package, install) in &installs {
-        let (package_version, description) = &required[package];
-        let dependency_names: BTreeSet<_> = required_dependencies(
-            format!("{package} {}", package_version.version()),
-            description,
-        )?
-        .into_iter()
-        .map(|relation| relation.package().to_string())
-        .collect();
+        let (selected, description) = &required[package];
+        let dependency_names: BTreeSet<_> =
+            required_dependencies(format!("{package} {}", selected.version()), description)?
+                .into_iter()
+                .map(|relation| relation.package().to_string())
+                .collect();
         let dependencies: Vec<_> = dependency_names
             .iter()
             .map(|name| DependencyInput {
@@ -119,114 +124,129 @@ pub(super) fn sync_plan(
             .iter()
             .filter_map(|name| installs.get(name).cloned())
             .collect();
-        let repository = package_version.repository().as_ref();
+        let repository = selected.repository().as_ref();
+        let name = package.clone();
         let span = context.span.clone();
         let artifact = if let Some(local) = repository.downcast_ref::<LocalRepository>() {
-            let input = Arc::new(BuildInput {
-                package_root: local.path().to_path_buf(),
-                archive_path: source_artifact_cache_path(&SourceArtifactCacheKey::new(
-                    SourceArtifactIdentity::Local(local.path().to_path_buf()),
-                    package,
-                    package_version.version().clone(),
-                )),
-                package: package.clone(),
-                version: package_version.version().clone(),
-            });
-            let task = graph
-                .task((), vec![(shared, 1), (r, 1)], move |()| {
-                    build(input).instrument(span)
-                })
-                .map_err(engine_error)?;
+            let input = Arc::new(BuildInput::local(
+                local.path().to_path_buf(),
+                name.clone(),
+                selected.version().clone(),
+            ));
+            let task = graph.task((), vec![(shared, 1), (r, 1)], move |()| {
+                async move {
+                    operations::build(input)
+                        .await
+                        .map_err(|source| OperationError::Build {
+                            package: name,
+                            source: Box::new(source),
+                        })
+                }
+                .instrument(span)
+            })?;
             tasks.insert(task.id(), (package.clone(), TaskKind::Build));
             task
         } else if let Some(git) = repository.downcast_ref::<GitRepository>() {
             let git = git.clone();
-            let name = package.clone();
-            let version = package_version.version().clone();
-            let source = graph
-                .task((), vec![(shared, 1), (checkout_slot, 1)], move |()| {
-                    checkout(git, name, version).instrument(span)
-                })
-                .map_err(engine_error)?;
+            let version = selected.version().clone();
+            let source = graph.task((), vec![(shared, 1), (checkout_slot, 1)], move |()| {
+                async move {
+                    let version_string = version.to_string();
+                    operations::checkout(git, name.clone(), version)
+                        .await
+                        .map_err(|source| OperationError::Checkout {
+                            package: name,
+                            version: version_string,
+                            source,
+                        })
+                }
+                .instrument(span)
+            })?;
             tasks.insert(source.id(), (package.clone(), TaskKind::Checkout));
+            let name = package.clone();
             let span = context.span.clone();
-            let task = graph
-                .task(source, vec![(shared, 1), (r, 1)], move |input| {
-                    build(input).instrument(span)
-                })
-                .map_err(engine_error)?;
+            let task = graph.task(source, vec![(shared, 1), (r, 1)], move |input| {
+                async move {
+                    operations::build(input)
+                        .await
+                        .map_err(|source| OperationError::Build {
+                            package: name,
+                            source: Box::new(source),
+                        })
+                }
+                .instrument(span)
+            })?;
             tasks.insert(task.id(), (package.clone(), TaskKind::Build));
             task
         } else {
-            let name = package.clone();
-            let selected = package_version.clone();
+            let selected = selected.clone();
             let r_version = context.r_version.clone();
-            let task = graph
-                .task((), vec![(shared, 1)], move |()| {
-                    async move {
-                        let version = selected.version().to_string();
-                        download_package_artifact(name.clone(), selected, r_version)
-                            .await
-                            .map_err(|source| SyncError::DownloadPackageArtifact {
-                                package: name,
-                                version,
-                                source,
-                            })
-                    }
-                    .instrument(span)
-                })
-                .map_err(engine_error)?;
+            let task = graph.task((), vec![(shared, 1)], move |()| {
+                async move {
+                    let version = selected.version().to_string();
+                    operations::download_package_artifact(name.clone(), selected, r_version)
+                        .await
+                        .map_err(|source| OperationError::Download {
+                            package: name,
+                            version,
+                            source,
+                        })
+                }
+                .instrument(span)
+            })?;
             tasks.insert(task.id(), (package.clone(), TaskKind::Download));
             task
         };
         let name = package.clone();
-        let version = package_version.version().clone();
+        let version = selected.version().clone();
         let context = context.clone();
         let span = context.span.clone();
-        graph
-            .define(
-                install,
-                (artifact, prerequisites),
-                vec![(shared, 1), (r, 1)],
-                move |(artifact, _completed_dependencies)| {
-                    async move {
-                        install_package(
-                            &context.installer,
-                            &context.project_library,
-                            &name,
-                            &version,
-                            context.r_version.as_ref(),
-                            &dependencies,
-                            artifact,
-                        )
-                        .await
-                        .map_err(|source| SyncError::PackageInstall {
-                            package: name,
-                            source: Box::new(source),
-                        })
-                    }
-                    .instrument(span)
-                },
-            )
-            .map_err(engine_error)?;
+        graph.define(
+            install,
+            (artifact, prerequisites),
+            vec![(shared, 1), (r, 1)],
+            move |(artifact, _completed_dependencies)| {
+                async move {
+                    operations::install_package(
+                        &context.installer,
+                        &context.project_library,
+                        &name,
+                        &version,
+                        context.r_version.as_ref(),
+                        &dependencies,
+                        artifact,
+                    )
+                    .await
+                    .map_err(|source| OperationError::Install {
+                        package: name,
+                        source: Box::new(source),
+                    })
+                }
+                .instrument(span)
+            },
+        )?;
     }
     for name in installed
         .keys()
         .filter(|name| !required.contains_key(*name))
     {
         let package = name.clone();
-        let context = context.clone();
+        let installer = context.installer.clone();
+        let library = context.project_library.clone();
         let span = context.span.clone();
-        let task = graph
-            .task((), vec![(shared, 1)], move |()| {
-                remove_package(package, context).instrument(span)
-            })
-            .map_err(engine_error)?;
+        let task = graph.task((), vec![(shared, 1)], move |()| {
+            async move {
+                operations::remove_package(installer, library, package.clone())
+                    .await
+                    .map_err(|source| OperationError::Remove { package, source })
+            }
+            .instrument(span)
+        })?;
         tasks.insert(task.id(), (name.clone(), TaskKind::Remove));
     }
     let graph = graph.finish().map_err(|error| match error {
-        BuildError::Cycle { blocked } => {
-            let packages = blocked
+        BuildError::Cycle { blocked } => PlanError::DependencyCycle {
+            packages: blocked
                 .into_iter()
                 .filter_map(|node| {
                     let (package, kind) = &tasks[&node];
@@ -234,10 +254,9 @@ pub(super) fn sync_plan(
                         package: package.clone(),
                     })
                 })
-                .collect();
-            DependencyCycleError { packages }.into()
-        }
-        other => engine_error(other),
+                .collect(),
+        },
+        other => PlanError::Graph(other),
     })?;
     Ok(SyncPlan {
         graph,
@@ -249,38 +268,140 @@ pub(super) fn sync_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{
-        GitUrl,
-        tests::{commit_file, source_repository},
-    };
+    use crate::repository::{PackageRepository, built_in_repository};
+    use r_description::Description;
+    use r_metadata::Remote;
+    use r_package_installer::Installer;
+    use std::path::PathBuf;
 
-    #[tokio::test]
-    async fn checkout_output_carries_the_pinned_tree_and_archive_destination() {
-        let (path, source, pinned) = source_repository("sync-checkout-output");
-        let remote = GitUrl::from_local_path(&path);
-        let repository = GitRepository::from_parts(remote.clone(), None, None).with_commit(pinned);
-        commit_file(
-            &source,
-            "Package: example\nVersion: 2.0.0\n",
-            "advance branch",
+    #[test]
+    fn package_requires_install_respects_source_and_version() {
+        let version = |value: &str| value.parse().expect("version fixture should parse");
+        let registry = PackageVersion::new(version("1.0.0"), built_in_repository());
+        let same = PackageVersion::new(version("1.0.0"), built_in_repository());
+        let old = PackageVersion::new(version("0.9.0"), built_in_repository());
+        assert!(package_requires_install(&registry, None));
+        assert!(!package_requires_install(&registry, Some(&same)));
+        assert!(package_requires_install(&registry, Some(&old)));
+        let local: Arc<dyn PackageRepository> =
+            Arc::new(LocalRepository::new(PathBuf::from("vendor/selected")));
+        let git: Arc<dyn PackageRepository> = Arc::new(
+            GitRepository::new("github::owner/repository".parse::<Remote>().unwrap()).unwrap(),
         );
-        let input = checkout(repository, "example".into(), "1.0.0".parse().unwrap())
-            .await
-            .unwrap();
-        let description = fs::read_to_string(input.package_root.join("DESCRIPTION")).unwrap();
-        assert!(description.contains("Version: 1.0.0"));
+        assert!(package_requires_install(
+            &PackageVersion::new(version("1.0.0"), local),
+            Some(&same)
+        ));
+        assert!(package_requires_install(
+            &PackageVersion::new(version("1.0.0"), git),
+            Some(&same)
+        ));
+    }
+
+    fn required_packages(packages: &[(&str, &str)]) -> RequiredPackages {
+        packages
+            .iter()
+            .map(|(name, fields)| {
+                let description =
+                    Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
+                (
+                    (*name).to_string(),
+                    (
+                        PackageVersion::new("1.0.0".parse().unwrap(), built_in_repository()),
+                        Arc::new(description),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn test_context() -> SyncTaskContext {
+        SyncTaskContext {
+            installer: Installer::new(PathBuf::from("unused-cache")),
+            project_library: PathBuf::from("unused-library"),
+            r_version: Arc::new(semver::Version::new(4, 5, 0)),
+            span: tracing::Span::none(),
+        }
+    }
+
+    #[test]
+    fn sync_plan_rejects_cycles_before_executing_operations() {
+        let packages = required_packages(&[
+            ("a", "Imports: b\n"),
+            ("b", "Imports: a\n"),
+            ("blocked", "Imports: b\n"),
+        ]);
+        let Err(PlanError::DependencyCycle { packages }) =
+            sync_plan(&packages, &BTreeMap::new(), test_context())
+        else {
+            panic!("expected cycle error")
+        };
         assert_eq!(
-            input.archive_path,
-            source_artifact_cache_path(&SourceArtifactCacheKey::new(
-                SourceArtifactIdentity::Git {
-                    remote,
-                    commit: pinned,
-                    subdirectory: None
-                },
-                "example",
-                "1.0.0".parse().unwrap(),
-            ))
+            packages
+                .iter()
+                .map(|p| p.package.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "blocked"]
         );
-        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn sync_tasks_schedule_extra_packages_for_removal() {
+        let required = required_packages(&[("required", "")]);
+        let installed = BTreeMap::from([
+            (
+                "required".to_string(),
+                PackageVersion::new("1.0.0".parse().unwrap(), built_in_repository()),
+            ),
+            (
+                "extra".to_string(),
+                PackageVersion::new("2.0.0".parse().unwrap(), built_in_repository()),
+            ),
+        ]);
+        let plan = sync_plan(&required, &installed, test_context()).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.install_count, 0);
+        assert!(
+            plan.tasks
+                .values()
+                .any(|task| task == &("extra".to_string(), TaskKind::Remove))
+        );
+    }
+
+    #[test]
+    fn malformed_dependencies_are_planning_errors_with_positioned_metadata() {
+        let packages = required_packages(&[("example", "Imports: cli (>= invalid)\n")]);
+        let Err(error) = sync_plan(&packages, &BTreeMap::new(), test_context()) else {
+            panic!("expected malformed metadata error")
+        };
+        let PlanError::Dependencies(source) = &error else {
+            panic!("expected metadata error")
+        };
+        assert!(!source.messages().is_empty());
+        // Sync forwards the positioned metadata diagnostic, not a stringified graph error.
+        let outer = super::super::SyncError::from(error);
+        assert_eq!(
+            outer.code().unwrap().to_string(),
+            "rpx::description::parse_failed"
+        );
+        assert!(outer.source_code().is_some());
+        assert!(outer.related().unwrap().next().is_some());
+    }
+
+    #[test]
+    fn graph_validation_errors_retain_the_task_runner_error() {
+        use std::error::Error;
+        let mut graph = GraphBuilder::<OperationError>::new();
+        let task = graph.reserve::<()>();
+        let error = PlanError::from(match graph.finish() {
+            Err(error) => error,
+            Ok(_) => panic!("undefined task should fail validation"),
+        });
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<BuildError>()
+            .unwrap();
+        assert!(matches!(source, BuildError::Undefined(node) if *node == task.id()));
     }
 }
