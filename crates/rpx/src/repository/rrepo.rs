@@ -33,6 +33,11 @@ impl RrepoRepository {
     pub fn url(&self) -> &Url {
         &self.url
     }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_descriptions(&self) {
+        self.descriptions.invalidate_all();
+    }
     pub async fn packages(&self) -> Result<Arc<http::RrepoPackagesResponse>, RepositoryError> {
         self.packages
             .try_get_with((), async {

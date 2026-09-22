@@ -88,7 +88,9 @@ mod tests {
         project::{LockfileBuildError, ResolveProjectError, lockfile_from_resolution},
         r::BasePackagesError,
         repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository},
-        resolver::{PackageVersion, ProviderError, RDependencyProvider, ResolutionError},
+        resolver::{
+            PackageVersion, ProviderError, RDependencyProvider, ResolutionError, ResolvedPackage,
+        },
     };
     use miette::Diagnostic;
     use pubgrub::{DerivationTree, External, PubGrubError, Ranges};
@@ -116,10 +118,12 @@ mod tests {
                     Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}"));
                 (
                     (*name).to_string(),
-                    (
+                    ResolvedPackage::from_description(
+                        name,
                         PackageVersion::new(version("1.0.0"), built_in_repository()),
-                        Arc::new(description),
-                    ),
+                        &description,
+                    )
+                    .unwrap(),
                 )
             })
             .collect()
@@ -280,10 +284,12 @@ mod tests {
         ))));
         let resolved = BTreeMap::from([(
             "selected".into(),
-            (
+            ResolvedPackage::from_description(
+                "selected",
                 PackageVersion::new(version("1.0.0"), local),
-                Arc::new(Description::parse("Package: selected\nVersion: 1.0.0\n")),
-            ),
+                &Description::parse("Package: selected\nVersion: 1.0.0\n"),
+            )
+            .unwrap(),
         )]);
         assert!(matches!(
             lockfile_from_resolution(
@@ -295,21 +301,20 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn lockfile_from_resolution_rejects_invalid_metadata() {
+    #[test]
+    fn resolved_records_reject_invalid_metadata_before_locking() {
         for field in ["Depends", "Imports", "LinkingTo"] {
             let metadata = format!("{field}: broken (>= invalid)\n");
-            let resolved = required_packages(&[("selected", &metadata)]);
-            assert!(matches!(
-                lockfile_from_resolution(
-                    BTreeSet::new(),
-                    &resolved,
-                    &[built_in_repository()],
-                    &semver::Version::new(4, 5, 0),
+            let description =
+                Description::parse(&format!("Package: selected\nVersion: 1.0.0\n{metadata}"));
+            assert!(
+                ResolvedPackage::from_description(
+                    "selected",
+                    PackageVersion::new(version("1.0.0"), built_in_repository()),
+                    &description
                 )
-                .await,
-                Err(LockfileBuildError::InvalidPackageRequirements { .. })
-            ));
+                .is_err()
+            );
         }
     }
 }

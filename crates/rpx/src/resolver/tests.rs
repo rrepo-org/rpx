@@ -1,4 +1,5 @@
 use super::*;
+use crate::description::required_dependencies;
 use crate::repository::RrepoRepository;
 
 struct Registry {
@@ -384,4 +385,96 @@ async fn backtracks_instead_of_replacing_the_fixed_root() {
     assert_eq!(selected["project"].version().to_string(), "1.0.1");
     assert_eq!(selected["testthat"].version().to_string(), "3.0.0");
     never.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolution_retains_metadata_after_repository_cache_eviction() {
+    let mut registry = Registry::new(&[("example", "1.0.0")]).await;
+    let metadata = registry
+        .server
+        .mock("GET", "/packages/example/versions/1.0.0/description")
+        .with_status(200)
+        .with_body("Package: example\nVersion: 1.0.0\nDepends: R (>= 4.0), stats\n")
+        .expect(1)
+        .create_async()
+        .await;
+    let selected = resolve_from_registry(
+        vec![registry.repository.clone()],
+        local_repository("root", "1.0.0"),
+        ProjectType::Package,
+        BTreeSet::from([Relation::any("example").unwrap()]),
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let PackageRepository::Rrepo(repo) = &registry.repository else {
+        unreachable!()
+    };
+    repo.invalidate_descriptions();
+    let selected: BTreeMap<_, _> = selected
+        .into_iter()
+        .filter(|(name, _)| name != "root")
+        .collect();
+    let lock = crate::project::lockfile_from_resolution(
+        BTreeSet::new(),
+        &selected,
+        &[registry.repository.clone()],
+        &semver::Version::new(4, 5, 0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lock.packages["example"].dependencies,
+        BTreeSet::from(["R (>= 4.0)".parse().unwrap(), "stats".parse().unwrap()])
+    );
+    metadata.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_only_solver_equality_does_not_conflate_source_metadata() {
+    let source = |dependency: &str| {
+        Arc::new(
+            LocalRepository::new("same-path".into()).with_description(Description::parse(
+                &format!("Package: example\nVersion: 1.0.0\nImports: {dependency}\n"),
+            )),
+        )
+    };
+    let a = PackageRepository::Local(source("firstdep"));
+    let b = PackageRepository::Local(source("seconddep"));
+    assert_eq!(a, b); // configuration equality is deliberately not snapshot identity
+    let first = version("1.0.0", a.clone());
+    let second = version("1.0.0", b.clone());
+    assert_eq!(first, second);
+    let provider = RDependencyProvider::new(
+        vec![a, b],
+        local_repository("root", "1.0.0"),
+        ProjectType::Package,
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeSet::new(),
+    );
+    tokio::task::spawn_blocking(move || {
+        provider
+            .get_dependencies(&"example".into(), &first)
+            .unwrap();
+        provider
+            .get_dependencies(&"example".into(), &second)
+            .unwrap();
+        assert_eq!(
+            provider
+                .resolved_package("example", first)
+                .unwrap()
+                .dependencies,
+            BTreeSet::from([Relation::any("firstdep").unwrap()])
+        );
+        assert_eq!(
+            provider
+                .resolved_package("example", second)
+                .unwrap()
+                .dependencies,
+            BTreeSet::from([Relation::any("seconddep").unwrap()])
+        );
+    })
+    .await
+    .unwrap();
 }

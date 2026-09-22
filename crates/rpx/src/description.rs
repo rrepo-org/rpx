@@ -341,7 +341,7 @@ pub enum DependencyMutationError {
     },
 }
 
-pub fn required_dependencies(
+pub(crate) fn declared_dependencies(
     source_name: impl Into<String>,
     description: &Description,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
@@ -354,7 +354,14 @@ pub fn required_dependencies(
             ("LinkingTo", description.linking_to_parsed()),
         ],
     )
-    .map(|dependencies| {
+}
+
+#[cfg(test)]
+pub(crate) fn required_dependencies(
+    source_name: impl Into<String>,
+    description: &Description,
+) -> Result<BTreeSet<Relation>, DescriptionParseError> {
+    declared_dependencies(source_name, description).map(|dependencies| {
         dependencies
             .into_iter()
             .filter(|relation| relation.package() != "R")

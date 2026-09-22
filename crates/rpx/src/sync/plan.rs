@@ -4,7 +4,6 @@
 use super::operations::{self, BuildInput, DependencyInput, OperationError, PreparedArtifact};
 use crate::{
     cache::installer_cache_path,
-    description::{DescriptionParseError, required_dependencies},
     project::RequiredPackages,
     r::{InstalledPackagesError, installed_packages},
     repository::PackageRepository,
@@ -62,12 +61,9 @@ struct Changes {
     removals: Vec<String>,
 }
 
-/// Pure reconciliation: selection and dependency validation finish before any
-/// task is registered. All dependency versions come from this resolution snapshot.
-fn reconcile(
-    required: RequiredPackages,
-    installed: &BTreeMap<String, Version>,
-) -> Result<Changes, PlanError> {
+/// Pure reconciliation of already-validated dependency records. All dependency
+/// versions come from this resolution (or explicitly replayed lockfile) snapshot.
+fn reconcile(required: RequiredPackages, installed: &BTreeMap<String, Version>) -> Changes {
     let removals = installed
         .keys()
         .filter(|name| !required.contains_key(*name))
@@ -75,31 +71,32 @@ fn reconcile(
         .collect();
     let versions: BTreeMap<_, _> = required
         .iter()
-        .map(|(name, (selected, _))| (name.clone(), selected.version().clone()))
+        .map(|(name, package)| (name.clone(), package.version().clone()))
         .collect();
     let installs = required
         .into_iter()
-        .filter(|(name, (selected, _))| package_requires_install(selected, installed.get(name)))
-        .map(|(name, (selected, description))| {
-            let dependencies =
-                required_dependencies(format!("{name} {}", selected.version()), &description)?
-                    .into_iter()
-                    .map(|relation| {
-                        let name = relation.package().to_string();
-                        let version = versions.get(&name).cloned();
-                        (name, version)
-                    })
-                    .collect();
-            Ok((
+        .filter(|(name, package)| package_requires_install(&package.selected, installed.get(name)))
+        .map(|(name, package)| {
+            let dependencies = package
+                .dependencies
+                .into_iter()
+                .filter(|relation| relation.package() != "R")
+                .map(|relation| {
+                    let name = relation.package().to_string();
+                    let version = versions.get(&name).cloned();
+                    (name, version)
+                })
+                .collect();
+            (
                 name,
                 InstallRequest {
-                    selected,
+                    selected: package.selected,
                     dependencies,
                 },
-            ))
+            )
         })
-        .collect::<Result<_, PlanError>>()?;
-    Ok(Changes { installs, removals })
+        .collect();
+    Changes { installs, removals }
 }
 
 fn package_requires_install(required: &PackageVersion, installed: Option<&Version>) -> bool {
@@ -113,9 +110,6 @@ fn package_requires_install(required: &PackageVersion, installed: Option<&Versio
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum PlanError {
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Dependencies(#[from] DescriptionParseError),
     #[error("cannot determine package installation order")]
     #[diagnostic(
         code(rpx::sync::dependency_cycle),
@@ -170,7 +164,7 @@ pub(super) struct SyncPlan {
 impl SyncPlan {
     /// Call under the desired tracing span; registration binds it to each operation.
     pub fn prepare(required: RequiredPackages, target: SyncTarget) -> Result<Self, PlanError> {
-        let changes = reconcile(required, &target.installed)?;
+        let changes = reconcile(required, &target.installed);
         let assembly = Assembly::new(target.library, target.r_version)
             .reserve_installs(changes.installs.keys());
         let assembly = changes
@@ -495,6 +489,7 @@ impl Assembly {
 mod tests {
     use super::*;
     use crate::repository::{GitRepository, LocalRepository, built_in_repository};
+    use crate::resolver::ResolvedPackage;
     use r_description::Description;
     use r_metadata::Remote;
     use std::error::Error;
@@ -505,12 +500,12 @@ mod tests {
             .map(|(name, fields)| {
                 (
                     (*name).into(),
-                    (
+                    ResolvedPackage::from_description(
+                        name,
                         PackageVersion::new("1.0.0".parse().unwrap(), built_in_repository()),
-                        Arc::new(Description::parse(&format!(
-                            "Package: {name}\nVersion: 1.0.0\n{fields}"
-                        ))),
-                    ),
+                        &Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{fields}")),
+                    )
+                    .unwrap(),
                 )
             })
             .collect()
@@ -531,7 +526,7 @@ mod tests {
     fn reconciliation_separates_kept_changed_missing_and_extra_packages() {
         let desired = required_packages(&[("kept", ""), ("changed", ""), ("missing", "")]);
         let observed = target(&[("kept", "1.0.0"), ("changed", "0.9.0"), ("extra", "1.0.0")]);
-        let changes = reconcile(desired, &observed.installed).unwrap();
+        let changes = reconcile(desired, &observed.installed);
         assert_eq!(
             changes
                 .installs
@@ -560,7 +555,7 @@ mod tests {
             ("newdep", ""),
         ]);
         let observed = target(&[("kept", "1.0.0")]);
-        let changes = reconcile(desired, &observed.installed).unwrap();
+        let changes = reconcile(desired, &observed.installed);
         let dependencies = &changes.installs["consumer"].dependencies;
         assert_eq!(
             dependencies.get("kept"),
@@ -645,17 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_dependencies_remain_positioned_planning_errors() {
-        let Err(error) = SyncPlan::prepare(
-            required_packages(&[("example", "Imports: cli (>= invalid)\n")]),
-            target(&[]),
-        ) else {
-            panic!("expected metadata error")
-        };
-        let PlanError::Dependencies(source) = &error else {
-            panic!("expected metadata error")
-        };
-        assert!(!source.messages().is_empty());
+    fn malformed_metadata_cannot_become_a_resolved_record() {
+        let error = ResolvedPackage::from_description(
+            "example",
+            PackageVersion::new("1.0.0".parse().unwrap(), built_in_repository()),
+            &Description::parse("Package: example\nVersion: 1.0.0\nImports: cli (>= invalid)\n"),
+        )
+        .unwrap_err();
+        assert!(!error.messages().is_empty());
         let outer = super::super::SyncError::from(error);
         assert_eq!(
             outer.code().unwrap().to_string(),

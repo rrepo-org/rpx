@@ -12,5 +12,7 @@ mod reconciliation;
 mod recovery;
 #[path = "e2e/repositories.rs"]
 mod repositories;
+#[path = "e2e/repository_resolution.rs"]
+mod repository_resolution;
 #[path = "e2e/support.rs"]
 mod support;

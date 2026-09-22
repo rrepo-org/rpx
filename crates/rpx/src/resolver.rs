@@ -6,7 +6,7 @@ use r_description::Description;
 use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -14,7 +14,9 @@ use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
-    description::{ProjectType, description_identity, required_dependencies},
+    description::{
+        DescriptionParseError, ProjectType, declared_dependencies, description_identity,
+    },
     r::{BasePackagesError, base_packages},
     repository::{
         ArchiveSupport, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
@@ -96,7 +98,43 @@ impl std::fmt::Display for PackageVersion {
     }
 }
 
-/// Native metadata dispatch shared by solving, prefetch, and hydration. Local
+/// Explicit dependency data for a selected package. Fresh resolution constructs
+/// this from native metadata; locked replay copies the lock's declared relations.
+/// A replayed record is never used to populate the resolver's metadata state.
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub selected: PackageVersion,
+    pub dependencies: BTreeSet<Relation>,
+}
+
+impl ResolvedPackage {
+    pub fn from_description(
+        package: &str,
+        selected: PackageVersion,
+        description: &Description,
+    ) -> Result<Self, DescriptionParseError> {
+        let dependencies = declared_dependencies(
+            format!(
+                "{package} {} from {}",
+                selected.version(),
+                selected.repository()
+            ),
+            description,
+        )?;
+        Ok(Self {
+            selected,
+            dependencies,
+        })
+    }
+    pub fn version(&self) -> &Version {
+        self.selected.version()
+    }
+    pub fn repository(&self) -> &PackageRepository {
+        self.selected.repository()
+    }
+}
+
+/// Native metadata dispatch shared by solving and prefetch. Local
 /// overrides and Git commit state stay on the original shared source handles.
 pub(crate) async fn package_description(
     repository: &PackageRepository,
@@ -104,8 +142,8 @@ pub(crate) async fn package_description(
     version: &Version,
 ) -> Result<Arc<Description>, RepositoryError> {
     let description = match repository {
-        PackageRepository::Rrepo(repo) => return repo.description(package, version).await,
-        PackageRepository::Cran(repo) => return repo.description(package, version).await,
+        PackageRepository::Rrepo(repo) => repo.description(package, version).await?,
+        PackageRepository::Cran(repo) => repo.description(package, version).await?,
         PackageRepository::Git(repo) => repo.description().await?,
         PackageRepository::Local(repo) => repo.description().await?,
     };
@@ -130,6 +168,9 @@ pub(crate) struct RDependencyProvider {
     preferred_versions: BTreeMap<String, Version>,
     base_packages: BTreeSet<String>,
     description_prefetch_permits: Arc<Semaphore>,
+    // Strong resolution state, not an evictable repository cache. Keys include
+    // the source slot because PackageVersion equality intentionally ignores it.
+    metadata: Mutex<BTreeMap<(usize, String, Version), Arc<BTreeSet<Relation>>>>,
 }
 
 impl RDependencyProvider {
@@ -149,12 +190,53 @@ impl RDependencyProvider {
             preferred_versions,
             base_packages,
             description_prefetch_permits: Arc::new(Semaphore::new(DESCRIPTION_PREFETCH_WORKERS)),
+            metadata: Mutex::new(BTreeMap::new()),
         }
     }
 
     fn root_package(&self) -> Result<(String, PackageVersion), ProviderError> {
         let (name, version) = tokio::runtime::Handle::current().block_on(self.root.package())?;
         Ok((name, PackageVersion::new(version, self.root.clone())))
+    }
+
+    fn metadata_key(
+        &self,
+        package: &str,
+        version: &PackageVersion,
+    ) -> Result<(usize, String, Version), ProviderError> {
+        let source = self
+            .repositories
+            .iter()
+            .position(|repository| repository.same_instance(version.repository()))
+            .ok_or_else(|| RepositoryError::InvalidData {
+                resource: format!("source for {package} {version}"),
+                details: "candidate source is outside this resolution".into(),
+            })?;
+        Ok((source, package.to_string(), version.version().clone()))
+    }
+
+    fn resolved_package(
+        &self,
+        name: &str,
+        selected: PackageVersion,
+    ) -> Result<ResolvedPackage, ProviderError> {
+        let key = self.metadata_key(name, &selected)?;
+        let metadata = self
+            .metadata
+            .lock()
+            .expect("resolution metadata lock poisoned");
+        let dependencies = metadata
+            .get(&key)
+            .ok_or_else(|| RepositoryError::InvalidData {
+                resource: format!("resolved metadata for {name} {selected}"),
+                details: "selected candidate has no validated dependency record".into(),
+            })?
+            .as_ref()
+            .clone();
+        Ok(ResolvedPackage {
+            selected,
+            dependencies,
+        })
     }
 
     fn prefetch_descriptions(
@@ -274,6 +356,16 @@ impl DependencyProvider for RDependencyProvider {
         if self.base_packages.contains(package) {
             return Ok(Dependencies::Available(DependencyConstraints::default()));
         }
+        let key = self.metadata_key(package, version)?;
+        let cached = self
+            .metadata
+            .lock()
+            .expect("resolution metadata lock poisoned")
+            .get(&key)
+            .cloned();
+        if let Some(relations) = cached {
+            return Ok(Dependencies::Available(self.dependency_ranges(&relations)?));
+        }
         let description = tokio::runtime::Handle::current()
             .block_on(package_description(
                 version.repository(),
@@ -284,7 +376,7 @@ impl DependencyProvider for RDependencyProvider {
                 repository: version.repository.to_string(),
                 source,
             })?;
-        let relations = match required_dependencies(
+        let relations = match declared_dependencies(
             format!("{package} {version} from {}", version.repository),
             &description,
         ) {
@@ -297,6 +389,10 @@ impl DependencyProvider for RDependencyProvider {
             }
         };
         let constraints = self.dependency_ranges(&relations)?;
+        self.metadata
+            .lock()
+            .expect("resolution metadata lock poisoned")
+            .insert(key, Arc::new(relations));
         self.prefetch_descriptions(&constraints)?;
         Ok(Dependencies::Available(constraints))
     }
@@ -435,7 +531,7 @@ pub(crate) async fn resolve_from_registry(
     root_type: ProjectType,
     root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, Version>,
-) -> Result<BTreeMap<String, PackageVersion>, ResolutionError> {
+) -> Result<BTreeMap<String, ResolvedPackage>, ResolutionError> {
     let base_packages = base_packages().await?;
     let span = tracing::info_span!(
         "resolve_dependencies",
@@ -460,9 +556,23 @@ pub(crate) async fn resolve_from_registry(
             base_packages,
         );
         let (name, version) = provider.root_package()?;
-        let selected = resolve(&provider, name, version)?
+        let root_description = tokio::runtime::Handle::current()
+            .block_on(provider.root.description())
+            .map_err(ProviderError::from)?;
+        let root = ResolvedPackage::from_description(&name, version.clone(), &root_description)
+            .map_err(RepositoryError::from)
+            .map_err(ProviderError::from)?;
+        let selected = resolve(&provider, name.clone(), version)?
             .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            .map(|(package, selected)| {
+                let record = if package == name {
+                    root.clone()
+                } else {
+                    provider.resolved_package(&package, selected)?
+                };
+                Ok((package, record))
+            })
+            .collect::<Result<BTreeMap<_, _>, ProviderError>>()?;
         Ok::<_, ResolutionError>(selected)
     })
     .await??;
@@ -478,7 +588,7 @@ fn dependency_ranges_from_relations(
 ) -> DependencyConstraints<String, Ranges<PackageVersion>> {
     relations
         .iter()
-        .filter(|r| !base_packages.contains(r.package()))
+        .filter(|r| r.package() != "R" && !base_packages.contains(r.package()))
         .fold(
             DependencyConstraints::default(),
             |mut constraints, relation| {

@@ -10,7 +10,7 @@ use crate::{
     },
     r::InstalledPackagesError,
     repository::LocalRepository,
-    resolver::PackageVersion,
+    resolver::{PackageVersion, ResolvedPackage},
     ui::progress_count_style,
 };
 use miette::Diagnostic;
@@ -66,7 +66,8 @@ fn desired_packages(
     let root = match (project_type(&project.description), project_package) {
         (ProjectType::Package, ProjectPackageMode::Install) => Some((
             root_name.clone(),
-            (
+            ResolvedPackage::from_description(
+                &root_name,
                 PackageVersion::new(
                     root_version,
                     Arc::new(
@@ -74,8 +75,8 @@ fn desired_packages(
                             .with_description(project.description.clone()),
                     ),
                 ),
-                Arc::new(project.description.clone()),
-            ),
+                &project.description,
+            )?,
         )),
         (ProjectType::Package, ProjectPackageMode::Omit) | (ProjectType::Project, _) => None,
     };
@@ -151,12 +152,12 @@ mod tests {
             .map(|name| {
                 (
                     name.into(),
-                    (
+                    ResolvedPackage::from_description(
+                        name,
                         PackageVersion::new("1.0.0".parse().unwrap(), built_in_repository()),
-                        Arc::new(Description::parse(&format!(
-                            "Package: {name}\nVersion: 1.0.0\n"
-                        ))),
-                    ),
+                        &Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n")),
+                    )
+                    .unwrap(),
                 )
             })
             .collect()
@@ -166,13 +167,13 @@ mod tests {
     fn root_policy_uses_supplied_description_without_changing_dependencies() {
         let desired =
             desired_packages(&project("package"), resolved(), ProjectPackageMode::Install).unwrap();
-        assert_eq!(desired["root"].0.version().to_string(), "2.0.0");
-        let PackageRepository::Local(local) = desired["root"].0.repository() else {
+        assert_eq!(desired["root"].version().to_string(), "2.0.0");
+        let PackageRepository::Local(local) = desired["root"].repository() else {
             panic!("expected local root")
         };
         assert_eq!(local.path(), std::path::Path::new("unused-project"));
-        assert_eq!(desired["dependency"].0.version().to_string(), "1.0.0");
-        assert_eq!(desired["dependency"].0.repository(), &built_in_repository());
+        assert_eq!(desired["dependency"].version().to_string(), "1.0.0");
+        assert_eq!(desired["dependency"].repository(), &built_in_repository());
     }
 
     #[test]
