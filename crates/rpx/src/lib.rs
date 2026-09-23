@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::io::IsTerminal;
 use tracing_indicatif::{
     filter::{IndicatifFilter, hide_indicatif_span_fields},
     style::ProgressStyle,
@@ -40,13 +39,11 @@ use ui::progress_spinner_style;
 /// Returns an error when command execution or diagnostic rendering fails.
 pub async fn run() -> miette::Result<()> {
     let cli = Cli::parse();
-    let interactive_init = matches!(&cli.command, Commands::Init(_))
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal();
+    let interactive_init = matches!(&cli.command, Commands::Init(_)) && ui::is_interactive();
     init_tracing(!interactive_init);
 
     match cli.command {
-        Commands::Init(args) => init::run(args, interactive_init).await?,
+        Commands::Init(args) => init::run(args).await?,
         Commands::Add(args) => add::run(args).await?,
         Commands::Remove(args) => remove::run(args).await?,
         Commands::Run(args) => run_command::run(args).await?,

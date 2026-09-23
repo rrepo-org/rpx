@@ -13,6 +13,7 @@ use crate::{
     },
     repository::parse_repository_url,
     sync::{ProjectPackageMode, SyncError, sync_resolved_project},
+    ui::is_interactive,
 };
 use miette::Diagnostic;
 use r_description::{Description, EditError, FieldName, LogicalValue};
@@ -349,8 +350,9 @@ impl DevelopmentPackage {
     }
 }
 
-pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> {
+pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     let current_dir = env::current_dir().map_err(Error::WorkingDirectoryUnavailable)?;
+    let interactive = is_interactive();
 
     if interactive {
         cliclack::intro("Create an R project").map_err(Error::InteractivePrompt)?;
