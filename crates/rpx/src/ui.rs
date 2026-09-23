@@ -1,3 +1,9 @@
+use std::io::IsTerminal;
+
+pub(crate) fn is_interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 pub(crate) fn progress_spinner_style() -> tracing_indicatif::style::ProgressStyle {
     tracing_indicatif::style::ProgressStyle::with_template("{span_child_prefix}{spinner} {msg}")
         .expect("progress spinner style should be valid")

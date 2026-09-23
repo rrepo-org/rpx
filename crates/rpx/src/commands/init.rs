@@ -13,6 +13,7 @@ use crate::{
     },
     repository::parse_repository_url,
     sync::{ProjectPackageMode, SyncError, sync_resolved_project},
+    ui::is_interactive,
 };
 use miette::Diagnostic;
 use r_description::{Description, EditError, FieldName, LogicalValue};
@@ -20,7 +21,6 @@ use r_metadata::Relation;
 use std::{
     collections::BTreeSet,
     env, fmt, fs, io,
-    io::IsTerminal,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -352,7 +352,7 @@ impl DevelopmentPackage {
 
 pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     let current_dir = env::current_dir().map_err(Error::WorkingDirectoryUnavailable)?;
-    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let interactive = is_interactive();
 
     if interactive {
         cliclack::intro("Create an R project").map_err(Error::InteractivePrompt)?;
@@ -428,15 +428,6 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     } else {
         args.development_packages
     };
-    let initialize_git = if interactive {
-        prompt_for_git_repository(&target)?
-    } else {
-        false
-    };
-    if interactive {
-        cliclack::outro("Configuration complete").map_err(Error::InteractivePrompt)?;
-    }
-
     let mut description = initial_description(InitialDescriptionOptions {
         package_name: &package_name,
         title: &title,
@@ -466,7 +457,12 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         root: target.clone(),
         description,
     };
-    let mut resolution = resolve_project(&project, ResolutionPolicy::AlwaysResolve).await?;
+    let mut resolution = with_spinner(
+        interactive,
+        "Resolve dependencies",
+        resolve_project(&project, ResolutionPolicy::AlwaysResolve),
+    )
+    .await?;
     pin_unconstrained_dependencies(
         &mut project,
         &mut resolution,
@@ -483,7 +479,17 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
     write_development_setup(&target, &package_name, project_type, &development_packages)?;
-    sync_resolved_project(&project, resolution, ProjectPackageMode::Install).await?;
+    with_spinner(
+        interactive,
+        "Install packages",
+        sync_resolved_project(&project, resolution, ProjectPackageMode::Install),
+    )
+    .await?;
+    let initialize_git = if interactive {
+        prompt_for_git_repository(&target)?
+    } else {
+        false
+    };
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),
@@ -492,16 +498,43 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         write_gitignore(&target)?;
     }
 
-    if initialize_git {
-        status(format_args!(
+    let message = if initialize_git {
+        format!(
             "Initialized project and Git repository at {}",
             target.display()
-        ));
+        )
     } else {
-        status(format_args!("Initialized project at {}", target.display()));
+        format!("Initialized project at {}", target.display())
+    };
+    if interactive {
+        cliclack::log::success(message).map_err(Error::InteractivePrompt)?;
+        cliclack::outro(next_step_message(&current_dir, &target))
+            .map_err(Error::InteractivePrompt)?;
+    } else {
+        status(message);
+        status(next_step_message(&current_dir, &target));
     }
-    status(next_step_message(&current_dir, &target));
     Ok(())
+}
+
+async fn with_spinner<T, E>(
+    interactive: bool,
+    message: &str,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let spinner = interactive.then(cliclack::spinner);
+    if let Some(spinner) = &spinner {
+        spinner.start(message);
+    }
+    let result = operation.await;
+    if let Some(spinner) = spinner {
+        if result.is_ok() {
+            spinner.stop(message);
+        } else {
+            spinner.error(format!("{message} failed"));
+        }
+    }
+    result
 }
 
 impl From<InitProjectType> for ProjectType {
