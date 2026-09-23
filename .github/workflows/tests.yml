@@ -65,6 +65,11 @@ jobs:
         with:
           r-version: ${{ matrix.r }}
 
+      - name: Install Linux test dependencies
+        if: runner.os == 'Linux'
+        # The development-tool E2E test builds fs from source on Linux.
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
