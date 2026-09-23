@@ -295,6 +295,18 @@ mod tests {
             };
             assert_eq!(cache_key_digest(&old), cache_key_digest(&new));
             let version: Version = "1.2.3".parse().unwrap();
+            let target: Triple = "x86_64-pc-windows-msvc".parse().unwrap();
+            let r_version: RVersion = "4.5.0".parse().unwrap();
+            assert_eq!(
+                cache_key_digest(&(&old, "package", &version, &target, &r_version)),
+                cache_key_digest(&BinaryArtifactCacheKey::new(
+                    new.clone(),
+                    "package",
+                    version.clone(),
+                    target,
+                    r_version
+                ))
+            );
             assert_eq!(
                 cache_key_digest(&(LegacySource::Registry(old), "package", &version)),
                 cache_key_digest(&SourceArtifactCacheKey::new(

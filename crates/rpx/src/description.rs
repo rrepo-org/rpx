@@ -875,6 +875,10 @@ pub enum RepositoriesFromDescriptionError {
     #[diagnostic(transparent)]
     Configuration(#[from] DescriptionParseError),
 
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidMetadata(RepositoryError),
+
     #[error("failed to configure {kind} repository: {source}")]
     #[diagnostic(code(rpx::description::repository_configuration_failed))]
     Repository {
@@ -882,6 +886,15 @@ pub enum RepositoriesFromDescriptionError {
         #[source]
         source: RepositoryError,
     },
+}
+
+impl RepositoriesFromDescriptionError {
+    fn remote(kind: &'static str, source: RepositoryError) -> Self {
+        match source {
+            source @ RepositoryError::CranPackages(_) => Self::InvalidMetadata(source),
+            source => Self::Repository { kind, source },
+        }
+    }
 }
 
 pub async fn repositories_from_description(
@@ -897,11 +910,13 @@ pub async fn repositories_from_description(
         async move {
             match repository {
                 ConfiguredRepository::Base(url) => discovered
-                    .try_get_with(url.clone(), PackageRepository::from_url(url))
+                    .try_get_with(url.clone(), Box::pin(PackageRepository::from_url(url)))
                     .await
-                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                        kind: "base",
-                        source: Arc::unwrap_or_clone(source),
+                    .map_err(|source| {
+                        RepositoriesFromDescriptionError::remote(
+                            "base",
+                            Arc::unwrap_or_clone(source),
+                        )
                     }),
                 ConfiguredRepository::Git(remote) => GitRepository::new(remote)
                     .map(|repository| PackageRepository::Git(Arc::new(repository)))
@@ -910,11 +925,13 @@ pub async fn repositories_from_description(
                         source,
                     }),
                 ConfiguredRepository::Additional(url) => discovered
-                    .try_get_with(url.clone(), PackageRepository::from_url(url))
+                    .try_get_with(url.clone(), Box::pin(PackageRepository::from_url(url)))
                     .await
-                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                        kind: "additional",
-                        source: Arc::unwrap_or_clone(source),
+                    .map_err(|source| {
+                        RepositoriesFromDescriptionError::remote(
+                            "additional",
+                            Arc::unwrap_or_clone(source),
+                        )
                     }),
             }
         }

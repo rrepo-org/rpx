@@ -41,7 +41,9 @@ pub fn built_in_repository() -> PackageRepository {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArchiveSupport {
+    /// The repository exposes archive directory listings.
     Available,
+    /// Directory listing is unavailable; known archive URLs may still work.
     Unavailable,
 }
 
@@ -192,11 +194,7 @@ impl PackageRepository {
                     Err(rrepo_error) => {
                         match cran_probe.await {
                             Ok(repository) => Ok(repository),
-                            Err(cran_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.clone(),
-                                rrepo: Box::new(rrepo_error),
-                                cran: Box::new(cran_error),
-                            }),
+                            Err(cran_error) => Err(discovery_failure(value.clone(), rrepo_error, cran_error)),
                         }
                     }
                 }
@@ -208,11 +206,7 @@ impl PackageRepository {
                     Err(cran_error) => {
                         match rrepo_probe.await {
                             Ok(repository) => Ok(repository),
-                            Err(rrepo_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value,
-                                rrepo: Box::new(rrepo_error),
-                                cran: Box::new(cran_error),
-                            }),
+                            Err(rrepo_error) => Err(discovery_failure(value, rrepo_error, cran_error)),
                         }
                     }
                 }
@@ -266,20 +260,18 @@ impl PackageRepository {
 
     pub async fn to_lockfile(&self) -> Result<crate::lockfile::Repository, RepositoryError> {
         match self {
-            Self::Rrepo(repository) => {
-                return Ok(crate::lockfile::Repository::Rrepo {
-                    url: repository.url().clone(),
-                });
-            }
+            Self::Rrepo(repository) => Ok(crate::lockfile::Repository::Rrepo {
+                url: repository.url().clone(),
+            }),
             Self::Cran(repository) => {
                 let archive_support = match repository.archive_support() {
                     ArchiveSupport::Available => crate::lockfile::ArchiveSupport::Available,
                     ArchiveSupport::Unavailable => crate::lockfile::ArchiveSupport::Unavailable,
                 };
-                return Ok(crate::lockfile::Repository::CranLike {
+                Ok(crate::lockfile::Repository::CranLike {
                     url: repository.url().clone(),
                     archive_support,
-                });
+                })
             }
             Self::Git(repository) => {
                 let commit = repository.commit().await?;
@@ -308,18 +300,33 @@ impl PackageRepository {
                         details: error.to_string(),
                     })?;
 
-                return Ok(crate::lockfile::Repository::Git {
+                Ok(crate::lockfile::Repository::Git {
                     url,
                     reference,
                     commit,
                     subdirectory,
-                });
+                })
             }
             Self::Local(_) => Err(RepositoryError::InvalidData {
                 resource: "lockfile repository".to_string(),
                 details: format!("unsupported repository {self}"),
             }),
         }
+    }
+}
+
+fn discovery_failure(
+    url: String,
+    rrepo: RepositoryError,
+    cran: RepositoryError,
+) -> RepositoryError {
+    match cran {
+        error @ RepositoryError::CranPackages(_) => error,
+        cran => RepositoryError::UnrecognizedRepository {
+            url,
+            rrepo: Box::new(rrepo),
+            cran: Box::new(cran),
+        },
     }
 }
 
@@ -475,6 +482,43 @@ mod tests {
         assert_eq!(repo.packages_index().await.unwrap().records().count(), 1);
         assert_eq!(repo.archive_support(), ArchiveSupport::Unavailable);
         index.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_cran_index_retains_its_positioned_diagnostic_during_discovery() {
+        use miette::Diagnostic;
+        let mut server = mockito::Server::new_async().await;
+        let _api = server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _archive = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _index = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_body("Package: example\nVersion: invalid\n")
+            .create_async()
+            .await;
+        let description = r_description::Description::parse(&format!(
+            "Package: root\nVersion: 1.0.0\nConfig/rpx/base-repository: {}\n",
+            server.url()
+        ));
+        let error = crate::description::repositories_from_description(
+            std::path::Path::new("unused"),
+            &description,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code().unwrap().to_string(),
+            "rpx::repository::cran_packages_parse_failed"
+        );
+        assert!(error.source_code().is_some());
     }
 
     #[tokio::test]

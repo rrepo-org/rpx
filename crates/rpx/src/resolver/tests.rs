@@ -478,3 +478,297 @@ async fn version_only_solver_equality_does_not_conflate_source_metadata() {
     .await
     .unwrap();
 }
+
+fn source_body(package: &str, version: &str, fields: &str) -> Vec<u8> {
+    let body = format!("Package: {package}\nVersion: {version}\n{fields}");
+    let compressed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(compressed);
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_cksum();
+    archive
+        .append_data(
+            &mut header,
+            format!("{package}/DESCRIPTION"),
+            body.as_bytes(),
+        )
+        .unwrap();
+    archive.into_inner().unwrap().finish().unwrap()
+}
+
+async fn cran_registry(
+    index: &str,
+    listing: ArchiveSupport,
+) -> (mockito::ServerGuard, PackageRepository, mockito::Mock) {
+    let mut server = mockito::Server::new_async().await;
+    let packages = server
+        .mock("GET", "/src/contrib/PACKAGES")
+        .with_status(200)
+        .with_body(index)
+        .expect(1)
+        .create_async()
+        .await;
+    let repo = PackageRepository::Cran(Arc::new(CranRepository::new(
+        server.url().parse().unwrap(),
+        listing,
+    )));
+    (server, repo, packages)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unindexed_preferred_archive_survives_absence_from_current_index() {
+    let (mut server, repo, index) = cran_registry(
+        "Package: other\nVersion: 2.0.0\n",
+        ArchiveSupport::Unavailable,
+    )
+    .await;
+    let no_listing = server
+        .mock("GET", "/src/contrib/Archive/example/")
+        .expect(0)
+        .create_async()
+        .await;
+    let current = server
+        .mock("GET", "/src/contrib/example_1.0.0.tar.gz")
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+    let archive = server
+        .mock("GET", "/src/contrib/Archive/example/example_1.0.0.tar.gz")
+        .with_status(200)
+        .with_body(source_body(
+            "example",
+            "1.0.0",
+            "Depends: R (>= 4.0), stats\n",
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let selected = resolve_from_registry(
+        vec![repo.clone()],
+        local_repository("project", "1.0.0"),
+        ProjectType::Package,
+        BTreeSet::from([Relation::any("example").unwrap()]),
+        BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selected["example"].version().to_string(), "1.0.0");
+    assert!(selected["example"].repository().same_instance(&repo));
+    assert_eq!(
+        selected["example"].dependencies,
+        BTreeSet::from(["R (>= 4.0)".parse().unwrap(), "stats".parse().unwrap()])
+    );
+    no_listing.assert_async().await;
+    current.assert_async().await;
+    archive.assert_async().await;
+    index.assert_async().await;
+}
+
+#[tokio::test]
+async fn missing_unindexed_preferred_version_falls_back_and_memoizes_absence() {
+    let (mut server, repo, index) = cran_registry(
+        "Package: example\nVersion: 2.0.0\n",
+        ArchiveSupport::Unavailable,
+    )
+    .await;
+    let current = server
+        .mock("GET", "/src/contrib/example_1.0.0.tar.gz")
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+    let archive = server
+        .mock("GET", "/src/contrib/Archive/example/example_1.0.0.tar.gz")
+        .with_status(410)
+        .expect(1)
+        .create_async()
+        .await;
+    let preferred = BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]);
+    let first = choose_package_version(&[repo.clone()], &preferred, "example", &Ranges::full())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = choose_package_version(&[repo], &preferred, "example", &Ranges::full())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.version().to_string(), "2.0.0");
+    assert_eq!(first, second);
+    current.assert_async().await;
+    archive.assert_async().await;
+    index.assert_async().await;
+}
+
+#[tokio::test]
+async fn incompatible_preferred_version_does_not_trigger_a_probe() {
+    let (mut server, repo, _) = cran_registry(
+        "Package: example\nVersion: 2.0.0\n",
+        ArchiveSupport::Unavailable,
+    )
+    .await;
+    let no_probe = server
+        .mock("GET", mockito::Matcher::Regex("[.]tar[.]gz$".into()))
+        .expect(0)
+        .create_async()
+        .await;
+    let selected = choose_package_version(
+        &[repo.clone()],
+        &BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]),
+        "example",
+        &Ranges::higher_than(version("2.0.0", repo)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.version().to_string(), "2.0.0");
+    no_probe.assert_async().await;
+}
+
+#[tokio::test]
+async fn current_preferred_version_uses_index_metadata_without_probing() {
+    let (mut server, repo, _) = cran_registry(
+        "Package: example\nVersion: 1.0.0\n",
+        ArchiveSupport::Unavailable,
+    )
+    .await;
+    let no_probe = server
+        .mock("GET", mockito::Matcher::Regex("[.]tar[.]gz$".into()))
+        .expect(0)
+        .create_async()
+        .await;
+    let selected = choose_package_version(
+        &[repo.clone()],
+        &BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]),
+        "example",
+        &Ranges::full(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    package_description(&repo, "example", selected.version())
+        .await
+        .unwrap();
+    no_probe.assert_async().await;
+}
+
+#[tokio::test]
+async fn per_package_listing_denial_still_allows_direct_preferred_lookup() {
+    let (mut server, repo, _) = cran_registry(
+        "Package: example\nVersion: 2.0.0\n",
+        ArchiveSupport::Available,
+    )
+    .await;
+    let listing = server
+        .mock("GET", "/src/contrib/Archive/example/")
+        .with_status(403)
+        .expect(1)
+        .create_async()
+        .await;
+    let current = server
+        .mock("GET", "/src/contrib/example_1.0.0.tar.gz")
+        .with_status(200)
+        .with_body(source_body("example", "1.0.0", ""))
+        .expect(1)
+        .create_async()
+        .await;
+    let selected = choose_package_version(
+        &[repo],
+        &BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]),
+        "example",
+        &Ranges::full(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.version().to_string(), "1.0.0");
+    listing.assert_async().await;
+    current.assert_async().await;
+}
+
+#[tokio::test]
+async fn indexed_archive_candidates_do_not_require_current_membership() {
+    let (mut server, repo, _) = cran_registry(
+        "Package: other\nVersion: 2.0.0\n",
+        ArchiveSupport::Available,
+    )
+    .await;
+    let listing = server
+        .mock("GET", "/src/contrib/Archive/example/")
+        .with_status(200)
+        .with_body("<a href=\"example_1.0.0.tar.gz\">example</a>")
+        .expect(1)
+        .create_async()
+        .await;
+    let selected = choose_package_version(&[repo], &BTreeMap::new(), "example", &Ranges::full())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.version().to_string(), "1.0.0");
+    listing.assert_async().await;
+}
+
+#[tokio::test]
+async fn preferred_probe_errors_are_not_treated_as_missing_versions() {
+    futures_util::future::join_all(
+        [
+            (403, Vec::new()),
+            (500, Vec::new()),
+            (200, b"invalid gzip".to_vec()),
+            (200, source_body("example", "9.0.0", "")),
+        ]
+        .into_iter()
+        .map(|(status, body)| async move {
+            let (mut server, repo, _) = cran_registry(
+                "Package: example\nVersion: 2.0.0\n",
+                ArchiveSupport::Unavailable,
+            )
+            .await;
+            let probe = server
+                .mock("GET", "/src/contrib/example_1.0.0.tar.gz")
+                .with_status(status)
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            let no_archive = server
+                .mock("GET", "/src/contrib/Archive/example/example_1.0.0.tar.gz")
+                .expect(0)
+                .create_async()
+                .await;
+            let result = choose_package_version(
+                &[repo],
+                &BTreeMap::from([("example".into(), "1.0.0".parse().unwrap())]),
+                "example",
+                &Ranges::full(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "status {status} must not silently fall back to current version"
+            );
+            probe.assert_async().await;
+            no_archive.assert_async().await;
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rrepo_version_endpoint_can_supply_packages_absent_from_its_index() {
+    let mut repo = Registry::new(&[]).await;
+    repo.versions("archived", &["1.0.0"]).await;
+    let selected = choose_package_version(
+        &[repo.repository.clone()],
+        &BTreeMap::new(),
+        "archived",
+        &Ranges::full(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.version().to_string(), "1.0.0");
+}

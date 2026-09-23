@@ -43,6 +43,29 @@ R when building task edges. Root resolution requirements retain their distinct
 project policy, including Suggests. Git repository serialization still finalizes
 configured commits, including unused configured Git sources as before.
 
+## CRAN candidate discovery
+
+Current PACKAGES membership is a fast path, not a prerequisite for archive
+candidates. The resolver uses native directory listings when available. The
+legacy `archive_support` field describes listing availability only: it does not
+assert that known archive files are absent.
+
+When directory listing is unavailable (including a denied per-package listing),
+an eligible preferred version is probed at its current source URL and then its
+archive URL. A successful source DESCRIPTION must identify the requested package
+and version. The parsed description is shared through Moka with subsequent
+dependency queries. Missing probes are also memoized for the current CLI run.
+
+Only HTTP 404/410 from an artifact endpoint means absence. Authentication/access
+failures, server failures, bad archives, and mismatched metadata propagate as
+errors rather than silently selecting a newer version. An unavailable preferred
+version falls back to the normal best eligible candidate; a preference excluded
+by the version range is not probed. This discovers known preferred versions, not
+an arbitrary history when the server offers no listing.
+
+Source requests for metadata do not populate a new persistent metadata store.
+Sync retains its existing artifact cache and binary-first download behavior.
+
 ## Compatibility
 
 The lockfile wire format and artifact/installer cache versions are unchanged.

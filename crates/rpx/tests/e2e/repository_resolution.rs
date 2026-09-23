@@ -84,11 +84,15 @@ fn lock_refreshes_actual_dependencies_after_a_hand_edited_version() {
 }
 
 fn source_archive(name: &str) -> Vec<u8> {
+    source_archive_version(name, "1.0.0", "")
+}
+
+fn source_archive_version(name: &str, version: &str, fields: &str) -> Vec<u8> {
     use std::io::Write;
     let compressed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut archive = tar::Builder::new(compressed);
     let description = format!(
-        "Package: {name}\nVersion: 1.0.0\nTitle: Locked Replay Fixture\nDescription: Tests locked replay without metadata.\nLicense: GPL-3\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\n"
+        "Package: {name}\nVersion: {version}\nTitle: Locked Replay Fixture\nDescription: Tests locked replay without metadata.\nLicense: GPL-3\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\n{fields}"
     );
     [
         ("DESCRIPTION", description.as_bytes()),
@@ -160,6 +164,85 @@ fn sync_replays_locked_dependencies_without_requesting_repository_metadata() {
     assert!(fs::read_dir(f.library()).unwrap().count() >= 2);
     no_metadata.assert();
     archives.iter().for_each(mockito::Mock::assert);
+    f.assert_no_staging();
+    f.close();
+}
+
+#[test]
+fn cran_lock_preserves_a_preferred_version_in_an_unindexed_archive_and_syncs_it() {
+    let f = Fixture::new();
+    let mut server = mockito::Server::new();
+    let _api = server.mock("GET", "/packages").with_status(404).create();
+    let _archive_root = server
+        .mock("GET", "/src/contrib/Archive/")
+        .with_status(403)
+        .create();
+    let initial = server
+        .mock("GET", "/src/contrib/PACKAGES")
+        .with_status(200)
+        .with_body("Package: selected\nVersion: 2.0.0\nDepends: R (>= 4.0), stats\n")
+        .expect(1)
+        .create();
+    configure(&f, &server.url());
+    f.success(&f.project, &["lock"]);
+    assert_eq!(f.lock()["packages"]["selected"]["version"], "2.0.0");
+    initial.assert();
+
+    // The previously selected package is no longer in PACKAGES, and directory
+    // listing is forbidden, but its known archive URL remains available.
+    server.reset();
+    let _api = server.mock("GET", "/packages").with_status(404).create();
+    let _archive_root = server
+        .mock("GET", "/src/contrib/Archive/")
+        .with_status(403)
+        .create();
+    let updated = server
+        .mock("GET", "/src/contrib/PACKAGES")
+        .with_status(200)
+        .with_body("Package: unrelated\nVersion: 3.0.0\n")
+        .expect(1)
+        .create();
+    let no_listing = server
+        .mock("GET", "/src/contrib/Archive/selected/")
+        .expect(0)
+        .create();
+    let current = server
+        .mock("GET", "/src/contrib/selected_2.0.0.tar.gz")
+        .with_status(404)
+        .expect(2)
+        .create();
+    let archive = server
+        .mock("GET", "/src/contrib/Archive/selected/selected_2.0.0.tar.gz")
+        .with_status(200)
+        .with_body(source_archive_version(
+            "selected",
+            "2.0.0",
+            "Depends: R (>= 4.0), stats\n",
+        ))
+        .expect(2)
+        .create();
+    let _binary = server
+        .mock("GET", mockito::Matcher::Regex("^/bin/".into()))
+        .with_status(404)
+        .create();
+    f.success(&f.project, &["lock"]);
+    let locked = f.lock();
+    assert_eq!(locked["packages"]["selected"]["version"], "2.0.0");
+    assert_eq!(
+        locked["packages"]["selected"]["dependencies"],
+        serde_json::json!(["R (>= 4.0)", "stats"])
+    );
+    let before_sync = f.lock_bytes();
+    f.success(&f.project, &["sync", "--no-install-project"]);
+    f.r_assert(
+        &f.project,
+        "stopifnot(as.character(packageVersion('selected')) == '2.0.0')",
+    );
+    assert_eq!(before_sync, f.lock_bytes());
+    updated.assert();
+    no_listing.assert();
+    current.assert();
+    archive.assert();
     f.assert_no_staging();
     f.close();
 }

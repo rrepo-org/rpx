@@ -19,7 +19,8 @@ use crate::{
     },
     r::{BasePackagesError, base_packages},
     repository::{
-        ArchiveSupport, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
+        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
+        built_in_repository,
     },
 };
 
@@ -143,7 +144,16 @@ pub(crate) async fn package_description(
 ) -> Result<Arc<Description>, RepositoryError> {
     let description = match repository {
         PackageRepository::Rrepo(repo) => repo.description(package, version).await?,
-        PackageRepository::Cran(repo) => repo.description(package, version).await?,
+        PackageRepository::Cran(repo) => match repo.indexed_description(package, version).await? {
+            Some(description) => description,
+            None => cran_source_description(repo, package, version)
+                .await?
+                .ok_or_else(|| RepositoryError::RepositoryPackageVersionNotFound {
+                    repository: repository.to_string(),
+                    package: package.into(),
+                    version: version.clone(),
+                })?,
+        },
         PackageRepository::Git(repo) => repo.description().await?,
         PackageRepository::Local(repo) => repo.description().await?,
     };
@@ -159,6 +169,26 @@ pub(crate) async fn package_description(
     Ok(description)
 }
 
+/// The resolver chooses current -> archive lookup. Native endpoint methods
+/// distinguish absence from errors and memoize both successful and missing probes.
+async fn cran_source_description(
+    repository: &CranRepository,
+    package: &str,
+    version: &Version,
+) -> Result<Option<Arc<Description>>, RepositoryError> {
+    match repository.current_description(package, version).await? {
+        Some(description) => Ok(Some(description)),
+        None => repository.archive_description(package, version).await,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateKey {
+    source_slot: usize,
+    package: String,
+    version: Version,
+}
+
 #[derive(Debug)]
 pub(crate) struct RDependencyProvider {
     repositories: Vec<PackageRepository>,
@@ -170,7 +200,7 @@ pub(crate) struct RDependencyProvider {
     description_prefetch_permits: Arc<Semaphore>,
     // Strong resolution state, not an evictable repository cache. Keys include
     // the source slot because PackageVersion equality intentionally ignores it.
-    metadata: Mutex<BTreeMap<(usize, String, Version), Arc<BTreeSet<Relation>>>>,
+    metadata: Mutex<BTreeMap<CandidateKey, Arc<BTreeSet<Relation>>>>,
 }
 
 impl RDependencyProvider {
@@ -203,7 +233,7 @@ impl RDependencyProvider {
         &self,
         package: &str,
         version: &PackageVersion,
-    ) -> Result<(usize, String, Version), ProviderError> {
+    ) -> Result<CandidateKey, ProviderError> {
         let source = self
             .repositories
             .iter()
@@ -212,7 +242,11 @@ impl RDependencyProvider {
                 resource: format!("source for {package} {version}"),
                 details: "candidate source is outside this resolution".into(),
             })?;
-        Ok((source, package.to_string(), version.version().clone()))
+        Ok(CandidateKey {
+            source_slot: source,
+            package: package.to_string(),
+            version: version.version().clone(),
+        })
     }
 
     fn resolved_package(
@@ -280,7 +314,7 @@ impl RDependencyProvider {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                tracing::debug!(%error, "description prefetch selection failed")
+                                tracing::debug!(%error, "description prefetch selection failed");
                             }
                         }
                     }
@@ -471,22 +505,50 @@ async fn choose_repository_version(
             (name == package).then_some(version)
         }
     };
-    let Some(latest) = latest.map(|v| PackageVersion::new(v, repository.clone())) else {
-        return Ok(None);
-    };
-    if range.contains(&latest) && (preferred.is_none() || preferred == Some(latest.version())) {
-        return Ok(Some(latest));
+    let latest = latest.map(|v| PackageVersion::new(v, repository.clone()));
+    if let Some(latest) = &latest
+        && range.contains(latest)
+        && (preferred.is_none() || preferred == Some(latest.version()))
+    {
+        return Ok(Some(latest.clone()));
     }
     let versions: BTreeSet<Version> = match repository {
-        PackageRepository::Rrepo(repo) => repo.versions(package).await?.keys().cloned().collect(),
-        PackageRepository::Cran(repo) if repo.archive_support() == ArchiveSupport::Available => {
-            repo.archive_versions(package).await?
+        PackageRepository::Rrepo(repo) => match repo.versions(package).await {
+            Ok(versions) => versions.keys().cloned().collect(),
+            Err(RepositoryError::Response { source })
+                if matches!(
+                    source.status(),
+                    Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+                ) =>
+            {
+                BTreeSet::new()
+            }
+            Err(error) => return Err(error.into()),
+        },
+        PackageRepository::Cran(repo) => {
+            let listed = if repo.archive_support() == ArchiveSupport::Available {
+                repo.archive_versions(package).await?
+            } else {
+                None
+            };
+            if listed.is_none()
+                && let Some(preferred) = preferred
+            {
+                let candidate = PackageVersion::new(preferred.clone(), repository.clone());
+                if range.contains(&candidate)
+                    && cran_source_description(repo, package, preferred)
+                        .await?
+                        .is_some()
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+            listed.unwrap_or_default()
         }
-        PackageRepository::Cran(_) | PackageRepository::Git(_) | PackageRepository::Local(_) => {
-            BTreeSet::new()
-        }
+        PackageRepository::Git(_) | PackageRepository::Local(_) => BTreeSet::new(),
     };
-    Ok(std::iter::once(latest)
+    Ok(latest
+        .into_iter()
         .chain(
             versions
                 .into_iter()

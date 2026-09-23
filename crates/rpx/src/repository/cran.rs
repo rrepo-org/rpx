@@ -1,5 +1,5 @@
 use super::{ArchiveSupport, RepositoryError};
-use crate::http;
+use crate::{description::description_identity, http};
 use futures_util::TryStreamExt;
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
@@ -13,8 +13,14 @@ pub struct CranRepository {
     url: Url,
     archives: ArchiveSupport,
     packages: Cache<(), Arc<Packages>>,
-    archive_versions: Cache<String, BTreeSet<Version>>,
-    descriptions: Cache<(String, Version), Arc<Description>>,
+    archive_versions: Cache<String, Option<BTreeSet<Version>>>,
+    descriptions: Cache<(SourceLocation, String, Version), Option<Arc<Description>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SourceLocation {
+    Current,
+    Archive,
 }
 
 impl std::fmt::Display for CranRepository {
@@ -82,14 +88,24 @@ impl CranRepository {
     pub async fn archive_versions(
         &self,
         package: &str,
-    ) -> Result<BTreeSet<Version>, RepositoryError> {
+    ) -> Result<Option<BTreeSet<Version>>, RepositoryError> {
         self.archive_versions
             .try_get_with(package.to_string(), async {
-                let text = http::cran_package_archive_listing(&self.url, package)
+                let response = http::cran_package_archive_listing(&self.url, package)
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
-                    })?
+                    })?;
+                // Listing access is distinct from direct artifact access.
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::FORBIDDEN
+                        | reqwest::StatusCode::NOT_FOUND
+                        | reqwest::StatusCode::GONE
+                ) {
+                    return Ok(None);
+                }
+                let text = response
                     .error_for_status()
                     .map_err(|source| RepositoryError::Response {
                         source: Arc::new(source),
@@ -106,55 +122,92 @@ impl CranRepository {
                             details: source.to_string(),
                         })?;
 
-                Ok::<BTreeSet<Version>, RepositoryError>(listing.versions.into_iter().collect())
+                Ok::<_, RepositoryError>(Some(listing.versions.into_iter().collect()))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
     }
 
-    pub async fn description(
+    pub async fn indexed_description(
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Arc<Description>, RepositoryError> {
-        let key = (package.to_string(), version.clone());
+    ) -> Result<Option<Arc<Description>>, RepositoryError> {
+        let index = self.packages_index().await?;
+        Ok(index
+            .records()
+            .find(|record| {
+                record
+                    .package()
+                    .is_some_and(|value| value.as_str() == package)
+                    && record
+                        .parsed_version()
+                        .is_some_and(|value| value.as_ref().is_ok_and(|value| value == version))
+            })
+            .map(|entry| Arc::new(packages_record_to_description(&entry))))
+    }
 
+    pub async fn current_description(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<Arc<Description>>, RepositoryError> {
+        self.tarball_description(SourceLocation::Current, package, version)
+            .await
+    }
+
+    pub async fn archive_description(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<Arc<Description>>, RepositoryError> {
+        self.tarball_description(SourceLocation::Archive, package, version)
+            .await
+    }
+
+    async fn tarball_description(
+        &self,
+        location: SourceLocation,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<Arc<Description>>, RepositoryError> {
         self.descriptions
-            .try_get_with(key, async {
-                let index = self.packages_index().await?;
-                let description = if let Some(entry) = index.records().find(|record| {
-                    record
-                        .package()
-                        .is_some_and(|value| value.as_str() == package)
-                        && record
-                            .parsed_version()
-                            .is_some_and(|value| value.as_ref().is_ok_and(|value| value == version))
-                }) {
-                    packages_record_to_description(&entry)
-                } else {
-                    let version_string = version.to_string();
-                    let response =
-                        http::cran_archive_source_tarball(&self.url, package, &version_string)
-                            .await
-                            .map_err(|source| RepositoryError::Request {
-                                source: Arc::new(source),
-                            })?
-                            .error_for_status()
-                            .map_err(|source| RepositoryError::Response {
-                                source: Arc::new(source),
-                            })?;
-
-                    description_from_source_tarball_response(response, package).await?
-                };
-
-                tracing::trace!(
-                    package,
-                    version = %version,
-                    repository = %self.url,
-                    "fetched package description"
-                );
-
-                Ok::<Arc<Description>, RepositoryError>(Arc::new(description))
+            .try_get_with((location, package.to_string(), version.clone()), async {
+                let response = match location {
+                    SourceLocation::Current => self.current_source(package, version).await,
+                    SourceLocation::Archive => self.archive_source(package, version).await,
+                }
+                .map_err(|source| RepositoryError::Request {
+                    source: Arc::new(source),
+                })?;
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                ) {
+                    return Ok(None);
+                }
+                let response =
+                    response
+                        .error_for_status()
+                        .map_err(|source| RepositoryError::Response {
+                            source: Arc::new(source),
+                        })?;
+                let description =
+                    description_from_source_tarball_response(response, package).await?;
+                let (found_name, found_version) = description_identity(
+                    format!("source DESCRIPTION from {}", self.url),
+                    &description,
+                )?;
+                if found_name != package || &found_version != version {
+                    return Err(RepositoryError::InvalidData {
+                        resource: format!(
+                            "source archive for {package} {version} from {}",
+                            self.url
+                        ),
+                        details: format!("contains {found_name} {found_version}"),
+                    });
+                }
+                Ok::<_, RepositoryError>(Some(Arc::new(description)))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
