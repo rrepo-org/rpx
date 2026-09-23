@@ -41,6 +41,89 @@ fn configure(f: &Fixture, url: &str) {
 }
 
 #[test]
+fn cran_lock_considers_every_indexed_version_without_source_probes() {
+    for reverse in [false, true] {
+        for archive_status in [403, 200] {
+            for (requirement, expected, dependency) in [
+                ("selected", "2.0.0", "newdep"),
+                ("selected (>= 2.0.0)", "2.0.0", "newdep"),
+                ("selected (< 2.0.0)", "1.0.0", "olddep"),
+            ] {
+                let f = Fixture::new();
+                let mut server = mockito::Server::new();
+                let _api = server.mock("GET", "/packages").with_status(404).create();
+                let _root = server
+                    .mock("GET", "/src/contrib/Archive/")
+                    .with_status(archive_status)
+                    .create();
+                let records = [
+                    "Package: selected\nVersion: 1.0.0\nImports: olddep\n",
+                    "Package: selected\nVersion: 2.0.0\nImports: newdep\n",
+                ];
+                let records = if reverse {
+                    [records[1], records[0]]
+                } else {
+                    records
+                };
+                let index = server.mock("GET", "/src/contrib/PACKAGES")
+                    .with_body(format!("{}\n{}\nPackage: olddep\nVersion: 1.0.0\n\nPackage: newdep\nVersion: 1.0.0\n", records[0], records[1]))
+                    .expect(if requirement == "selected" { 2 } else { 1 }).create();
+                // An available but empty archive listing must not replace the
+                // multiple versions advertised by PACKAGES.
+                let listing = server
+                    .mock("GET", "/src/contrib/Archive/selected/")
+                    .with_body(
+                        "<h1>Index of archive</h1><pre><a href='../'>Parent Directory</a></pre>",
+                    )
+                    .expect(usize::from(archive_status == 200 && expected == "1.0.0"))
+                    .create();
+                let no_sources = server
+                    .mock("GET", mockito::Matcher::Regex("\\.tar\\.gz$".into()))
+                    .with_status(500)
+                    .expect(0)
+                    .create();
+                configure(&f, &server.url());
+                f.set_field("Imports", requirement);
+                f.success(&f.project, &["lock"]);
+                let mut locked = f.lock();
+                assert_eq!(locked["packages"]["selected"]["version"], expected);
+                assert_eq!(
+                    locked["packages"]["selected"]["dependencies"],
+                    serde_json::json!([dependency])
+                );
+                assert!(locked["packages"].get(dependency).is_some());
+                let unused = if dependency == "newdep" {
+                    "olddep"
+                } else {
+                    "newdep"
+                };
+                assert!(locked["packages"].get(unused).is_none());
+
+                if requirement == "selected" {
+                    // A previous indexed version is a preference, and its own
+                    // dependencies must be refreshed without archive requests.
+                    locked["packages"]["selected"]["version"] = "1.0.0".into();
+                    f.write_lock(&locked);
+                    f.success(&f.project, &["lock"]);
+                    let locked = f.lock();
+                    assert_eq!(locked["packages"]["selected"]["version"], "1.0.0");
+                    assert_eq!(
+                        locked["packages"]["selected"]["dependencies"],
+                        serde_json::json!(["olddep"])
+                    );
+                    assert!(locked["packages"].get("olddep").is_some());
+                    assert!(locked["packages"].get("newdep").is_none());
+                }
+                index.assert();
+                listing.assert();
+                no_sources.assert();
+                f.close();
+            }
+        }
+    }
+}
+
+#[test]
 fn lock_refreshes_actual_dependencies_after_a_hand_edited_version() {
     let f = Fixture::new();
     let mut server = mockito::Server::new();

@@ -458,19 +458,21 @@ async fn choose_repository_version(
     range: &Ranges<PackageVersion>,
     preferred: Option<&Version>,
 ) -> Result<Option<PackageVersion>, ProviderError> {
-    let latest = match repository {
+    let indexed: BTreeSet<Version> = match repository {
         PackageRepository::Rrepo(repo) => repo
             .packages()
             .await?
             .packages
             .iter()
             .find(|entry| entry.name == package)
-            .and_then(|entry| entry.latest_version.parse::<Version>().ok()),
+            .and_then(|entry| entry.latest_version.parse::<Version>().ok())
+            .into_iter()
+            .collect(),
         PackageRepository::Cran(repo) => repo
             .packages_index()
             .await?
             .records()
-            .find(|record| {
+            .filter(|record| {
                 record
                     .package()
                     .is_some_and(|name| name.as_str() == package)
@@ -480,22 +482,26 @@ async fn choose_repository_version(
                     .parsed_version()
                     .expect("validated Version")
                     .expect("validated Version")
-            }),
+            })
+            .collect(),
         PackageRepository::Git(repo) => {
             let (name, version) = repo.package().await?;
-            (name == package).then_some(version)
+            (name == package).then_some(version).into_iter().collect()
         }
         PackageRepository::Local(repo) => {
             let (name, version) = repo.package().await?;
-            (name == package).then_some(version)
+            (name == package).then_some(version).into_iter().collect()
         }
     };
-    let latest = latest.map(|v| PackageVersion::new(v, repository.clone()));
-    if let Some(latest) = &latest
-        && range.contains(latest)
-        && (preferred.is_none() || preferred == Some(latest.version()))
+    let indexed_candidate = preferred
+        .and_then(|version| indexed.get(version))
+        .or_else(|| indexed.last())
+        .map(|version| PackageVersion::new(version.clone(), repository.clone()));
+    if let Some(candidate) = indexed_candidate
+        && range.contains(&candidate)
+        && (preferred.is_none() || preferred == Some(candidate.version()))
     {
-        return Ok(Some(latest.clone()));
+        return Ok(Some(candidate));
     }
     let versions: BTreeSet<Version> = match repository {
         PackageRepository::Rrepo(repo) => match repo.versions(package).await {
@@ -530,13 +536,10 @@ async fn choose_repository_version(
         }
         PackageRepository::Git(_) | PackageRepository::Local(_) => BTreeSet::new(),
     };
-    Ok(latest
+    Ok(indexed
         .into_iter()
-        .chain(
-            versions
-                .into_iter()
-                .map(|v| PackageVersion::new(v, repository.clone())),
-        )
+        .chain(versions)
+        .map(|version| PackageVersion::new(version, repository.clone()))
         .filter(|v| range.contains(v))
         .max_by(|a, b| {
             preferred
