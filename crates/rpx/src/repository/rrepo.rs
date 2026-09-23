@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
+    url: Url,
     source: rrepo_sdk::Repository,
     packages: Cache<(), Arc<rrepo_sdk::PackagesResponse>>,
     versions: Cache<String, Arc<BTreeMap<Version, String>>>,
@@ -21,17 +22,18 @@ impl std::fmt::Display for RrepoRepository {
 }
 
 impl RrepoRepository {
-    pub fn new(url: Url) -> Self {
-        Self {
-            source: rrepo_sdk::Repository::new(url),
+    pub fn new(url: Url) -> Result<Self, rrepo_sdk::InvalidBaseUrl> {
+        Ok(Self {
+            source: rrepo_sdk::Repository::new(url.clone())?,
+            url,
             packages: Cache::new(1),
             versions: Cache::new(1024),
             descriptions: Cache::new(4096),
-        }
+        })
     }
 
     pub fn url(&self) -> &Url {
-        self.source.base_url()
+        &self.url
     }
 
     #[cfg(test)]
@@ -133,7 +135,6 @@ impl RrepoRepository {
         self.source
             .source(&http::client(), package, version.as_ref())
             .await
-            .map_err(request_error)
     }
 
     pub async fn binary(
@@ -143,40 +144,20 @@ impl RrepoRepository {
         target: &target_lexicon::Triple,
         r_version: &semver::Version,
     ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
-        use target_lexicon::OperatingSystem;
         let client = http::client();
-        let r_series = format!("{}.{}", r_version.major, r_version.minor);
-        match target.operating_system {
-            OperatingSystem::Windows => {
-                self.source
-                    .windows_binary(&client, package, version.as_ref(), &r_series)
-                    .await
-            }
-            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
-                self.source
-                    .macos_binary(
-                        &client,
-                        package,
-                        version.as_ref(),
-                        http::r_macos_binary_target(target)?,
-                        &r_series,
-                    )
-                    .await
-            }
-            _ => {
-                return Err(http::BinaryArtifactRequestError::UnsupportedTarget {
-                    target: target.clone(),
-                });
-            }
-        }
-        .map_err(request_error)
-        .map_err(Into::into)
-    }
-}
-
-fn request_error(error: rrepo_sdk::Error) -> reqwest_middleware::Error {
-    match error {
-        rrepo_sdk::Error::Request(error) => error,
-        error => reqwest_middleware::Error::middleware(error),
+        let r_version: Version = format!("{}.{}", r_version.major, r_version.minor)
+            .parse()
+            .expect("numeric R major/minor version");
+        self.source
+            .binary(&client, package, version, target, &r_version)
+            .await
+            .map_err(|error| match error {
+                rrepo_sdk::BinaryError::Request(error) => error.into(),
+                rrepo_sdk::BinaryError::UnsupportedTarget => {
+                    http::BinaryArtifactRequestError::UnsupportedTarget {
+                        target: target.clone(),
+                    }
+                }
+            })
     }
 }

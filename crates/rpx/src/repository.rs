@@ -3,7 +3,7 @@ mod git;
 mod local;
 mod rrepo;
 
-use crate::{description::DescriptionParseError, http};
+use crate::description::DescriptionParseError;
 use miette::Diagnostic;
 use r_metadata::Version;
 use reqwest::Url;
@@ -28,8 +28,11 @@ static BUILT_IN_REPOSITORY_URL: LazyLock<Url> = LazyLock::new(|| {
         .expect("built-in repository URL should be valid")
 });
 
-static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> =
-    LazyLock::new(|| Arc::new(RrepoRepository::new(built_in_repository_url().clone())));
+static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
+    Arc::new(
+        RrepoRepository::new(built_in_repository_url().clone()).expect("valid built-in repository"),
+    )
+});
 
 pub fn built_in_repository_url() -> &'static Url {
     &BUILT_IN_REPOSITORY_URL
@@ -55,10 +58,13 @@ pub enum RepositoryError {
     CranPackages(Box<CranPackagesParseError>),
 
     #[error(transparent)]
-    Cran(Arc<cran_sdk::Error>),
+    Cran(Arc<cran_sdk::ListingError>),
 
     #[error(transparent)]
-    Rrepo(Arc<rrepo_sdk::Error>),
+    InvalidCranUrl(#[from] cran_sdk::InvalidBaseUrl),
+
+    #[error(transparent)]
+    InvalidRrepoUrl(#[from] rrepo_sdk::InvalidBaseUrl),
 
     #[error("request failed: {source}")]
     Request {
@@ -149,14 +155,14 @@ impl PackageRepository {
         let value = url.to_string();
         let rrepo_url = url.clone();
         let rrepo_probe = async {
-            let repository = Arc::new(RrepoRepository::new(rrepo_url));
+            let repository = Arc::new(RrepoRepository::new(rrepo_url)?);
             repository.packages().await?;
             Ok::<_, RepositoryError>(Self::Rrepo(repository))
         };
 
         let cran_url = url;
         let cran_probe = async {
-            let repository = CranRepository::new(cran_url.clone(), ArchiveSupport::Unavailable);
+            let repository = CranRepository::new(cran_url.clone(), ArchiveSupport::Unavailable)?;
             let packages_probe = repository.packages_index();
             let archive_probe = async {
                 repository
@@ -227,7 +233,7 @@ impl PackageRepository {
     ) -> Result<Self, RepositoryError> {
         match repository {
             crate::lockfile::Repository::Rrepo { url } => {
-                Ok(Self::Rrepo(Arc::new(RrepoRepository::new(url.clone()))))
+                Ok(Self::Rrepo(Arc::new(RrepoRepository::new(url.clone())?)))
             }
             crate::lockfile::Repository::CranLike {
                 url,
@@ -240,7 +246,7 @@ impl PackageRepository {
                 Ok(Self::Cran(Arc::new(CranRepository::new(
                     url.clone(),
                     archive_support,
-                ))))
+                )?)))
             }
             crate::lockfile::Repository::Git {
                 url,
@@ -323,43 +329,62 @@ impl PackageRepository {
     }
 }
 
-impl From<cran_sdk::Error> for RepositoryError {
-    fn from(error: cran_sdk::Error) -> Self {
+impl From<cran_sdk::FetchError> for RepositoryError {
+    fn from(error: cran_sdk::FetchError) -> Self {
         match error {
-            cran_sdk::Error::Request(source) => Self::Request {
+            cran_sdk::FetchError::Request(source) => Self::Request {
                 source: Arc::new(source),
             },
-            cran_sdk::Error::Response(source) => Self::Response {
+            cran_sdk::FetchError::Response(source) => Self::Response {
                 source: Arc::new(source),
             },
-            cran_sdk::Error::Archive(source) => Self::Archive {
+        }
+    }
+}
+
+impl From<cran_sdk::DescriptionError> for RepositoryError {
+    fn from(error: cran_sdk::DescriptionError) -> Self {
+        match error {
+            cran_sdk::DescriptionError::Fetch(error) => error.into(),
+            cran_sdk::DescriptionError::Archive(source) => Self::Archive {
                 source: Arc::new(source),
             },
-            cran_sdk::Error::DescriptionNotFound { package } => {
+            cran_sdk::DescriptionError::DescriptionNotFound { package } => {
                 Self::DescriptionNotFound { package }
             }
-            cran_sdk::Error::Packages(error) => {
-                Self::CranPackages(Box::new(CranPackagesParseError::new(
-                    http::display_safe_url(&error.url).to_string(),
-                    error.text,
-                    error.findings,
-                )))
-            }
+        }
+    }
+}
+
+impl From<cran_sdk::PackagesError> for RepositoryError {
+    fn from(error: cran_sdk::PackagesError) -> Self {
+        match error {
+            cran_sdk::PackagesError::Fetch(error) => error.into(),
+            cran_sdk::PackagesError::Invalid(error) => Self::CranPackages(Box::new(
+                CranPackagesParseError::new("CRAN PACKAGES", error.text, error.findings),
+            )),
+        }
+    }
+}
+
+impl From<cran_sdk::ListingError> for RepositoryError {
+    fn from(error: cran_sdk::ListingError) -> Self {
+        match error {
+            cran_sdk::ListingError::Fetch(error) => error.into(),
             error => Self::Cran(Arc::new(error)),
         }
     }
 }
 
-impl From<rrepo_sdk::Error> for RepositoryError {
-    fn from(error: rrepo_sdk::Error) -> Self {
+impl From<rrepo_sdk::FetchError> for RepositoryError {
+    fn from(error: rrepo_sdk::FetchError) -> Self {
         match error {
-            rrepo_sdk::Error::Request(source) => Self::Request {
+            rrepo_sdk::FetchError::Request(source) => Self::Request {
                 source: Arc::new(source),
             },
-            rrepo_sdk::Error::Response(source) => Self::Response {
+            rrepo_sdk::FetchError::Response(source) => Self::Response {
                 source: Arc::new(source),
             },
-            error => Self::Rrepo(Arc::new(error)),
         }
     }
 }

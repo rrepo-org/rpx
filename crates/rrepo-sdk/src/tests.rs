@@ -32,7 +32,8 @@ async fn native_endpoints_keep_prefixes_and_use_injected_middleware() {
             request.header("x-initialized", "yes")
         })
         .build();
-    let repo = Repository::new(format!("{}/upstream/cran/", server.url()).parse().unwrap());
+    let repo =
+        Repository::new(format!("{}/upstream/cran/", server.url()).parse().unwrap()).unwrap();
     let packages = server.mock("GET", "/upstream/cran/packages").match_header("x-middleware", "yes")
         .match_header("x-initialized", "yes").with_status(200)
         .with_body(r#"{"repositorySlug":"cran","packages":[{"name":"example","latestVersion":"1.0","latestUploadedAt":"today","versionCount":2}]}"#)
@@ -90,21 +91,33 @@ async fn native_endpoints_keep_prefixes_and_use_injected_middleware() {
     assert_eq!(response.headers()["x-artifact"], "source");
     assert_eq!(response.text().await.unwrap(), "source bytes");
     assert_eq!(
-        repo.windows_binary(&client, "example", "1.0", "4.5")
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"x86_64-pc-windows-msvc".parse().unwrap(),
+            &"4.5".parse().unwrap()
+        )
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap(),
         "zip bytes"
     );
     assert_eq!(
-        repo.macos_binary(&client, "example", "1.0", "big-sur-arm64", "4.5")
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"aarch64-apple-darwin".parse().unwrap(),
+            &"4.5".parse().unwrap()
+        )
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap(),
         "tgz bytes"
     );
     packages.assert_async().await;
@@ -119,7 +132,7 @@ async fn native_endpoints_keep_prefixes_and_use_injected_middleware() {
 #[tokio::test]
 async fn clients_can_be_changed_without_sharing_hidden_sdk_cache_state() {
     let mut server = mockito::Server::new_async().await;
-    let repo = Repository::new(server.url().parse().unwrap());
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
     let first = server
         .mock("GET", "/packages")
         .match_header("x-client", "first")
@@ -163,14 +176,16 @@ async fn clients_can_be_changed_without_sharing_hidden_sdk_cache_state() {
 async fn status_errors_and_raw_artifact_responses_remain_distinct() {
     let mut server = mockito::Server::new_async().await;
     let client: ClientWithMiddleware = reqwest::Client::new().into();
-    let repo = Repository::new(server.url().parse().unwrap());
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
     let _metadata = server
         .mock("GET", "/packages")
         .with_status(403)
         .create_async()
         .await;
     let error = repo.packages(&client).await.unwrap_err();
-    assert_eq!(error.status(), Some(reqwest::StatusCode::FORBIDDEN));
+    assert!(
+        matches!(error, FetchError::Response(error) if error.status() == Some(reqwest::StatusCode::FORBIDDEN))
+    );
     let _artifact = server
         .mock("GET", "/packages/example/versions/1.0/source")
         .with_status(404)
@@ -181,10 +196,7 @@ async fn status_errors_and_raw_artifact_responses_remain_distinct() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "missing");
     let invalid = Repository::new("mailto:packages@example.test".parse().unwrap());
-    assert!(matches!(
-        invalid.packages(&client).await,
-        Err(Error::InvalidBaseUrl)
-    ));
+    assert!(matches!(invalid, Err(InvalidBaseUrl)));
 }
 
 #[tokio::test]
@@ -195,7 +207,7 @@ async fn endpoint_arguments_are_encoded_as_path_segments() {
         .with_body("encoded")
         .create_async()
         .await;
-    let repo = Repository::new(format!("{}/prefix", server.url()).parse().unwrap());
+    let repo = Repository::new(format!("{}/prefix", server.url()).parse().unwrap()).unwrap();
     let client = reqwest::Client::new().into();
     assert_eq!(
         repo.source(&client, "a/b", "1/2")
@@ -207,4 +219,55 @@ async fn endpoint_arguments_are_encoded_as_path_segments() {
         "encoded"
     );
     mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn binary_routing_uses_runtime_version_and_rejects_linux() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = Repository::new(format!("{}/prefix/", server.url()).parse().unwrap()).unwrap();
+    assert_eq!(repo.base_url().path(), "/prefix");
+    let client = reqwest::Client::new().into();
+    let version: Version = "01.0-2".parse().unwrap();
+    for (triple, r, suffix) in [
+        ("aarch64-apple-darwin", "4.5.2", "macos/big-sur-arm64/4.5"),
+        ("aarch64-apple-darwin", "4.6.0", "macos/sonoma-arm64/4.6"),
+        ("x86_64-apple-darwin", "4.6.1", "macos/big-sur-x86_64/4.6"),
+        ("x86_64-pc-windows-msvc", "4.6.1", "windows/4.6"),
+    ] {
+        let response = server
+            .mock(
+                "GET",
+                format!("/prefix/packages/example/versions/01.0-2/binaries/{suffix}").as_str(),
+            )
+            .with_status(404)
+            .with_body("absent")
+            .create_async()
+            .await;
+        let artifact = repo
+            .binary(
+                &client,
+                "example",
+                &version,
+                &triple.parse().unwrap(),
+                &r.parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(artifact.text().await.unwrap(), "absent");
+        response.assert_async().await;
+    }
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-pc-windows-msvc"] {
+        assert!(matches!(
+            repo.binary(
+                &client,
+                "example",
+                &version,
+                &triple.parse().unwrap(),
+                &"4.6".parse().unwrap()
+            )
+            .await,
+            Err(BinaryError::UnsupportedTarget)
+        ));
+    }
 }

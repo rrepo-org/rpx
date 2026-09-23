@@ -5,10 +5,24 @@ use tracing::{Instrument, instrument::WithSubscriber};
 use tracing_subscriber::{Layer, layer::SubscriberExt, registry::LookupSpan};
 
 fn parse(input: &str) -> Result<Packages, Box<PackagesParseError>> {
-    parse_packages(
-        "https://example.test/src/contrib/PACKAGES".parse().unwrap(),
-        input.into(),
-    )
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut server = mockito::Server::new_async().await;
+        let response = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_body(input)
+            .create_async()
+            .await;
+        let result = Repository::new(server.url().parse().unwrap())
+            .unwrap()
+            .packages(&reqwest::Client::new().into())
+            .await;
+        response.assert_async().await;
+        match result {
+            Ok(packages) => Ok(packages),
+            Err(PackagesError::Invalid(error)) => Err(error),
+            Err(error) => panic!("unexpected transport error: {error}"),
+        }
+    })
 }
 
 #[test]
@@ -138,14 +152,104 @@ fn rejects_structurally_invalid_packages_before_reading_records() {
     );
 }
 
-#[test]
-fn archive_listing_handles_links_escaped_text_and_duplicate_versions() {
-    let listing: ArchiveListing = "<a href=\"example_1.0.tar.gz\">example_1.0.tar.gz</a>\nhttps://example.test/example_2.0.tar.gz\n".parse().unwrap();
+#[tokio::test]
+async fn archive_listing_uses_only_requested_package_files() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
+    let response = server
+        .mock("GET", "/src/contrib/Archive/example/")
+        .with_body(
+            r#"<h1>Index of archive</h1><pre>
+          <a href="example_1%2E0.tar.gz">truncated name...</a>
+          <a href="example_1.0.0.tar.gz">equivalent version</a>
+          <a href="example_2&#46;0.tar.gz">second</a>
+          <a href="other_invalid.tar.gz">other package</a>
+          <a href="example_3.0.tar.gz/">directory</a>
+          <a href="../example_4.0.tar.gz">outside</a>
+          <script>example_invalid.tar.gz</script>example_invalid.tar.gz
+        </pre>"#,
+        )
+        .create_async()
+        .await;
     assert_eq!(
-        listing.versions,
+        repo.archive_listing(&reqwest::Client::new().into(), "example")
+            .await
+            .unwrap(),
         vec!["1.0".parse().unwrap(), "2.0".parse().unwrap()]
     );
-    assert!("example_invalid.tar.gz".parse::<ArchiveListing>().is_err());
+    response.assert_async().await;
+}
+
+#[tokio::test]
+async fn archive_listings_handle_redirects_json_and_structured_failures() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
+    let client = reqwest::Client::new().into();
+    let redirect = server
+        .mock("GET", "/src/contrib/Archive/example/")
+        .with_status(302)
+        .with_header("location", "/mirror/example/")
+        .create_async()
+        .await;
+    let listing = server.mock("GET", "/mirror/example/")
+        .with_body("<h1>Index of example</h1><pre><a href='/mirror/example/example_1.0.tar.gz'>example</a></pre>").create_async().await;
+    assert_eq!(
+        repo.archive_listing(&client, "example").await.unwrap(),
+        vec!["1.0".parse().unwrap()]
+    );
+    redirect.assert_async().await;
+    listing.assert_async().await;
+    for (package, content_type, body) in [
+        (
+            "json",
+            "application/json; charset=utf-8",
+            r#"[{"name":"json_2.0.tar.gz","type":"file"},{"name":"other_invalid.tar.gz","type":"file"}]"#,
+        ),
+        (
+            "invalid",
+            "text/html",
+            "<h1>Index of archive</h1><pre><a href='invalid_nope.tar.gz'>invalid</a></pre>",
+        ),
+        ("shell", "text/html", "<div id='app'></div>"),
+        (
+            "partial",
+            "text/html",
+            "<p class='warning'>Listing truncated</p><table id='list'></table>",
+        ),
+        (
+            "empty",
+            "text/html",
+            "<h1>Index of empty</h1><pre><a href='../'>parent</a></pre>",
+        ),
+    ] {
+        let response = server
+            .mock("GET", format!("/src/contrib/Archive/{package}/").as_str())
+            .with_header("content-type", content_type)
+            .with_body(body)
+            .create_async()
+            .await;
+        let result = repo.archive_listing(&client, package).await;
+        match package {
+            "json" => assert_eq!(result.unwrap(), vec!["2.0".parse().unwrap()]),
+            "invalid" => assert!(matches!(
+                result,
+                Err(ListingError::Version {
+                    source: r_metadata::VersionParseError::InvalidComponent { .. },
+                    ..
+                })
+            )),
+            "shell" => assert!(matches!(
+                result,
+                Err(ListingError::Directory(
+                    directory_listing::Error::Unrecognized
+                ))
+            )),
+            "partial" => assert!(matches!(result, Err(ListingError::Truncated))),
+            "empty" => assert!(result.unwrap().is_empty()),
+            _ => unreachable!(),
+        }
+        response.assert_async().await;
+    }
 }
 
 fn source_body() -> Vec<u8> {
@@ -193,7 +297,7 @@ async fn all_endpoints_preserve_prefixes_and_native_statuses() {
             request.header("x-initialized", "yes")
         })
         .build();
-    let repo = Repository::new(format!("{}/repo/", server.url()).parse().unwrap());
+    let repo = Repository::new(format!("{}/repo/", server.url()).parse().unwrap()).unwrap();
     let packages = server
         .mock("GET", "/repo/src/contrib/PACKAGES")
         .match_header("x-middleware", "yes")
@@ -208,7 +312,7 @@ async fn all_endpoints_preserve_prefixes_and_native_statuses() {
         .await;
     let listing = server
         .mock("GET", "/repo/src/contrib/Archive/example/")
-        .with_body("example_1.0.tar.gz")
+        .with_body("<h1>Index of archive</h1><pre><a href='example_1.0.tar.gz'>example</a></pre>")
         .create_async()
         .await;
     let latest = server
@@ -250,10 +354,7 @@ async fn all_endpoints_preserve_prefixes_and_native_statuses() {
         reqwest::StatusCode::FORBIDDEN
     );
     assert_eq!(
-        repo.archive_listing(&client, "example")
-            .await
-            .unwrap()
-            .versions,
+        repo.archive_listing(&client, "example").await.unwrap(),
         vec!["1.0".parse().unwrap()]
     );
     assert_eq!(
@@ -304,21 +405,33 @@ async fn all_endpoints_preserve_prefixes_and_native_statuses() {
         "1.0"
     );
     assert_eq!(
-        repo.windows_binary(&client, "example", "1.0", "4.5")
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"x86_64-pc-windows-msvc".parse().unwrap(),
+            &"4.5".parse().unwrap()
+        )
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap(),
         "zip"
     );
     assert_eq!(
-        repo.macos_binary(&client, "example", "1.0", "big-sur-arm64", "4.5")
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"aarch64-apple-darwin".parse().unwrap(),
+            &"4.5".parse().unwrap()
+        )
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap(),
         "tgz"
     );
     packages.assert_async().await;
@@ -329,6 +442,176 @@ async fn all_endpoints_preserve_prefixes_and_native_statuses() {
     archive.assert_async().await;
     windows.assert_async().await;
     macos.assert_async().await;
+}
+
+#[tokio::test]
+async fn binary_routes_follow_r_version_and_preserve_version_spelling() {
+    let mut server = mockito::Server::new_async().await;
+    let client = reqwest::Client::new().into();
+    let repo = Repository::new(format!("{}/prefix/", server.url()).parse().unwrap()).unwrap();
+    for (triple, r, path) in [
+        (
+            "aarch64-apple-darwin",
+            "4.5.2",
+            "bin/macosx/big-sur-arm64/contrib/4.5/example_01.0-2.tgz",
+        ),
+        (
+            "aarch64-apple-darwin",
+            "4.6.0",
+            "bin/macosx/sonoma-arm64/contrib/4.6/example_01.0-2.tgz",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "4.6.0",
+            "bin/macosx/big-sur-x86_64/contrib/4.6/example_01.0-2.tgz",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "4.2.3",
+            "bin/macosx/contrib/4.2/example_01.0-2.tgz",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "4.3.0",
+            "bin/macosx/big-sur-x86_64/contrib/4.3/example_01.0-2.tgz",
+        ),
+        (
+            "x86_64-apple-darwin",
+            "3.6.3",
+            "bin/macosx/el-capitan/contrib/3.6/example_01.0-2.tgz",
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "4.5.1",
+            "bin/windows/contrib/4.5/example_01.0-2.zip",
+        ),
+    ] {
+        let response = server
+            .mock("GET", format!("/prefix/{path}").as_str())
+            .with_status(410)
+            .with_body("gone")
+            .create_async()
+            .await;
+        let version: Version = "01.0-2".parse().unwrap();
+        let artifact = repo
+            .binary(
+                &client,
+                "example",
+                &version,
+                &triple.parse().unwrap(),
+                &r.parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact.status(), reqwest::StatusCode::GONE);
+        assert_eq!(artifact.text().await.unwrap(), "gone");
+        response.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn binary_index_uses_triple_and_rejects_unsupported_targets() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
+    let client = reqwest::Client::new().into();
+    let target = "aarch64-apple-darwin".parse().unwrap();
+    let r = "4.5.1".parse().unwrap();
+    let index = server
+        .mock("GET", "/bin/macosx/big-sur-arm64/contrib/4.5/PACKAGES")
+        .with_body("Package: example\nVersion: 1.0\n")
+        .create_async()
+        .await;
+    assert_eq!(
+        repo.binary_packages(&client, &target, &r)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(matches!(
+        repo.binary_packages(&client, &"x86_64-unknown-linux-gnu".parse().unwrap(), &r)
+            .await,
+        Err(BinaryPackagesError::Routing(RoutingError))
+    ));
+    assert!(matches!(
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"x86_64-unknown-linux-gnu".parse().unwrap(),
+            &r
+        )
+        .await,
+        Err(BinaryError::Routing(RoutingError))
+    ));
+    assert!(matches!(
+        repo.binary(
+            &client,
+            "example",
+            "1.0",
+            &"aarch64-pc-windows-msvc".parse().unwrap(),
+            &r
+        )
+        .await,
+        Err(BinaryError::Routing(RoutingError))
+    ));
+    index.assert_async().await;
+}
+
+#[tokio::test]
+async fn normalizes_prefix_once_and_encodes_dynamic_segments() {
+    let mut server = mockito::Server::new_async().await;
+    for suffix in ["", "/", "/prefix", "/prefix/"] {
+        let repo = Repository::new(format!("{}{suffix}", server.url()).parse().unwrap()).unwrap();
+        assert_eq!(
+            repo.base_url().path(),
+            if suffix.starts_with("/prefix") {
+                "/prefix"
+            } else {
+                "/"
+            }
+        );
+        let path = format!(
+            "{}/src/contrib/odd%2Fname_1.0.tar.gz",
+            suffix.trim_end_matches('/')
+        );
+        let response = server
+            .mock("GET", path.as_str())
+            .with_body("archive")
+            .create_async()
+            .await;
+        repo.current_source(&reqwest::Client::new().into(), "odd/name", "1.0")
+            .await
+            .unwrap();
+        response.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn source_description_distinguishes_missing_and_corrupt_archives() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
+    let client = reqwest::Client::new().into();
+    let missing = server
+        .mock("GET", "/src/contrib/other_1.0.tar.gz")
+        .with_body(source_body())
+        .create_async()
+        .await;
+    assert!(matches!(
+        repo.current_description(&client, "other", "1.0").await,
+        Err(DescriptionError::DescriptionNotFound { .. })
+    ));
+    let corrupt = server
+        .mock("GET", "/src/contrib/bad_1.0.tar.gz")
+        .with_body("not gzip")
+        .create_async()
+        .await;
+    assert!(matches!(
+        repo.current_description(&client, "bad", "1.0").await,
+        Err(DescriptionError::Archive(_))
+    ));
+    missing.assert_async().await;
+    corrupt.assert_async().await;
 }
 
 type SpanRecords = Vec<(String, Option<String>)>;
@@ -360,7 +643,7 @@ async fn sdk_and_injected_http_spans_inherit_the_callers_subscriber() {
     let client = ClientBuilder::new(reqwest::Client::new())
         .with(Mark)
         .build();
-    let repo = Repository::new(server.url().parse().unwrap());
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
     let spans = Spans(Arc::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::registry().with(spans.clone());
     async {
@@ -383,32 +666,24 @@ async fn sdk_and_injected_http_spans_inherit_the_callers_subscriber() {
 async fn typed_metadata_errors_keep_status_and_parser_findings() {
     let mut server = mockito::Server::new_async().await;
     let client = reqwest::Client::new().into();
-    let repo = Repository::new(server.url().parse().unwrap());
+    let repo = Repository::new(server.url().parse().unwrap()).unwrap();
     let _listing = server
         .mock("GET", "/src/contrib/Archive/example/")
         .with_status(403)
         .create_async()
         .await;
-    assert_eq!(
-        repo.archive_listing(&client, "example")
-            .await
-            .unwrap_err()
-            .status(),
-        Some(reqwest::StatusCode::FORBIDDEN)
-    );
+    assert!(matches!(repo.archive_listing(&client, "example").await,
+        Err(ListingError::Fetch(FetchError::Response(error))) if error.status() == Some(reqwest::StatusCode::FORBIDDEN)));
     let _index = server
         .mock("GET", "/src/contrib/PACKAGES")
         .with_body("Package: example\nVersion: invalid\n")
         .create_async()
         .await;
-    let Error::Packages(error) = repo.packages(&client).await.unwrap_err() else {
+    let PackagesError::Invalid(error) = repo.packages(&client).await.unwrap_err() else {
         panic!("expected index findings")
     };
     assert!(!error.findings.is_empty());
     assert!(error.text.contains("Version: invalid"));
     let invalid = Repository::new("mailto:packages@example.test".parse().unwrap());
-    assert!(matches!(
-        invalid.packages(&client).await,
-        Err(Error::InvalidBaseUrl)
-    ));
+    assert!(matches!(invalid, Err(InvalidBaseUrl)));
 }

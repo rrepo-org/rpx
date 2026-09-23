@@ -11,9 +11,9 @@ struct Registry {
 impl Registry {
     async fn new(packages: &[(&str, &str)]) -> Self {
         let mut server = mockito::Server::new_async().await;
-        let repository = PackageRepository::Rrepo(Arc::new(RrepoRepository::new(
-            server.url().parse().unwrap(),
-        )));
+        let repository = PackageRepository::Rrepo(Arc::new(
+            RrepoRepository::new(server.url().parse().unwrap()).unwrap(),
+        ));
         let index = serde_json::json!({"repositorySlug":"fixture", "packages": packages.iter().map(|(name, version)|
             serde_json::json!({"name":name,"latestVersion":version})).collect::<Vec<_>>()});
         let mock = server
@@ -511,10 +511,9 @@ async fn cran_registry(
         .expect(1)
         .create_async()
         .await;
-    let repo = PackageRepository::Cran(Arc::new(CranRepository::new(
-        server.url().parse().unwrap(),
-        listing,
-    )));
+    let repo = PackageRepository::Cran(Arc::new(
+        CranRepository::new(server.url().parse().unwrap(), listing).unwrap(),
+    ));
     (server, repo, packages)
 }
 
@@ -699,7 +698,9 @@ async fn indexed_archive_candidates_do_not_require_current_membership() {
     let listing = server
         .mock("GET", "/src/contrib/Archive/example/")
         .with_status(200)
-        .with_body("<a href=\"example_1.0.0.tar.gz\">example</a>")
+        .with_body(
+            "<h1>Index of archive</h1><pre><a href=\"example_1.0.0.tar.gz\">example</a></pre>",
+        )
         .expect(1)
         .create_async()
         .await;

@@ -7,7 +7,7 @@ use rrepo_sdk::{ClientWithMiddleware, Repository};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let http: ClientWithMiddleware = reqwest::Client::builder().build()?.into();
-let repository = Repository::new("https://rrepo.dev/upstream/cran".parse()?);
+let repository = Repository::new("https://rrepo.dev/upstream/cran".parse()?)?;
 
 let index = repository.packages(&http).await?;
 let versions = repository.versions(&http, "digest").await?;
@@ -34,13 +34,37 @@ The application remains responsible for scoping its own caches appropriately.
 - `versions`: native version response, retaining source URLs.
 - `description`: parsed version-specific DESCRIPTION.
 - `source`: unconsumed source artifact response.
-- `windows_binary`, `macos_binary`: unconsumed artifact responses for explicit
-  repository platform and R major.minor parameters.
+- `binary`: an unconsumed Windows/macOS artifact response selected by a
+  `&target_lexicon::Triple` and `&r_metadata::Version` runtime version.
 
 Metadata methods check HTTP status. Artifact methods preserve status, headers,
 and streaming bodies so the application can choose its download/fallback policy.
-Transport, HTTP/body, and base-URL errors remain structured; `Error::status()`
-exposes HTTP status failures.
+Construction validates HTTP URLs and normalizes their trailing slash once.
+Metadata methods return `FetchError` with transport or HTTP/body/JSON causes;
+raw source requests return middleware errors, and binary requests additionally
+expose unsupported-target failures. Callers match variants and inspect the native
+reqwest error for status information; there are no status-forwarding methods.
+
+Package versions accept `impl AsRef<str>`: strings and metadata `Version` retain
+their original spelling. Binary requests derive the R major/minor series inside
+the SDK. Windows x86_64 uses `binaries/windows/<series>`; macOS uses
+`binaries/macos/<platform>/<series>`. ARM64 selects Big Sur for R 4.1–4.5 and Sonoma
+from R 4.6; Intel selects Big Sur from R 4.3. Earlier macOS builds and Linux are
+unsupported. The supplied triple describes the R installation, not the SDK host.
+
+```rust,no_run
+use rrepo_sdk::{Repository, Version};
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let repository = Repository::new("https://rrepo.dev/upstream/cran".parse()?)?;
+let client = reqwest::Client::new().into();
+let triple = "aarch64-apple-darwin".parse().expect("valid target triple");
+let r: Version = "4.6.1".parse()?;
+let version: Version = "0.6.39".parse()?;
+let response = repository.binary(&client, "digest", &version, &triple, &r).await?;
+# let _ = response;
+# Ok(())
+# }
+```
 
 SDK operation spans use `tracing` and the caller's subscriber. HTTP request
 instrumentation belongs to injected middleware; rendering/progress belongs to

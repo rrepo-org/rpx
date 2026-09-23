@@ -11,6 +11,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct CranRepository {
+    url: Url,
     source: cran_sdk::Repository,
     archives: ArchiveSupport,
     packages: Cache<(), Arc<Packages>>,
@@ -31,18 +32,19 @@ impl std::fmt::Display for CranRepository {
 }
 
 impl CranRepository {
-    pub fn new(url: Url, archives: ArchiveSupport) -> Self {
-        Self {
-            source: cran_sdk::Repository::new(url),
+    pub fn new(url: Url, archives: ArchiveSupport) -> Result<Self, cran_sdk::InvalidBaseUrl> {
+        Ok(Self {
+            source: cran_sdk::Repository::new(url.clone())?,
+            url,
             archives,
             packages: Cache::new(1),
             archive_versions: Cache::new(1024),
             descriptions: Cache::new(4096),
-        }
+        })
     }
 
     pub fn url(&self) -> &Url {
-        self.source.base_url()
+        &self.url
     }
 
     pub fn archive_support(&self) -> ArchiveSupport {
@@ -74,17 +76,19 @@ impl CranRepository {
         self.archive_versions
             .try_get_with(package.to_string(), async {
                 match self.source.archive_listing(&http::client(), package).await {
-                    Ok(listing) => Ok(Some(listing.versions.into_iter().collect())),
+                    Ok(versions) => Ok(Some(versions.into_iter().collect())),
                     // Preserve the existing listing-support policy in rpx.
-                    Err(error)
-                        if matches!(
-                            error.status(),
-                            Some(
-                                reqwest::StatusCode::FORBIDDEN
-                                    | reqwest::StatusCode::NOT_FOUND
-                                    | reqwest::StatusCode::GONE
-                            )
-                        ) =>
+                    Err(cran_sdk::ListingError::Fetch(
+                        cran_sdk::FetchError::Response(error)
+                        | cran_sdk::FetchError::Request(reqwest_middleware::Error::Reqwest(error)),
+                    )) if matches!(
+                        error.status(),
+                        Some(
+                            reqwest::StatusCode::FORBIDDEN
+                                | reqwest::StatusCode::NOT_FOUND
+                                | reqwest::StatusCode::GONE
+                        )
+                    ) =>
                     {
                         Ok(None)
                     }
@@ -155,11 +159,13 @@ impl CranRepository {
                 };
                 let description = match result {
                     Ok(description) => description,
-                    Err(error)
-                        if matches!(
-                            error.status(),
-                            Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
-                        ) =>
+                    Err(cran_sdk::DescriptionError::Fetch(
+                        cran_sdk::FetchError::Response(error)
+                        | cran_sdk::FetchError::Request(reqwest_middleware::Error::Reqwest(error)),
+                    )) if matches!(
+                        error.status(),
+                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+                    ) =>
                     {
                         return Ok(None);
                     }
@@ -192,7 +198,6 @@ impl CranRepository {
         self.source
             .current_source(&http::client(), package, version.as_ref())
             .await
-            .map_err(request_error)
     }
 
     pub async fn archive_source(
@@ -203,7 +208,6 @@ impl CranRepository {
         self.source
             .archive_source(&http::client(), package, version.as_ref())
             .await
-            .map_err(request_error)
     }
 
     pub async fn binary(
@@ -213,50 +217,27 @@ impl CranRepository {
         target: &target_lexicon::Triple,
         r_version: &semver::Version,
     ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
-        use target_lexicon::OperatingSystem;
         let client = http::client();
-        let r_series = format!("{}.{}", r_version.major, r_version.minor);
-        match target.operating_system {
-            OperatingSystem::Windows => {
-                self.source
-                    .windows_binary(&client, package, version.as_ref(), &r_series)
-                    .await
-            }
-            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
-                self.source
-                    .macos_binary(
-                        &client,
-                        package,
-                        version.as_ref(),
-                        http::r_macos_binary_target(target)?,
-                        &r_series,
-                    )
-                    .await
-            }
-            _ => {
-                return Err(http::BinaryArtifactRequestError::UnsupportedTarget {
-                    target: target.clone(),
-                });
-            }
-        }
-        .map_err(request_error)
-        .map_err(Into::into)
+        let r_version: Version = format!("{}.{}", r_version.major, r_version.minor)
+            .parse()
+            .expect("numeric R major/minor version");
+        self.source
+            .binary(&client, package, version, target, &r_version)
+            .await
+            .map_err(|error| match error {
+                cran_sdk::BinaryError::Request(error) => error.into(),
+                cran_sdk::BinaryError::Routing(_) => {
+                    http::BinaryArtifactRequestError::UnsupportedTarget {
+                        target: target.clone(),
+                    }
+                }
+            })
     }
 
     pub(crate) async fn archive_root(
         &self,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
-        self.source
-            .archive_root(&http::client())
-            .await
-            .map_err(request_error)
-    }
-}
-
-fn request_error(error: cran_sdk::Error) -> reqwest_middleware::Error {
-    match error {
-        cran_sdk::Error::Request(error) => error,
-        error => reqwest_middleware::Error::middleware(error),
+        self.source.archive_root(&http::client()).await
     }
 }
 

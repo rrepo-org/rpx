@@ -7,17 +7,22 @@ description = "Async CRAN repository protocol SDK with caller-supplied HTTP clie
 repository = "https://github.com/rrepo-org/rpx"
 
 [dependencies]
+directory-listing = { path = "../directory-listing" }
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 reqwest-middleware = "0.5"
 r-description = { package = "r-description-parser", version = "=0.2.0" }
 r-packages = { package = "r-packages-parser", version = "=0.2.0" }
 r-metadata = "=0.2.0"
-flate2 = "1.1.5"
-tar = "0.4.44"
+archive-stream = { path = "../archive-stream" }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+target-lexicon = "0.13.3"
 thiserror = "2.0.17"
 tracing = "0.1.41"
 
 [dev-dependencies]
+flate2 = "1.1.5"
+tar = "0.4.44"
 async-trait = "0.1"
 http = "1"
 mockito = "1.7.0"

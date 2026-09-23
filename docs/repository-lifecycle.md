@@ -14,15 +14,30 @@ their complete chain and request initializers. SDK descriptors own only their UR
 
 The dependency direction is `rpx -> SDKs -> reqwest/middleware + metadata parsers`.
 Neither SDK imports rpx or the other SDK. rpx's HTTP module configures the shared
-client, authentication, HTTP tracing/progress, and URL display. The existing binary
-target mapping remains shared there. SDK binary endpoints accept explicit native
-platform/R-series values supplied by that mapping.
+client, authentication, HTTP tracing/progress, and URL display. Both SDKs own
+Windows/macOS binary routing from a triple and metadata R version, including the
+R 4.6 ARM64 transition to Sonoma. Linux binary routing is deferred.
+The existing HTTP-module mapping is still used by R installation.
+Both SDKs validate/normalize base URLs at construction; the rpx adapters retain
+the original configured URLs for source identity and cache-key compatibility.
 
 The rpx repository adapters retain Moka caches, source identity, and all existing
-archive-support and fallback policy. Generic SDK errors preserve HTTP status and
-parse findings; the adapters provide rpx-specific positioned diagnostics.
+archive-support and fallback policy. SDK error variants retain native causes and
+parse findings; rpx matches native HTTP errors for its availability policy and
+provides positioned diagnostics.
 The CRAN SDK also exposes the latest web DESCRIPTION endpoint even though rpx's
 resolver uses index or version-pinned source metadata instead.
+
+The non-publishable `archive-stream` crate accepts async readers and reads a
+selected regular file from a gzip tar stream without filesystem extraction or
+whole-archive buffering. CRAN owns HTTP adaptation and DESCRIPTION parsing. It
+stops after the selected entry, leaving the archive tail unconsumed/unvalidated.
+
+The non-publishable `directory-listing` crate parses HTML autoindexes with a real
+HTML parser and nginx JSON into generic file/directory entries. CRAN selects exact
+package archive filenames and parses versions. Unknown HTTP-200 documents and
+explicitly truncated listings are reported as errors. HTTP status policy stays
+in rpx; the parser owns neither network requests nor R package semantics.
 
 SDK operation spans inherit caller tracing context and cover metadata parsing.
 Injected middleware owns HTTP spans; rpx owns terminal UI and streamed-download

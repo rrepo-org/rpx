@@ -8,29 +8,30 @@
 #![doc = include_str!("../README.md")]
 
 pub use r_description::Description;
+pub use r_metadata::Version;
 pub use reqwest::Url;
 pub use reqwest_middleware::ClientWithMiddleware;
 use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum Error {
-    #[error("repository base URL does not support path segments")]
-    InvalidBaseUrl,
+pub enum FetchError {
     #[error(transparent)]
     Request(#[from] reqwest_middleware::Error),
     #[error(transparent)]
     Response(#[from] reqwest::Error),
 }
 
-impl Error {
-    pub fn status(&self) -> Option<reqwest::StatusCode> {
-        match self {
-            Self::Response(error) => error.status(),
-            Self::Request(reqwest_middleware::Error::Reqwest(error)) => error.status(),
-            _ => None,
-        }
-    }
+#[derive(Debug, Clone, Error)]
+#[error("repository base URL does not support HTTP path segments")]
+pub struct InvalidBaseUrl;
+
+#[derive(Debug, Error)]
+pub enum BinaryError {
+    #[error("unsupported binary target or R version")]
+    UnsupportedTarget,
+    #[error(transparent)]
+    Request(#[from] reqwest_middleware::Error),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -70,30 +71,31 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(base_url: Url) -> Self {
-        Self { base_url }
+    pub fn new(mut base_url: Url) -> Result<Self, InvalidBaseUrl> {
+        if !matches!(base_url.scheme(), "http" | "https") {
+            return Err(InvalidBaseUrl);
+        }
+        base_url
+            .path_segments_mut()
+            .map_err(|()| InvalidBaseUrl)?
+            .pop_if_empty();
+        Ok(Self { base_url })
     }
     pub fn base_url(&self) -> &Url {
         &self.base_url
     }
 
-    fn request(
+    #[tracing::instrument(name = "rrepo.packages", skip_all)]
+    pub async fn packages(
         &self,
         client: &ClientWithMiddleware,
-        segments: &[&str],
-    ) -> Result<reqwest_middleware::RequestBuilder, Error> {
+    ) -> Result<PackagesResponse, FetchError> {
         let mut url = self.base_url.clone();
         url.path_segments_mut()
-            .map_err(|()| Error::InvalidBaseUrl)?
-            .pop_if_empty()
-            .extend(segments);
-        Ok(client.get(url))
-    }
-
-    #[tracing::instrument(name = "rrepo.packages", skip_all)]
-    pub async fn packages(&self, client: &ClientWithMiddleware) -> Result<PackagesResponse, Error> {
-        Ok(self
-            .request(client, &["packages"])?
+            .expect("validated repository URL")
+            .push("packages");
+        Ok(client
+            .get(url)
             .send()
             .await?
             .error_for_status()?
@@ -106,9 +108,13 @@ impl Repository {
         &self,
         client: &ClientWithMiddleware,
         package: &str,
-    ) -> Result<VersionsResponse, Error> {
-        Ok(self
-            .request(client, &["packages", package, "versions"])?
+    ) -> Result<VersionsResponse, FetchError> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("validated repository URL")
+            .extend(["packages", package, "versions"]);
+        Ok(client
+            .get(url)
             .send()
             .await?
             .error_for_status()?
@@ -116,18 +122,25 @@ impl Repository {
             .await?)
     }
 
-    #[tracing::instrument(name = "rrepo.description", skip_all, fields(package, version))]
+    #[tracing::instrument(name = "rrepo.description", skip_all, fields(package))]
     pub async fn description(
         &self,
         client: &ClientWithMiddleware,
         package: &str,
-        version: &str,
-    ) -> Result<Description, Error> {
-        let text = self
-            .request(
-                client,
-                &["packages", package, "versions", version, "description"],
-            )?
+        version: impl AsRef<str>,
+    ) -> Result<Description, FetchError> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("validated repository URL")
+            .extend([
+                "packages",
+                package,
+                "versions",
+                version.as_ref(),
+                "description",
+            ]);
+        let text = client
+            .get(url)
             .send()
             .await?
             .error_for_status()?
@@ -137,62 +150,60 @@ impl Repository {
     }
 
     /// Return an unconsumed response. The caller controls status/fallback policy.
-    #[tracing::instrument(name = "rrepo.source", skip_all, fields(package, version))]
+    #[tracing::instrument(name = "rrepo.source", skip_all, fields(package))]
     pub async fn source(
         &self,
         client: &ClientWithMiddleware,
         package: &str,
-        version: &str,
-    ) -> Result<reqwest::Response, Error> {
-        Ok(self
-            .request(
-                client,
-                &["packages", package, "versions", version, "source"],
-            )?
-            .send()
-            .await?)
+        version: impl AsRef<str>,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("validated repository URL")
+            .extend(["packages", package, "versions", version.as_ref(), "source"]);
+        client.get(url).send().await
     }
 
-    /// The R series is explicit (`major.minor`) and need not match the host.
-    #[tracing::instrument(name = "rrepo.windows_binary", skip_all, fields(package, version))]
-    pub async fn windows_binary(
+    /// Return an unconsumed binary response for the target R installation.
+    #[tracing::instrument(name = "rrepo.binary", skip_all, fields(package))]
+    pub async fn binary(
         &self,
         client: &ClientWithMiddleware,
         package: &str,
-        version: &str,
-        r_series: &str,
-    ) -> Result<reqwest::Response, Error> {
-        Ok(self
-            .request(
-                client,
-                &[
-                    "packages", package, "versions", version, "binaries", "windows", r_series,
-                ],
-            )?
-            .send()
-            .await?)
-    }
-
-    /// The platform is a repository identifier such as `big-sur-arm64`.
-    #[tracing::instrument(name = "rrepo.macos_binary", skip_all, fields(package, version))]
-    pub async fn macos_binary(
-        &self,
-        client: &ClientWithMiddleware,
-        package: &str,
-        version: &str,
-        platform: &str,
-        r_series: &str,
-    ) -> Result<reqwest::Response, Error> {
-        Ok(self
-            .request(
-                client,
-                &[
-                    "packages", package, "versions", version, "binaries", "macos", platform,
-                    r_series,
-                ],
-            )?
-            .send()
-            .await?)
+        version: impl AsRef<str>,
+        target: &target_lexicon::Triple,
+        r: &Version,
+    ) -> Result<reqwest::Response, BinaryError> {
+        use target_lexicon::{Architecture, OperatingSystem};
+        let series = format!("{}.{}", r.major(), r.minor());
+        let r = (r.major(), r.minor());
+        let (os, platform) = match (target.operating_system, target.architecture) {
+            (OperatingSystem::Windows, Architecture::X86_64) if r >= (3, 0) => ("windows", None),
+            (OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_), arch) => {
+                let platform = match arch {
+                    Architecture::Aarch64(_) if r >= (4, 6) => "sonoma-arm64",
+                    Architecture::Aarch64(_) if r >= (4, 1) => "big-sur-arm64",
+                    Architecture::X86_64 if r >= (4, 3) => "big-sur-x86_64",
+                    _ => return Err(BinaryError::UnsupportedTarget),
+                };
+                ("macos", Some(platform))
+            }
+            _ => return Err(BinaryError::UnsupportedTarget),
+        };
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("validated repository URL")
+            .extend([
+                "packages",
+                package,
+                "versions",
+                version.as_ref(),
+                "binaries",
+                os,
+            ])
+            .extend(platform)
+            .push(&series);
+        Ok(client.get(url).send().await?)
     }
 }
 
