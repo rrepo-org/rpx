@@ -497,8 +497,8 @@ dependencies = [
  "futures-util",
  "http",
  "mockito",
- "r-description-parser",
- "r-metadata",
+ "r-description-parser 0.3.0",
+ "r-metadata 0.3.0",
  "r-packages-parser",
  "reqwest",
  "reqwest-middleware",
@@ -1905,13 +1905,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-dcf-syntax"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "888c0f45198692749b576b017c9acf13a315f554043f0b271bcf3cc5e28f6fa5"
+dependencies = [
+ "rowan",
+ "thiserror",
+]
+
+[[package]]
 name = "r-description-parser"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8effe2fcc99137a6232481939d44bf5bb45e280f62f70aeebc1614871e76cad1"
 dependencies = [
- "r-dcf-syntax",
- "r-metadata",
+ "r-dcf-syntax 0.2.0",
+ "r-metadata 0.2.0",
+ "thiserror",
+]
+
+[[package]]
+name = "r-description-parser"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46036879a5c0c30f1a6e2c47f1ad12c9ce7dac9af4ba13334f02d7c8018d6f13"
+dependencies = [
+ "r-dcf-syntax 0.3.0",
+ "r-metadata 0.3.0",
  "thiserror",
 ]
 
@@ -1938,6 +1959,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-metadata"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab9d8c76ea04ccdd60d9be7aa380a2ab0b65f21cd147ddc348660414f2c9b6c5"
+dependencies = [
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "r-package-installer"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1947,8 +1978,8 @@ dependencies = [
  "flate2",
  "hex",
  "object",
- "r-dcf-syntax",
- "r-description-parser",
+ "r-dcf-syntax 0.2.0",
+ "r-description-parser 0.2.0",
  "sha2",
  "tar",
  "thiserror",
@@ -1958,12 +1989,13 @@ dependencies = [
 
 [[package]]
 name = "r-packages-parser"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce231431649ce8079c2b1b19bc5ea9eaee564c47ba12fa257b2c406958209f06"
+checksum = "4fa6783b079d394170293c1306d35a217cd21ddb50af31d9f69c3478854a6e93"
 dependencies = [
- "r-dcf-syntax",
- "r-metadata",
+ "r-dcf-syntax 0.3.0",
+ "r-description-parser 0.3.0",
+ "r-metadata 0.3.0",
  "thiserror",
 ]
 
@@ -2210,8 +2242,8 @@ dependencies = [
  "pathdiff",
  "petname",
  "pubgrub",
- "r-description-parser",
- "r-metadata",
+ "r-description-parser 0.3.0",
+ "r-metadata 0.3.0",
  "r-package-installer",
  "r-packages-parser",
  "relative-path",
@@ -2252,8 +2284,8 @@ dependencies = [
  "async-trait",
  "http",
  "mockito",
- "r-description-parser",
- "r-metadata",
+ "r-description-parser 0.3.0",
+ "r-metadata 0.3.0",
  "reqwest",
  "reqwest-middleware",
  "serde",
