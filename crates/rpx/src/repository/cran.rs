@@ -1,5 +1,6 @@
 use super::{ArchiveSupport, RepositoryError};
 use crate::{description::description_identity, http};
+use futures_util::{StreamExt, TryStreamExt, future, stream};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
@@ -133,68 +134,62 @@ impl CranRepository {
         self.descriptions
             .try_get_with((package.to_string(), version.clone()), async {
                 let index = self.packages_index().await?;
-                if let Some(description) = index
-                    .records()
-                    .find(|record| {
-                        record
-                            .package()
-                            .is_some_and(|value| value.as_str() == package)
-                            && record.parsed_version().is_some_and(|value| {
-                                value.as_ref().is_ok_and(|value| value == version)
-                            })
-                    })
-                    .map(|entry| Arc::new(packages_record_to_description(&entry)))
-                {
-                    return Ok(Some(description));
+                if let Some(record) = index.records().find(|record| {
+                    record
+                        .package()
+                        .is_some_and(|value| value.as_str() == package)
+                        && matches!(record.parsed_version(), Some(Ok(found)) if &found == version)
+                }) {
+                    return Ok(Some(Arc::new(packages_record_to_description(&record))));
                 }
                 let client = http::client();
-                let result = match self
-                    .source
-                    .current_description(&client, package, version)
-                    .await
-                {
-                    Err(cran_sdk::DescriptionError::Fetch(
-                        cran_sdk::FetchError::Response(error)
-                        | cran_sdk::FetchError::Request(reqwest_middleware::Error::Reqwest(error)),
-                    )) if matches!(
-                        error.status(),
-                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
-                    ) =>
-                    {
-                        self.source
-                            .archive_description(&client, package, version)
-                            .await
-                    }
-                    result => result,
-                };
-                let description = match result {
-                    Ok(description) => description,
-                    Err(cran_sdk::DescriptionError::Fetch(
-                        cran_sdk::FetchError::Response(error)
-                        | cran_sdk::FetchError::Request(reqwest_middleware::Error::Reqwest(error)),
-                    )) if matches!(
-                        error.status(),
-                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
-                    ) =>
-                    {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(RepositoryError::from(error)),
-                };
-                let (found_name, found_version) = description_identity(
-                    format!("source DESCRIPTION from {}", self.url()),
-                    &description,
-                )?;
-                if found_name != package || &found_version != version {
-                    return Err(RepositoryError::InvalidData {
-                        resource: format!(
-                            "source archive for {package} {version} from {}",
-                            self.url()
-                        ),
-                        details: format!("contains {found_name} {found_version}"),
-                    });
-                }
-                Ok::<_, RepositoryError>(Some(Arc::new(description)))
+                let descriptions =
+                    stream::once(self.source.current_description(&client, package, version))
+                        .chain(stream::once(
+                            self.source.archive_description(&client, package, version),
+                        ))
+                        .filter_map(|result| {
+                            future::ready(match result {
+                                Ok(description) => Some(Ok(description)),
+                                Err(cran_sdk::DescriptionError::Fetch(
+                                    cran_sdk::FetchError::Response(error)
+                                    | cran_sdk::FetchError::Request(
+                                        reqwest_middleware::Error::Reqwest(error),
+                                    ),
+                                )) if matches!(
+                                    error.status(),
+                                    Some(
+                                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                                    )
+                                ) =>
+                                {
+                                    None
+                                }
+                                Err(error) => Some(Err(RepositoryError::from(error))),
+                            })
+                        });
+                futures_util::pin_mut!(descriptions);
+
+                descriptions
+                    .try_next()
+                    .await?
+                    .map(|description| {
+                        let (found_name, found_version) = description_identity(
+                            format!("source DESCRIPTION from {}", self.url()),
+                            &description,
+                        )?;
+                        if found_name != package || &found_version != version {
+                            return Err(RepositoryError::InvalidData {
+                                resource: format!(
+                                    "source archive for {package} {version} from {}",
+                                    self.url()
+                                ),
+                                details: format!("contains {found_name} {found_version}"),
+                            });
+                        }
+                        Ok(Arc::new(description))
+                    })
+                    .transpose()
             })
             .await
             .map_err(Arc::unwrap_or_clone)
