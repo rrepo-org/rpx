@@ -426,12 +426,6 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
     } else {
         args.development_packages
     };
-    let initialize_git = if interactive {
-        prompt_for_git_repository(&target)?
-    } else {
-        false
-    };
-
     let mut description = initial_description(InitialDescriptionOptions {
         package_name: &package_name,
         title: &title,
@@ -489,6 +483,11 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
         sync_resolved_project(&project, resolution, ProjectPackageMode::Install),
     )
     .await?;
+    let initialize_git = if interactive {
+        prompt_for_git_repository(&target)?
+    } else {
+        false
+    };
     if initialize_git {
         git::initialize_repository(&target).map_err(|source| Error::InitializeGit {
             path: target.clone(),
