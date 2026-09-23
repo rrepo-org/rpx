@@ -3,9 +3,9 @@ use crate::{description::description_identity, http};
 use futures_util::{StreamExt, TryStreamExt, future, stream};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
-use r_description::{Description, LogicalValue};
+use r_description::Description;
 use r_metadata::Version;
-use r_packages::{Finding, PackageRecord, Packages};
+use r_packages::{Finding, Packages};
 use reqwest::Url;
 use std::{collections::BTreeSet, sync::Arc};
 use thiserror::Error;
@@ -140,7 +140,7 @@ impl CranRepository {
                         .is_some_and(|value| value.as_str() == package)
                         && matches!(record.parsed_version(), Some(Ok(found)) if &found == version)
                 }) {
-                    return Ok(Some(Arc::new(packages_record_to_description(&record))));
+                    return Ok(Some(Arc::new(Description::from(record))));
                 }
                 let client = http::client();
                 let descriptions =
@@ -238,35 +238,6 @@ impl CranRepository {
                 }
             })
     }
-}
-
-fn packages_record_to_description(record: &PackageRecord) -> Description {
-    let value = |value: r_description::ValueText| {
-        LogicalValue::new(value.as_str()).expect("validated metadata is a valid DCF value")
-    };
-    let mut builder = Description::builder()
-        .package(value(
-            record.package().expect("validated Package should exist"),
-        ))
-        .version(value(
-            record.version().expect("validated Version should exist"),
-        ));
-    if let Some(depends) = record.depends() {
-        builder = builder.depends(value(depends));
-    }
-    if let Some(imports) = record.imports() {
-        builder = builder.imports(value(imports));
-    }
-    if let Some(suggests) = record.suggests() {
-        builder = builder.suggests(value(suggests));
-    }
-    if let Some(linking_to) = record.linking_to() {
-        builder = builder.field(
-            r_description::FieldName::new("LinkingTo").expect("constant field name is valid"),
-            value(linking_to),
-        );
-    }
-    builder.build()
 }
 
 #[derive(Clone, Debug, Error, Diagnostic)]
@@ -476,16 +447,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builds_description_from_validated_package_record() {
-        let packages = r_packages::Packages::parse(
-            "Package: example\nVersion: 1.0.0\nImports: old\nImports: current,\n",
+    #[tokio::test]
+    async fn indexed_description_preserves_all_record_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        let repo =
+            CranRepository::new(server.url().parse().unwrap(), ArchiveSupport::Available).unwrap();
+        let record = concat!(
+            "Package: example\nVersion: 1.0.0\n",
+            "Depends: R (>= 4.0)\n",
+            "Imports: old\nImports: current,\n    another (>= 1.0)\n",
+            "Suggests: optional\nLinkingTo: headers\n",
+            "License: MIT\nNeedsCompilation: yes\n",
+            "X-Custom: preserved\n    continuation\n",
         );
-        assert!(packages.validate().is_empty());
-        let record = packages.record(0).expect("package record should exist");
+        let index = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_body(format!(
+                "Package: other\nVersion: 2.0\n\n{record}\nPackage: last\nVersion: 3.0\n"
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let current = server
+            .mock("GET", "/src/contrib/example_1.0.0.tar.gz")
+            .expect(0)
+            .create_async()
+            .await;
+        let archived = server
+            .mock("GET", "/src/contrib/Archive/example/example_1.0.0.tar.gz")
+            .expect(0)
+            .create_async()
+            .await;
 
-        let description = packages_record_to_description(&record);
+        let description = repo
+            .description("example", &"1.0.0".parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
 
+        assert_eq!(description.to_string(), record);
+        assert_eq!(
+            description.imports().unwrap().as_str(),
+            "current,\nanother (>= 1.0)"
+        );
         assert_eq!(description.package().unwrap().as_str(), "example");
         assert_eq!(
             description.version_parsed().unwrap().unwrap().as_str(),
@@ -497,7 +501,10 @@ mod tests {
                 .values()
                 .map(r_metadata::Relation::package)
                 .collect::<Vec<_>>(),
-            ["current"]
+            ["old", "current", "another"]
         );
+        index.assert_async().await;
+        current.assert_async().await;
+        archived.assert_async().await;
     }
 }

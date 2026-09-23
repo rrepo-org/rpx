@@ -10,9 +10,9 @@ repository = "https://github.com/rrepo-org/rpx"
 directory-listing = { path = "../directory-listing" }
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 reqwest-middleware = "0.5"
-r-description = { package = "r-description-parser", version = "=0.2.0" }
-r-packages = { package = "r-packages-parser", version = "=0.2.0" }
-r-metadata = "=0.2.0"
+r-description = { package = "r-description-parser", version = "=0.3.0" }
+r-packages = { package = "r-packages-parser", version = "=0.3.0" }
+r-metadata = "=0.3.0"
 archive-stream = { path = "../archive-stream" }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
