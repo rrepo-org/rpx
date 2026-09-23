@@ -4,13 +4,13 @@ use moka::future::Cache;
 use r_description::Description;
 use r_metadata::Version;
 use reqwest::Url;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
     source: rrepo_sdk::Repository,
     packages: Cache<(), Arc<rrepo_sdk::PackagesResponse>>,
-    versions: Cache<String, Arc<BTreeMap<Version, String>>>,
+    versions: Cache<String, Arc<BTreeSet<Version>>>,
     descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
@@ -58,11 +58,8 @@ impl RrepoRepository {
             .map_err(Arc::unwrap_or_clone)
     }
 
-    /// Version -> source URL, retaining the endpoint's native artifact references.
-    pub async fn versions(
-        &self,
-        package: &str,
-    ) -> Result<Arc<BTreeMap<Version, String>>, RepositoryError> {
+    /// Available versions; artifact endpoints are derived from the repository base URL.
+    pub async fn versions(&self, package: &str) -> Result<Arc<BTreeSet<Version>>, RepositoryError> {
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
@@ -76,19 +73,17 @@ impl RrepoRepository {
                     .versions
                     .into_iter()
                     .map(|summary| {
-                        summary
-                            .version
-                            .parse::<Version>()
-                            .map(|version| (version, summary.source_url))
-                            .map_err(|source| RepositoryError::InvalidData {
+                        summary.version.parse::<Version>().map_err(|source| {
+                            RepositoryError::InvalidData {
                                 resource: format!(
                                     "package version {} for {package}",
                                     summary.version
                                 ),
                                 details: source.to_string(),
-                            })
+                            }
+                        })
                     })
-                    .collect::<Result<BTreeMap<_, _>, RepositoryError>>()
+                    .collect::<Result<BTreeSet<_>, RepositoryError>>()
                     .map(Arc::new)
             })
             .await

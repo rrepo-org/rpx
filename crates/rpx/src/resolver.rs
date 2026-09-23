@@ -499,7 +499,7 @@ async fn choose_repository_version(
     }
     let versions: BTreeSet<Version> = match repository {
         PackageRepository::Rrepo(repo) => match repo.versions(package).await {
-            Ok(versions) => versions.keys().cloned().collect(),
+            Ok(versions) => versions.as_ref().clone(),
             Err(RepositoryError::Response { source })
                 if matches!(
                     source.status(),
