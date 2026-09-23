@@ -1,0 +1,16 @@
+[package]
+name = "archive-stream"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+tokio-tar = { package = "astral-tokio-tar", version = "0.7" }
+tokio = { version = "1", features = ["io-util"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+flate2 = "1"
+tar = "0.4"
+tokio = { version = "1", features = ["macros", "rt"] }

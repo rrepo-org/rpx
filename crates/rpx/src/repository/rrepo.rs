@@ -1,162 +1,96 @@
-use super::{PackageRepository, RepositoryError};
-use crate::{http, resolver::PackageVersion};
-use async_trait::async_trait;
+use super::RepositoryError;
+use crate::http;
 use moka::future::Cache;
 use r_description::Description;
 use r_metadata::Version;
 use reqwest::Url;
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
-    url: Url,
-    packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
-    versions: Cache<String, BTreeSet<Version>>,
+    source: rrepo_sdk::Repository,
+    packages: Cache<(), Arc<rrepo_sdk::PackagesResponse>>,
+    versions: Cache<String, Arc<BTreeSet<Version>>>,
     descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
 impl std::fmt::Display for RrepoRepository {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.url.fmt(formatter)
+        self.url().fmt(formatter)
     }
 }
 
 impl RrepoRepository {
-    pub fn new(url: Url) -> Self {
-        Self {
-            url,
+    pub fn new(url: Url) -> Result<Self, rrepo_sdk::InvalidBaseUrl> {
+        Ok(Self {
+            source: rrepo_sdk::Repository::new(url)?,
             packages: Cache::new(1),
             versions: Cache::new(1024),
             descriptions: Cache::new(4096),
-        }
+        })
     }
 
     pub fn url(&self) -> &Url {
-        &self.url
-    }
-}
-
-#[async_trait]
-impl PackageRepository for RrepoRepository {
-    fn as_any(&self) -> &dyn Any {
-        self
+        self.source.base_url()
     }
 
-    fn equals(&self, other: &dyn PackageRepository) -> bool {
-        other
-            .as_any()
-            .downcast_ref::<Self>()
-            .is_some_and(|other| self.url == other.url)
+    /// Recognize rrepo and retain its fetched index on the returned handle.
+    pub async fn probe(url: Url) -> Result<Self, RepositoryError> {
+        let repository = Self::new(url)?;
+        repository.packages().await?;
+        Ok(repository)
     }
 
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
-        let response = self
-            .packages
+    #[cfg(test)]
+    pub(crate) fn invalidate_descriptions(&self) {
+        self.descriptions.invalidate_all();
+    }
+    pub async fn packages(&self) -> Result<Arc<rrepo_sdk::PackagesResponse>, RepositoryError> {
+        self.packages
             .try_get_with((), async {
-                let response = http::rrepo_repository_packages(&self.url)
+                self.source
+                    .packages(&http::client())
                     .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?
-                    .json::<http::RrepoPackagesResponse>()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
-
-                Ok::<Arc<http::RrepoPackagesResponse>, RepositoryError>(Arc::new(response))
+                    .map(Arc::new)
+                    .map_err(RepositoryError::from)
             })
             .await
-            .map_err(Arc::unwrap_or_clone)?;
-
-        Ok(response
-            .packages
-            .iter()
-            .filter_map(|package| {
-                let version = match package.latest_version.parse::<Version>() {
-                    Ok(version) => version,
-                    Err(error) => {
-                        tracing::debug!(
-                            package = %package.name,
-                            version = %package.latest_version,
-                            repository = %self.url,
-                            error = %error,
-                            "skipping package with invalid latest version"
-                        );
-                        return None;
-                    }
-                };
-
-                Some((
-                    package.name.clone(),
-                    PackageVersion::new(version, Arc::clone(&repository)),
-                ))
-            })
-            .collect())
+            .map_err(Arc::unwrap_or_clone)
     }
 
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository: Arc<dyn PackageRepository> = Arc::new(self.clone());
+    /// Available versions; artifact endpoints are derived from the repository base URL.
+    pub async fn versions(&self, package: &str) -> Result<Arc<BTreeSet<Version>>, RepositoryError> {
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
-                let response = http::rrepo_package_versions(&self.url, package)
+                let response = self
+                    .source
+                    .versions(&http::client(), package)
                     .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?
-                    .json::<http::RrepoPackageVersionsResponse>()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
+                    .map_err(RepositoryError::from)?;
 
-                response
-                    .versions
-                    .into_iter()
-                    .map(|summary| {
-                        summary.version.parse::<Version>().map_err(|source| {
-                            RepositoryError::InvalidData {
-                                resource: format!(
-                                    "package version {} for {package}",
-                                    summary.version
-                                ),
-                                details: source.to_string(),
-                            }
-                        })
-                    })
-                    .collect::<Result<BTreeSet<_>, RepositoryError>>()
+                Ok::<_, RepositoryError>(Arc::new(
+                    response
+                        .versions
+                        .into_iter()
+                        .map(|summary| summary.version)
+                        .collect(),
+                ))
             })
             .await
             .map_err(Arc::unwrap_or_clone)?;
 
         tracing::trace!(
             package,
-            repository = %self.url,
+            repository = %self.url(),
             versions = versions.len(),
             "loaded package versions"
         );
 
-        Ok(versions
-            .into_iter()
-            .map(|version| PackageVersion::new(version, Arc::clone(&repository)))
-            .collect())
+        Ok(versions)
     }
 
-    async fn description(
+    pub async fn description(
         &self,
         package: &str,
         version: &Version,
@@ -165,27 +99,16 @@ impl PackageRepository for RrepoRepository {
 
         self.descriptions
             .try_get_with(key, async {
-                let description =
-                    http::rrepo_package_description(&self.url, package, version.as_ref())
-                        .await
-                        .map_err(|source| RepositoryError::Request {
-                            source: Arc::new(source),
-                        })?
-                        .error_for_status()
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?
-                        .text()
-                        .await
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?;
-                let description = Description::parse(&description);
+                let description = self
+                    .source
+                    .description(&http::client(), package, version.as_ref())
+                    .await
+                    .map_err(RepositoryError::from)?;
 
                 tracing::trace!(
                     package,
                     version = %version,
-                    repository = %self.url,
+                    repository = %self.url(),
                     "fetched package description"
                 );
 
@@ -193,5 +116,39 @@ impl PackageRepository for RrepoRepository {
             })
             .await
             .map_err(Arc::unwrap_or_clone)
+    }
+
+    pub async fn source(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        self.source
+            .source(&http::client(), package, version.as_ref())
+            .await
+    }
+
+    pub async fn binary(
+        &self,
+        package: &str,
+        version: &Version,
+        target: &target_lexicon::Triple,
+        r_version: &semver::Version,
+    ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
+        let client = http::client();
+        let r_version: Version = format!("{}.{}", r_version.major, r_version.minor)
+            .parse()
+            .expect("numeric R major/minor version");
+        self.source
+            .binary(&client, package, version, target, &r_version)
+            .await
+            .map_err(|error| match error {
+                rrepo_sdk::BinaryError::Request(error) => error.into(),
+                rrepo_sdk::BinaryError::UnsupportedTarget => {
+                    http::BinaryArtifactRequestError::UnsupportedTarget {
+                        target: target.clone(),
+                    }
+                }
+            })
     }
 }

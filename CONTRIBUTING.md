@@ -24,6 +24,12 @@ The task runner, including its internal scheduler, can be tested without R:
 cargo test -p rpx-task --locked
 ```
 
+The protocol SDKs also run independently of R:
+
+```bash
+cargo test -p cran-sdk -p rrepo-sdk --locked
+```
+
 See [sync execution](docs/sync-engine.md) for crate boundaries and test coverage.
 
 ## Preparing a release

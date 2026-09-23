@@ -2,12 +2,12 @@
 //! These functions do not depend on the graph runner or sync orchestration.
 use crate::{
     cache::{
-        BinaryArtifactCacheKey, INSTALLER_CACHE_VERSION, RegistryIdentity, SourceArtifactCacheKey,
+        BinaryArtifactCacheKey, INSTALLER_CACHE_VERSION, RegistryCacheKey, SourceArtifactCacheKey,
         SourceArtifactIdentity, binary_artifact_cache_path, source_artifact_cache_path,
     },
     http,
     r::{self, build_package_archive},
-    repository::{CranRepository, GitRepository, RepositoryError, RrepoRepository},
+    repository::{GitRepository, PackageRepository, RepositoryError},
     resolver::PackageVersion,
     ui::{progress_bar_style, progress_spinner_style},
 };
@@ -350,17 +350,16 @@ pub(super) async fn download_package_artifact(
     span.pb_start();
 
     async {
-        let repository = registry_identity(&package_version)
+        let registry = RegistryCacheKey::from_repository(package_version.repository())
             .ok_or(DownloadPackageArtifactError::UnsupportedRepository)?;
+        let repository = package_version.repository();
         span.record(
             "repository",
-            match &repository {
-                RegistryIdentity::Cran(url) | RegistryIdentity::Rrepo(url) => url.as_str(),
-            },
+            repository.to_string(),
         );
         span.record("stage", "downloading binary");
         span.pb_set_message(&format!("{package} {version} downloading binary"));
-        match registry_binary_location(&repository, &package, &package_version, r_version.as_ref()) {
+        match registry_binary_location(&registry, &package, &package_version, r_version.as_ref()) {
             Ok(Some((path, format))) => {
                 let binary_result = async {
                     match artifact_cache_entry(&path) {
@@ -372,23 +371,10 @@ pub(super) async fn download_package_artifact(
                         }
                         ArtifactCacheEntry::Missing => {}
                     }
-                    let response = match &repository {
-                        RegistryIdentity::Rrepo(url) => http::rrepo_binary(
-                            url,
-                            &package,
-                            &version,
-                            &HOST,
-                            r_version.as_ref(),
-                        )
-                        .await,
-                        RegistryIdentity::Cran(url) => http::cran_binary(
-                            url,
-                            &package,
-                            &version,
-                            &HOST,
-                            r_version.as_ref(),
-                        )
-                        .await,
+                    let response = match repository {
+                        PackageRepository::Rrepo(repo) => repo.binary(&package, package_version.version(), &HOST, &r_version).await,
+                        PackageRepository::Cran(repo) => repo.binary(&package, package_version.version(), &HOST, &r_version).await,
+                        PackageRepository::Git(_) | PackageRepository::Local(_) => return Err(DownloadPackageArtifactError::UnsupportedRepository),
                     }
                     .map_err(|source| DownloadPackageArtifactError::BinaryRequest { source })?
                     .error_for_status()
@@ -432,7 +418,7 @@ pub(super) async fn download_package_artifact(
         span.pb_set_message(&format!("{package} {version} falling back to source"));
         span.record("stage", "downloading source");
         span.pb_set_message(&format!("{package} {version} downloading source"));
-        let path = registry_source_path(&repository, &package, &package_version);
+        let path = registry_source_path(&registry, &package, &package_version);
         match artifact_cache_entry(&path) {
             ArtifactCacheEntry::File => {
                 span.record("stage", "prepared");
@@ -445,8 +431,8 @@ pub(super) async fn download_package_artifact(
             ArtifactCacheEntry::Missing => {}
         }
 
-        let response = match &repository {
-            RegistryIdentity::Rrepo(url) => http::rrepo_source_artifact(url, &package, &version)
+        let response = match repository {
+            PackageRepository::Rrepo(repo) => repo.source(&package, package_version.version())
                 .await
                 .map_err(|source| DownloadPackageArtifactError::Request {
                     artifact: "source",
@@ -457,8 +443,8 @@ pub(super) async fn download_package_artifact(
                     artifact: "source",
                     source,
                 })?,
-            RegistryIdentity::Cran(url) => {
-                let current = http::cran_current_source_tarball(url, &package, &version)
+            PackageRepository::Cran(repo) => {
+                let current = repo.current_source(&package, package_version.version())
                     .await
                     .map_err(|source| DownloadPackageArtifactError::Request {
                         artifact: "current source",
@@ -476,7 +462,7 @@ pub(super) async fn download_package_artifact(
                     Ok(response) => response,
                     Err(error) => {
                         tracing::debug!(%error, "current source artifact unavailable; trying archive");
-                        http::cran_archive_source_tarball(url, &package, &version)
+                        repo.archive_source(&package, package_version.version())
                             .await
                             .map_err(|source| DownloadPackageArtifactError::Request {
                                 artifact: "archived source",
@@ -489,7 +475,8 @@ pub(super) async fn download_package_artifact(
                             })?
                     }
                 }
-            }
+            },
+            PackageRepository::Git(_) | PackageRepository::Local(_) => return Err(DownloadPackageArtifactError::UnsupportedRepository),
         };
         span.record("artifact_kind", "source");
         publish_artifact_response(path.clone(), response, &span).await?;
@@ -548,20 +535,8 @@ fn artifact_cache_entry(path: &Path) -> ArtifactCacheEntry {
     }
 }
 
-fn registry_identity(package_version: &PackageVersion) -> Option<RegistryIdentity> {
-    let repository = package_version.repository();
-    let repository = repository.as_ref();
-    if let Some(repository) = repository.downcast_ref::<RrepoRepository>() {
-        Some(RegistryIdentity::Rrepo(repository.url().clone()))
-    } else {
-        repository
-            .downcast_ref::<CranRepository>()
-            .map(|repository| RegistryIdentity::Cran(repository.url().clone()))
-    }
-}
-
 fn registry_binary_location(
-    registry: &RegistryIdentity,
+    registry: &RegistryCacheKey,
     package: &str,
     package_version: &PackageVersion,
     r_version: &semver::Version,
@@ -585,7 +560,7 @@ fn registry_binary_location(
 }
 
 fn registry_source_path(
-    registry: &RegistryIdentity,
+    registry: &RegistryCacheKey,
     package: &str,
     package_version: &PackageVersion,
 ) -> PathBuf {

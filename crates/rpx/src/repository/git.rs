@@ -1,16 +1,12 @@
-use super::{PackageRepository, RepositoryError};
+use super::RepositoryError;
 use crate::{
     description::description_identity,
     git::{self, GitOid, GitUrl},
-    resolver::PackageVersion,
 };
-use async_trait::async_trait;
 use moka::future::Cache;
 use r_description::Description;
 use r_metadata::{Remote, RemoteSource, Version};
 use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -29,6 +25,13 @@ pub struct GitRepository {
 
 impl GitRepository {
     pub fn new(remote: Remote) -> Result<Self, RepositoryError> {
+        let (url, reference, subdirectory) = Self::configuration(remote)?;
+        Ok(Self::from_parts(url, reference, subdirectory))
+    }
+
+    fn configuration(
+        remote: Remote,
+    ) -> Result<(GitUrl, Option<String>, Option<PathBuf>), RepositoryError> {
         let repository = remote.to_string();
         let (reference, subdirectory) = remote_parts(&remote);
         let url = GitUrl::try_from(remote).map_err(|source| RepositoryError::Git {
@@ -40,13 +43,36 @@ impl GitRepository {
             .map(validate_subdirectory)
             .transpose()?;
 
-        Ok(Self {
-            remote: url,
+        Ok((url, reference, subdirectory))
+    }
+
+    pub fn matches_lockfile(
+        remote: &Remote,
+        locked: &crate::lockfile::Repository,
+    ) -> Result<bool, RepositoryError> {
+        let (current_url, current_reference, current_subdirectory) =
+            Self::configuration(remote.clone())?;
+        let crate::lockfile::Repository::Git {
+            url,
             reference,
+            commit,
             subdirectory,
-            commit: Arc::new(OnceCell::new()),
-            descriptions: Cache::new(1),
-        })
+        } = locked
+        else {
+            return Ok(false);
+        };
+        let locked_url = GitUrl::try_from(url).map_err(|source| RepositoryError::Git {
+            repository: url.to_string(),
+            source: Arc::new(source),
+        })?;
+        let locked_reference = match reference {
+            crate::lockfile::GitReference::DefaultBranch => None,
+            crate::lockfile::GitReference::Named { value } => Some(value.clone()),
+            crate::lockfile::GitReference::Commit => Some(commit.to_string()),
+        };
+        Ok(current_url == locked_url
+            && current_reference == locked_reference
+            && current_subdirectory == subdirectory.as_ref().map(|path| path.to_path("")))
     }
 
     pub(crate) fn with_commit(mut self, commit: GitOid) -> Self {
@@ -89,7 +115,7 @@ impl GitRepository {
         self.subdirectory.as_deref()
     }
 
-    async fn repository_description(&self) -> Result<Arc<Description>, RepositoryError> {
+    pub async fn description(&self) -> Result<Arc<Description>, RepositoryError> {
         let commit = self.commit().await?;
         self.descriptions
             .try_get_with(commit, async {
@@ -116,13 +142,11 @@ impl GitRepository {
             .map_err(Arc::unwrap_or_clone)
     }
 
-    async fn package(self: &Arc<Self>) -> Result<(String, PackageVersion), RepositoryError> {
-        let description = self.repository_description().await?;
+    pub async fn package(&self) -> Result<(String, Version), RepositoryError> {
+        let description = self.description().await?;
         let (package, version) =
             description_identity(format!("DESCRIPTION from {self}"), &description)?;
-        let repository: Arc<dyn PackageRepository> = self.clone();
-
-        Ok((package, PackageVersion::new(version, repository)))
+        Ok((package, version))
     }
 
     fn git_error(&self, source: git::GitError) -> RepositoryError {
@@ -162,56 +186,6 @@ impl std::fmt::Display for GitRepository {
     }
 }
 
-#[async_trait]
-impl PackageRepository for GitRepository {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn equals(&self, other: &dyn PackageRepository) -> bool {
-        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
-            self.remote == other.remote
-                && self.reference == other.reference
-                && self.subdirectory == other.subdirectory
-        })
-    }
-
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError> {
-        let repository = Arc::new(self.clone());
-        let (package, version) = repository.package().await?;
-        Ok(BTreeMap::from([(package, version)]))
-    }
-
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError> {
-        let repository = Arc::new(self.clone());
-        let (repository_package, version) = repository.package().await?;
-        if package == repository_package {
-            Ok(BTreeSet::from([version]))
-        } else {
-            Ok(BTreeSet::new())
-        }
-    }
-
-    async fn description(
-        &self,
-        package: &str,
-        version: &Version,
-    ) -> Result<Arc<Description>, RepositoryError> {
-        let description = self.repository_description().await?;
-        let (repository_package, repository_version) =
-            description_identity(format!("DESCRIPTION from {self}"), &description)?;
-        if package != repository_package || version != &repository_version {
-            return Err(RepositoryError::RepositoryPackageVersionNotFound {
-                repository: self.to_string(),
-                package: package.to_string(),
-                version: version.clone(),
-            });
-        }
-
-        Ok(description)
-    }
-}
-
 fn remote_parts(remote: &Remote) -> (Option<String>, Option<String>) {
     match &remote.source {
         RemoteSource::GitHub(source)
@@ -245,6 +219,7 @@ mod tests {
     use super::*;
     use crate::git::tests::{commit_file, source_repository};
     use crate::lockfile::{GitReference, Repository};
+    use crate::repository::PackageRepository;
     use std::fs;
 
     #[tokio::test]
@@ -255,11 +230,11 @@ mod tests {
         let remote = "github::owner/repository/subdir@main"
             .parse::<Remote>()
             .expect("remote should parse");
-        let repository: Arc<dyn PackageRepository> = Arc::new(
+        let repository = PackageRepository::Git(Arc::new(
             GitRepository::new(remote)
                 .expect("repository should build")
                 .with_commit(commit),
-        );
+        ));
 
         let locked = repository
             .to_lockfile()
@@ -286,16 +261,16 @@ mod tests {
         let remote = GitUrl::from_local_path(&source_path);
         let repository = GitRepository::from_parts(remote, None, None).with_commit(initial);
 
-        let packages = repository.packages().await.expect("packages should load");
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages["example"].version().to_string(), "1.0.0");
+        let (name, version) = repository.package().await.expect("package should load");
+        assert_eq!(name, "example");
+        assert_eq!(version.to_string(), "1.0.0");
 
         commit_file(&source, "Package: example\nVersion: 2.0.0\n", "second");
-        let packages = repository
-            .packages()
+        let (_, version) = repository
+            .package()
             .await
             .expect("packages should be cached");
-        assert_eq!(packages["example"].version().to_string(), "1.0.0");
+        assert_eq!(version.to_string(), "1.0.0");
 
         fs::remove_dir_all(source_path).expect("source should be removed");
     }
@@ -310,7 +285,7 @@ mod tests {
         );
 
         let error = repository
-            .packages()
+            .package()
             .await
             .expect_err("invalid DESCRIPTION identity should be rejected");
 

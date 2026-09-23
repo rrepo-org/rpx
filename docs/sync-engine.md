@@ -79,8 +79,8 @@ This is a snapshot, not a library-wide lock against concurrent processes.
 
 `SyncPlan::prepare` performs two phases:
 
-1. Pure `reconcile`: classify retained, installed, and removed packages, then
-   validate dependency metadata for all installation requests. Installation and
+1. Pure `reconcile`: classify retained, installed, and removed packages using
+   explicit dependency records from resolution or locked replay. Installation and
    removal sets are disjoint. Dependency versions come from the same resolution,
    even for retained packages; runtime-provided dependencies keep optional versions.
 2. Fold the changes into a private `Assembly`: reserve every installation handle,
@@ -115,8 +115,9 @@ are preserved. Checkout has its own diagnostic, with distinct commit-resolution
 and checkout causes. Installer preparation and materialization (including their
 blocking-task join failures) are distinguished. All retain typed source errors.
 
-`PlanError` reports dependency metadata errors, package-labelled cycles, and
-task-graph construction failures. `RunError` forwards contextual operation errors
+Native metadata is validated when constructing resolved package records, before
+sync planning. `PlanError` reports package-labelled cycles and task-graph
+construction failures. `RunError` forwards contextual operation errors
 and attributes executor panics/join failures to a package and operation while
 preserving the `JoinError`. Internal invariant messages remain distinct.
 `SyncError` handles project setup and transparently forwards plan/run diagnostics

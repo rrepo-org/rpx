@@ -3,23 +3,19 @@ mod git;
 mod local;
 mod rrepo;
 
-use crate::resolver::PackageVersion;
-use crate::{description::DescriptionParseError, http};
-use async_trait::async_trait;
+use crate::description::DescriptionParseError;
 use miette::Diagnostic;
-use r_description::Description;
 use r_metadata::Version;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    fmt::{Debug, Display},
+    fmt::Display,
     path::PathBuf,
     sync::{Arc, LazyLock},
 };
 use thiserror::Error;
 
+pub(crate) use cran::CranPackagesParseError;
 pub use cran::CranRepository;
 pub use git::GitRepository;
 pub use local::LocalRepository;
@@ -32,21 +28,26 @@ static BUILT_IN_REPOSITORY_URL: LazyLock<Url> = LazyLock::new(|| {
         .expect("built-in repository URL should be valid")
 });
 
-static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> =
-    LazyLock::new(|| Arc::new(RrepoRepository::new(built_in_repository_url().clone())));
+static BUILT_IN_REPOSITORY: LazyLock<Arc<RrepoRepository>> = LazyLock::new(|| {
+    Arc::new(
+        RrepoRepository::new(built_in_repository_url().clone()).expect("valid built-in repository"),
+    )
+});
 
 pub fn built_in_repository_url() -> &'static Url {
     &BUILT_IN_REPOSITORY_URL
 }
 
-pub fn built_in_repository() -> Arc<dyn PackageRepository> {
-    BUILT_IN_REPOSITORY.clone()
+pub fn built_in_repository() -> PackageRepository {
+    PackageRepository::Rrepo(BUILT_IN_REPOSITORY.clone())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArchiveSupport {
+    /// The repository exposes archive directory listings.
     Available,
+    /// Directory listing is unavailable; known archive URLs may still work.
     Unavailable,
 }
 
@@ -54,7 +55,16 @@ pub enum ArchiveSupport {
 pub enum RepositoryError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    CranPackages(Box<http::CranPackagesParseError>),
+    CranPackages(Box<CranPackagesParseError>),
+
+    #[error(transparent)]
+    Cran(Arc<cran_sdk::ListingError>),
+
+    #[error(transparent)]
+    InvalidCranUrl(#[from] cran_sdk::InvalidBaseUrl),
+
+    #[error(transparent)]
+    InvalidRrepoUrl(#[from] rrepo_sdk::InvalidBaseUrl),
 
     #[error("request failed: {source}")]
     Request {
@@ -91,13 +101,6 @@ pub enum RepositoryError {
     #[error("source package does not contain {package}/DESCRIPTION")]
     DescriptionNotFound { package: String },
 
-    #[error("local repository at {path} does not contain {package} {version}")]
-    PackageVersionNotFound {
-        path: PathBuf,
-        package: String,
-        version: Version,
-    },
-
     #[allow(dead_code)]
     #[error("Git repository {repository} failed: {source}")]
     Git {
@@ -125,92 +128,33 @@ pub enum RepositoryError {
     },
 }
 
-#[async_trait]
-pub trait PackageRepository: Any + Debug + Display + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
-    fn equals(&self, other: &dyn PackageRepository) -> bool;
-
-    async fn packages(&self) -> Result<BTreeMap<String, PackageVersion>, RepositoryError>;
-
-    async fn versions(&self, package: &str) -> Result<BTreeSet<PackageVersion>, RepositoryError>;
-
-    async fn description(
-        &self,
-        package: &str,
-        version: &Version,
-    ) -> Result<Arc<Description>, RepositoryError>;
+/// Shared native sources. Cloning preserves caches, pinned commits, and local
+/// DESCRIPTION overrides. Equality compares configuration, not resolved content.
+#[derive(Debug, Clone)]
+pub enum PackageRepository {
+    Cran(Arc<CranRepository>),
+    Rrepo(Arc<RrepoRepository>),
+    Git(Arc<GitRepository>),
+    Local(Arc<LocalRepository>),
 }
 
-impl dyn PackageRepository {
-    pub fn downcast_ref<T: PackageRepository + 'static>(&self) -> Option<&T> {
-        self.as_any().downcast_ref()
+impl PackageRepository {
+    /// Resolution metadata is scoped to an exact handle, not configuration
+    /// equality (two local overrides or Git revisions may share configuration).
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Cran(a), Self::Cran(b)) => Arc::ptr_eq(a, b),
+            (Self::Rrepo(a), Self::Rrepo(b)) => Arc::ptr_eq(a, b),
+            (Self::Git(a), Self::Git(b)) => Arc::ptr_eq(a, b),
+            (Self::Local(a), Self::Local(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
 
-    pub async fn from_url(url: Url) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+    pub async fn from_url(url: Url) -> Result<Self, RepositoryError> {
         let value = url.to_string();
-        let rrepo_url = url.clone();
-        let rrepo_probe = async {
-            http::rrepo_repository_packages(&rrepo_url)
-                .await
-                .map_err(|source| RepositoryError::Request {
-                    source: Arc::new(source),
-                })?
-                .error_for_status()
-                .map_err(|source| RepositoryError::Response {
-                    source: Arc::new(source),
-                })?;
-
-            Ok::<Arc<dyn PackageRepository>, RepositoryError>(Arc::new(RrepoRepository::new(
-                rrepo_url,
-            )))
-        };
-
-        let cran_url = url;
-        let cran_probe = async {
-            let packages_probe = async {
-                http::cran_packages(&cran_url)
-                    .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })
-            };
-            let archive_probe = async {
-                http::cran_archive_root(&cran_url)
-                    .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })
-            };
-
-            let (packages_result, archive_result) = tokio::join!(packages_probe, archive_probe);
-            packages_result?;
-
-            let archives = match archive_result {
-                Ok(_) => ArchiveSupport::Available,
-                Err(RepositoryError::Response { source })
-                    if matches!(
-                        source.status(),
-                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN)
-                    ) =>
-                {
-                    ArchiveSupport::Unavailable
-                }
-                Err(error) => return Err(error),
-            };
-
-            Ok::<Arc<dyn PackageRepository>, RepositoryError>(Arc::new(CranRepository::new(
-                cran_url, archives,
-            )))
-        };
+        let rrepo_probe = RrepoRepository::probe(url.clone());
+        let cran_probe = CranRepository::probe(url);
 
         tokio::pin!(rrepo_probe);
         tokio::pin!(cran_probe);
@@ -218,15 +162,11 @@ impl dyn PackageRepository {
         tokio::select! {
             rrepo_result = &mut rrepo_probe => {
                 match rrepo_result {
-                    Ok(repository) => Ok(repository),
+                    Ok(repository) => Ok(Self::Rrepo(Arc::new(repository))),
                     Err(rrepo_error) => {
                         match cran_probe.await {
-                            Ok(repository) => Ok(repository),
-                            Err(cran_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value.clone(),
-                                rrepo: Box::new(rrepo_error),
-                                cran: Box::new(cran_error),
-                            }),
+                            Ok(repository) => Ok(Self::Cran(Arc::new(repository))),
+                            Err(cran_error) => Err(discovery_failure(value.clone(), rrepo_error, cran_error)),
                         }
                     }
                 }
@@ -234,15 +174,11 @@ impl dyn PackageRepository {
 
             cran_result = &mut cran_probe => {
                 match cran_result {
-                    Ok(repository) => Ok(repository),
+                    Ok(repository) => Ok(Self::Cran(Arc::new(repository))),
                     Err(cran_error) => {
                         match rrepo_probe.await {
-                            Ok(repository) => Ok(repository),
-                            Err(rrepo_error) => Err(RepositoryError::UnrecognizedRepository {
-                                url: value,
-                                rrepo: Box::new(rrepo_error),
-                                cran: Box::new(cran_error),
-                            }),
+                            Ok(repository) => Ok(Self::Rrepo(Arc::new(repository))),
+                            Err(rrepo_error) => Err(discovery_failure(value, rrepo_error, cran_error)),
                         }
                     }
                 }
@@ -252,10 +188,10 @@ impl dyn PackageRepository {
 
     pub fn from_lockfile(
         repository: &crate::lockfile::Repository,
-    ) -> Result<Arc<dyn PackageRepository>, RepositoryError> {
+    ) -> Result<Self, RepositoryError> {
         match repository {
             crate::lockfile::Repository::Rrepo { url } => {
-                Ok(Arc::new(RrepoRepository::new(url.clone())))
+                Ok(Self::Rrepo(Arc::new(RrepoRepository::new(url.clone())?)))
             }
             crate::lockfile::Repository::CranLike {
                 url,
@@ -265,7 +201,10 @@ impl dyn PackageRepository {
                     crate::lockfile::ArchiveSupport::Available => ArchiveSupport::Available,
                     crate::lockfile::ArchiveSupport::Unavailable => ArchiveSupport::Unavailable,
                 };
-                Ok(Arc::new(CranRepository::new(url.clone(), archive_support)))
+                Ok(Self::Cran(Arc::new(CranRepository::new(
+                    url.clone(),
+                    archive_support,
+                )?)))
             }
             crate::lockfile::Repository::Git {
                 url,
@@ -284,70 +223,142 @@ impl dyn PackageRepository {
                     crate::lockfile::GitReference::Commit => Some(commit.to_string()),
                 };
                 let subdirectory = subdirectory.as_ref().map(|path| path.to_path(""));
-                Ok(Arc::new(
+                Ok(Self::Git(Arc::new(
                     GitRepository::from_parts(remote, reference, subdirectory).with_commit(*commit),
-                ))
+                )))
             }
         }
     }
 
     pub async fn to_lockfile(&self) -> Result<crate::lockfile::Repository, RepositoryError> {
-        if let Some(repository) = self.downcast_ref::<RrepoRepository>() {
-            return Ok(crate::lockfile::Repository::Rrepo {
+        match self {
+            Self::Rrepo(repository) => Ok(crate::lockfile::Repository::Rrepo {
                 url: repository.url().clone(),
-            });
-        }
-
-        if let Some(repository) = self.downcast_ref::<CranRepository>() {
-            let archive_support = match repository.archive_support() {
-                ArchiveSupport::Available => crate::lockfile::ArchiveSupport::Available,
-                ArchiveSupport::Unavailable => crate::lockfile::ArchiveSupport::Unavailable,
-            };
-            return Ok(crate::lockfile::Repository::CranLike {
-                url: repository.url().clone(),
-                archive_support,
-            });
-        }
-
-        if let Some(repository) = self.downcast_ref::<GitRepository>() {
-            let commit = repository.commit().await?;
-            let url = reqwest::Url::try_from(repository.remote()).map_err(|source| {
-                RepositoryError::Git {
-                    repository: repository.to_string(),
-                    source: Arc::new(source),
-                }
-            })?;
-            let url = parse_repository_url(url.as_str())?;
-            let reference = match repository.reference() {
-                None => crate::lockfile::GitReference::DefaultBranch,
-                Some(reference) if is_commit_reference(reference, commit) => {
-                    crate::lockfile::GitReference::Commit
-                }
-                Some(value) => crate::lockfile::GitReference::Named {
-                    value: value.to_string(),
-                },
-            };
-            let subdirectory = repository
-                .subdirectory()
-                .map(relative_path::RelativePathBuf::from_path)
-                .transpose()
-                .map_err(|error| RepositoryError::InvalidData {
-                    resource: format!("subdirectory in {repository}"),
-                    details: error.to_string(),
+            }),
+            Self::Cran(repository) => {
+                let archive_support = match repository.archive_support() {
+                    ArchiveSupport::Available => crate::lockfile::ArchiveSupport::Available,
+                    ArchiveSupport::Unavailable => crate::lockfile::ArchiveSupport::Unavailable,
+                };
+                Ok(crate::lockfile::Repository::CranLike {
+                    url: repository.url().clone(),
+                    archive_support,
+                })
+            }
+            Self::Git(repository) => {
+                let commit = repository.commit().await?;
+                let url = reqwest::Url::try_from(repository.remote()).map_err(|source| {
+                    RepositoryError::Git {
+                        repository: repository.to_string(),
+                        source: Arc::new(source),
+                    }
                 })?;
+                let url = parse_repository_url(url.as_str())?;
+                let reference = match repository.reference() {
+                    None => crate::lockfile::GitReference::DefaultBranch,
+                    Some(reference) if is_commit_reference(reference, commit) => {
+                        crate::lockfile::GitReference::Commit
+                    }
+                    Some(value) => crate::lockfile::GitReference::Named {
+                        value: value.to_string(),
+                    },
+                };
+                let subdirectory = repository
+                    .subdirectory()
+                    .map(relative_path::RelativePathBuf::from_path)
+                    .transpose()
+                    .map_err(|error| RepositoryError::InvalidData {
+                        resource: format!("subdirectory in {repository}"),
+                        details: error.to_string(),
+                    })?;
 
-            return Ok(crate::lockfile::Repository::Git {
-                url,
-                reference,
-                commit,
-                subdirectory,
-            });
+                Ok(crate::lockfile::Repository::Git {
+                    url,
+                    reference,
+                    commit,
+                    subdirectory,
+                })
+            }
+            Self::Local(_) => Err(RepositoryError::InvalidData {
+                resource: "lockfile repository".to_string(),
+                details: format!("unsupported repository {self}"),
+            }),
         }
+    }
+}
 
-        Err(RepositoryError::InvalidData {
-            resource: "lockfile repository".to_string(),
-            details: format!("unsupported repository {self}"),
-        })
+impl From<cran_sdk::FetchError> for RepositoryError {
+    fn from(error: cran_sdk::FetchError) -> Self {
+        match error {
+            cran_sdk::FetchError::Request(source) => Self::Request {
+                source: Arc::new(source),
+            },
+            cran_sdk::FetchError::Response(source) => Self::Response {
+                source: Arc::new(source),
+            },
+        }
+    }
+}
+
+impl From<cran_sdk::DescriptionError> for RepositoryError {
+    fn from(error: cran_sdk::DescriptionError) -> Self {
+        match error {
+            cran_sdk::DescriptionError::Fetch(error) => error.into(),
+            cran_sdk::DescriptionError::Archive(source) => Self::Archive {
+                source: Arc::new(source),
+            },
+            cran_sdk::DescriptionError::DescriptionNotFound { package } => {
+                Self::DescriptionNotFound { package }
+            }
+        }
+    }
+}
+
+impl From<cran_sdk::PackagesError> for RepositoryError {
+    fn from(error: cran_sdk::PackagesError) -> Self {
+        match error {
+            cran_sdk::PackagesError::Fetch(error) => error.into(),
+            cran_sdk::PackagesError::Invalid(error) => Self::CranPackages(Box::new(
+                CranPackagesParseError::new("CRAN PACKAGES", error.text, error.findings),
+            )),
+        }
+    }
+}
+
+impl From<cran_sdk::ListingError> for RepositoryError {
+    fn from(error: cran_sdk::ListingError) -> Self {
+        match error {
+            cran_sdk::ListingError::Fetch(error) => error.into(),
+            error => Self::Cran(Arc::new(error)),
+        }
+    }
+}
+
+impl From<rrepo_sdk::FetchError> for RepositoryError {
+    fn from(error: rrepo_sdk::FetchError) -> Self {
+        match error {
+            rrepo_sdk::FetchError::Request(source) => Self::Request {
+                source: Arc::new(source),
+            },
+            rrepo_sdk::FetchError::Response(source) => Self::Response {
+                source: Arc::new(source),
+            },
+        }
+    }
+}
+
+fn discovery_failure(
+    url: String,
+    rrepo: RepositoryError,
+    cran: RepositoryError,
+) -> RepositoryError {
+    match cran {
+        error @ RepositoryError::CranPackages(_) => error,
+        cran => RepositoryError::UnrecognizedRepository {
+            url,
+            rrepo: Box::new(rrepo),
+            cran: Box::new(cran),
+        },
     }
 }
 
@@ -370,17 +381,201 @@ pub fn parse_repository_url(value: &str) -> Result<Url, RepositoryError> {
     Ok(url)
 }
 
-impl PartialEq for dyn PackageRepository {
+impl PartialEq for PackageRepository {
     fn eq(&self, other: &Self) -> bool {
-        self.equals(other)
+        match (self, other) {
+            (Self::Rrepo(a), Self::Rrepo(b)) => a.url() == b.url(),
+            (Self::Cran(a), Self::Cran(b)) => {
+                a.url() == b.url() && a.archive_support() == b.archive_support()
+            }
+            (Self::Git(a), Self::Git(b)) => {
+                a.remote() == b.remote()
+                    && a.reference() == b.reference()
+                    && a.subdirectory() == b.subdirectory()
+            }
+            (Self::Local(a), Self::Local(b)) => a.path() == b.path(),
+            _ => false,
+        }
     }
 }
 
-impl Eq for dyn PackageRepository {}
+impl Eq for PackageRepository {}
+
+impl Display for PackageRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cran(repo) => repo.fmt(f),
+            Self::Rrepo(repo) => repo.fmt(f),
+            Self::Git(repo) => repo.fmt(f),
+            Self::Local(repo) => repo.fmt(f),
+        }
+    }
+}
+
+impl From<Arc<LocalRepository>> for PackageRepository {
+    fn from(value: Arc<LocalRepository>) -> Self {
+        Self::Local(value)
+    }
+}
+impl From<Arc<GitRepository>> for PackageRepository {
+    fn from(value: Arc<GitRepository>) -> Self {
+        Self::Git(value)
+    }
+}
+impl From<Arc<RrepoRepository>> for PackageRepository {
+    fn from(value: Arc<RrepoRepository>) -> Self {
+        Self::Rrepo(value)
+    }
+}
+impl From<Arc<CranRepository>> for PackageRepository {
+    fn from(value: Arc<CranRepository>) -> Self {
+        Self::Cran(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rrepo_discovery_and_clones_reuse_the_fetched_index() {
+        let mut server = mockito::Server::new_async().await;
+        let index = server
+            .mock("GET", "/packages")
+            .with_status(200)
+            .with_body(r#"{"repositorySlug":"fixture","packages":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let repository = PackageRepository::from_url(server.url().parse().unwrap())
+            .await
+            .unwrap();
+        let clone = repository.clone();
+        assert!(repository.same_instance(&clone));
+        let PackageRepository::Rrepo(repo) = clone else {
+            panic!("expected rrepo")
+        };
+        assert!(repo.packages().await.unwrap().packages.is_empty());
+        index.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_remote_configuration_shares_discovery_without_losing_order() {
+        let mut server = mockito::Server::new_async().await;
+        let index = server
+            .mock("GET", "/packages")
+            .with_status(200)
+            .with_body(r#"{"repositorySlug":"fixture","packages":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let description = r_description::Description::parse(&format!(
+            "Package: root\nVersion: 1.0.0\nConfig/rpx/base-repository: {}\nAdditional_repositories: {}\n",
+            server.url(),
+            server.url()
+        ));
+        let repositories = crate::description::repositories_from_description(
+            std::path::Path::new("unused"),
+            &description,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repositories.len(), 2);
+        assert!(repositories[0].same_instance(&repositories[1]));
+        index.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cran_discovery_retains_its_validated_packages_index() {
+        let mut server = mockito::Server::new_async().await;
+        let _api = server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _archive = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(403)
+            .create_async()
+            .await;
+        let index = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_body("Package: example\nVersion: 1.0.0\n")
+            .expect(1)
+            .create_async()
+            .await;
+        let repository = PackageRepository::from_url(server.url().parse().unwrap())
+            .await
+            .unwrap();
+        let PackageRepository::Cran(repo) = repository else {
+            panic!("expected CRAN")
+        };
+        assert_eq!(repo.packages_index().await.unwrap().records().count(), 1);
+        assert_eq!(repo.archive_support(), ArchiveSupport::Unavailable);
+        index.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_cran_index_retains_its_positioned_diagnostic_during_discovery() {
+        use miette::Diagnostic;
+        let mut server = mockito::Server::new_async().await;
+        let _api = server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _archive = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _index = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_body("Package: example\nVersion: invalid\n")
+            .create_async()
+            .await;
+        let description = r_description::Description::parse(&format!(
+            "Package: root\nVersion: 1.0.0\nConfig/rpx/base-repository: {}\n",
+            server.url()
+        ));
+        let error = crate::description::repositories_from_description(
+            std::path::Path::new("unused"),
+            &description,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code().unwrap().to_string(),
+            "rpx::repository::cran_packages_parse_failed"
+        );
+        assert!(error.source_code().is_some());
+    }
+
+    #[tokio::test]
+    async fn local_overrides_are_instance_state_not_path_identity() {
+        let path = std::path::PathBuf::from("unused-local-source");
+        let first = PackageRepository::Local(Arc::new(
+            LocalRepository::new(path.clone()).with_description(r_description::Description::parse(
+                "Package: example\nVersion: 1.0.0\n",
+            )),
+        ));
+        let second =
+            PackageRepository::Local(Arc::new(LocalRepository::new(path).with_description(
+                r_description::Description::parse("Package: example\nVersion: 2.0.0\n"),
+            )));
+        assert_eq!(first, second);
+        assert!(!first.same_instance(&second));
+        let PackageRepository::Local(first) = first else {
+            unreachable!()
+        };
+        let PackageRepository::Local(second) = second else {
+            unreachable!()
+        };
+        assert_eq!(first.package().await.unwrap().1.to_string(), "1.0.0");
+        assert_eq!(second.package().await.unwrap().1.to_string(), "2.0.0");
+    }
 
     #[test]
     fn parses_canonical_repository_urls() {
@@ -397,5 +592,38 @@ mod tests {
             "https://example.test/"
         );
         assert!(parse_repository_url("mailto:packages@example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn sdk_canonical_urls_preserve_repository_lockfile_and_cache_identity() {
+        for (plain, trailing) in [
+            ("https://example.test/cran", "https://example.test/cran/"),
+            ("https://example.test", "https://example.test/"),
+        ] {
+            let cran = |url: &str| {
+                PackageRepository::Cran(Arc::new(
+                    CranRepository::new(url.parse().unwrap(), ArchiveSupport::Available).unwrap(),
+                ))
+            };
+            let rrepo = |url: &str| {
+                PackageRepository::Rrepo(Arc::new(
+                    RrepoRepository::new(url.parse().unwrap()).unwrap(),
+                ))
+            };
+            for (first, second) in [
+                (cran(plain), cran(trailing)),
+                (rrepo(plain), rrepo(trailing)),
+            ] {
+                assert_eq!(first, second);
+                assert_eq!(
+                    crate::cache::RegistryCacheKey::from_repository(&first),
+                    crate::cache::RegistryCacheKey::from_repository(&second)
+                );
+                let locked = first.to_lockfile().await.unwrap();
+                assert_eq!(locked, second.to_lockfile().await.unwrap());
+                assert_eq!(locked.url(), &parse_repository_url(trailing).unwrap());
+                assert_eq!(PackageRepository::from_lockfile(&locked).unwrap(), first);
+            }
+        }
     }
 }

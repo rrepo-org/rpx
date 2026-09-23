@@ -1,6 +1,7 @@
 use crate::{
     git::{GitOid, GitUrl},
     project::cache_dir_path,
+    repository::PackageRepository,
 };
 use r_metadata::Version;
 use semver::Version as RVersion;
@@ -17,14 +18,32 @@ const BINARY_ARTIFACT_CACHE_VERSION: &str = "v1";
 pub(crate) const INSTALLER_CACHE_VERSION: &str = "v1";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum RegistryIdentity {
-    Cran(Url),
-    Rrepo(Url),
+pub(crate) struct RegistryCacheKey {
+    // Preserve the v1 registry enum's discriminant encoding, without using a
+    // second repository enum for dispatch. These tags are part of the cache ABI.
+    kind: isize,
+    url: Url,
+}
+
+impl RegistryCacheKey {
+    pub(crate) fn from_repository(repository: &PackageRepository) -> Option<Self> {
+        match repository {
+            PackageRepository::Cran(repo) => Some(Self {
+                kind: 0,
+                url: repo.url().clone(),
+            }),
+            PackageRepository::Rrepo(repo) => Some(Self {
+                kind: 1,
+                url: repo.url().clone(),
+            }),
+            PackageRepository::Git(_) | PackageRepository::Local(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum SourceArtifactIdentity {
-    Registry(RegistryIdentity),
+    Registry(RegistryCacheKey),
     Git {
         remote: GitUrl,
         commit: GitOid,
@@ -42,7 +61,7 @@ pub(crate) struct SourceArtifactCacheKey {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct BinaryArtifactCacheKey {
-    repository: RegistryIdentity,
+    repository: RegistryCacheKey,
     package: String,
     version: Version,
     target: Triple,
@@ -65,7 +84,7 @@ impl SourceArtifactCacheKey {
 
 impl BinaryArtifactCacheKey {
     pub(crate) fn new(
-        repository: RegistryIdentity,
+        repository: RegistryCacheKey,
         package: impl Into<String>,
         version: Version,
         target: Triple,
@@ -123,6 +142,12 @@ pub(crate) fn installer_cache_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn cran(value: &str) -> RegistryCacheKey {
+        RegistryCacheKey {
+            kind: 0,
+            url: value.parse().unwrap(),
+        }
+    }
     use std::{
         fs,
         path::Path,
@@ -155,9 +180,7 @@ mod tests {
             .join(&package);
         remove_dir_if_present(&root);
         let key = SourceArtifactCacheKey::new(
-            SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
-                "https://example.test/cran".parse().unwrap(),
-            )),
+            SourceArtifactIdentity::Registry(cran("https://example.test/cran")),
             &package,
             "1.2.3".parse().unwrap(),
         );
@@ -180,9 +203,7 @@ mod tests {
     fn source_artifact_key_uses_version_equivalence() {
         let key = |version: &str| {
             SourceArtifactCacheKey::new(
-                SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
-                    "https://example.test/cran".parse().unwrap(),
-                )),
+                SourceArtifactIdentity::Registry(cran("https://example.test/cran")),
                 "package",
                 version.parse().unwrap(),
             )
@@ -199,16 +220,14 @@ mod tests {
 
     #[test]
     fn artifact_stores_use_distinct_compatibility_keys() {
-        let repository = || RegistryIdentity::Cran("https://example.test/cran".parse().unwrap());
+        let repository = || cran("https://example.test/cran");
         let source = source_artifact_cache_path(&SourceArtifactCacheKey::new(
             SourceArtifactIdentity::Registry(repository()),
             "package",
             "1.2.3".parse().unwrap(),
         ));
         let other_repository = source_artifact_cache_path(&SourceArtifactCacheKey::new(
-            SourceArtifactIdentity::Registry(RegistryIdentity::Cran(
-                "https://mirror.example.test/cran".parse().unwrap(),
-            )),
+            SourceArtifactIdentity::Registry(cran("https://mirror.example.test/cran")),
             "package",
             "1.2.3".parse().unwrap(),
         ));
@@ -243,5 +262,59 @@ mod tests {
     #[test]
     fn installer_cache_is_versioned() {
         assert!(installer_cache_path().ends_with("installer/v1"));
+    }
+
+    #[test]
+    fn registry_key_encoding_matches_pre_enum_refactor() {
+        #[derive(Hash)]
+        enum LegacyRegistry {
+            Cran(Url),
+            Rrepo(Url),
+        }
+        #[derive(Hash)]
+        #[allow(dead_code)]
+        enum LegacySource {
+            Registry(LegacyRegistry),
+            Git {
+                remote: GitUrl,
+                commit: GitOid,
+                subdirectory: Option<PathBuf>,
+            },
+            Local(PathBuf),
+        }
+        let url: Url = "https://example.test/repository".parse().unwrap();
+        [
+            (0, LegacyRegistry::Cran(url.clone())),
+            (1, LegacyRegistry::Rrepo(url.clone())),
+        ]
+        .into_iter()
+        .for_each(|(kind, old)| {
+            let new = RegistryCacheKey {
+                kind,
+                url: url.clone(),
+            };
+            assert_eq!(cache_key_digest(&old), cache_key_digest(&new));
+            let version: Version = "1.2.3".parse().unwrap();
+            let target: Triple = "x86_64-pc-windows-msvc".parse().unwrap();
+            let r_version: RVersion = "4.5.0".parse().unwrap();
+            assert_eq!(
+                cache_key_digest(&(&old, "package", &version, &target, &r_version)),
+                cache_key_digest(&BinaryArtifactCacheKey::new(
+                    new.clone(),
+                    "package",
+                    version.clone(),
+                    target,
+                    r_version
+                ))
+            );
+            assert_eq!(
+                cache_key_digest(&(LegacySource::Registry(old), "package", &version)),
+                cache_key_digest(&SourceArtifactCacheKey::new(
+                    SourceArtifactIdentity::Registry(new),
+                    "package",
+                    version
+                ))
+            );
+        });
     }
 }

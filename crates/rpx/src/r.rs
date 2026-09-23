@@ -459,7 +459,7 @@ mod tests {
         let digest = packages.get("digest").unwrap();
 
         assert_eq!(digest.version().to_string(), "0.6.37");
-        assert!(digest.repository().equals(built_in_repository().as_ref()));
+        assert_eq!(digest.repository(), &built_in_repository());
     }
 
     #[tokio::test]

@@ -341,7 +341,7 @@ pub enum DependencyMutationError {
     },
 }
 
-pub fn required_dependencies(
+pub(crate) fn declared_dependencies(
     source_name: impl Into<String>,
     description: &Description,
 ) -> Result<BTreeSet<Relation>, DescriptionParseError> {
@@ -354,7 +354,14 @@ pub fn required_dependencies(
             ("LinkingTo", description.linking_to_parsed()),
         ],
     )
-    .map(|dependencies| {
+}
+
+#[cfg(test)]
+pub(crate) fn required_dependencies(
+    source_name: impl Into<String>,
+    description: &Description,
+) -> Result<BTreeSet<Relation>, DescriptionParseError> {
+    declared_dependencies(source_name, description).map(|dependencies| {
         dependencies
             .into_iter()
             .filter(|relation| relation.package() != "R")
@@ -868,6 +875,10 @@ pub enum RepositoriesFromDescriptionError {
     #[diagnostic(transparent)]
     Configuration(#[from] DescriptionParseError),
 
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    InvalidMetadata(RepositoryError),
+
     #[error("failed to configure {kind} repository: {source}")]
     #[diagnostic(code(rpx::description::repository_configuration_failed))]
     Repository {
@@ -877,34 +888,54 @@ pub enum RepositoriesFromDescriptionError {
     },
 }
 
+impl RepositoriesFromDescriptionError {
+    fn remote(kind: &'static str, source: RepositoryError) -> Self {
+        match source {
+            source @ RepositoryError::CranPackages(_) => Self::InvalidMetadata(source),
+            source => Self::Repository { kind, source },
+        }
+    }
+}
+
 pub async fn repositories_from_description(
     path: &Path,
     description: &Description,
-) -> Result<Vec<Arc<dyn PackageRepository>>, RepositoriesFromDescriptionError> {
-    futures_util::future::join_all(configured_repositories(path, description)?.into_iter().map(
-        |repository| async move {
+) -> Result<Vec<PackageRepository>, RepositoriesFromDescriptionError> {
+    let configured = configured_repositories(path, description)?;
+    // Share discovery and its populated caches within this configuration load,
+    // while retaining every entry's original precedence position.
+    let discovered = moka::future::Cache::new(configured.len() as u64);
+    futures_util::future::join_all(configured.into_iter().map(|repository| {
+        let discovered = &discovered;
+        async move {
             match repository {
-                ConfiguredRepository::Base(url) => <dyn PackageRepository>::from_url(url)
+                ConfiguredRepository::Base(url) => discovered
+                    .try_get_with(url.clone(), Box::pin(PackageRepository::from_url(url)))
                     .await
-                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                        kind: "base",
-                        source,
+                    .map_err(|source| {
+                        RepositoriesFromDescriptionError::remote(
+                            "base",
+                            Arc::unwrap_or_clone(source),
+                        )
                     }),
                 ConfiguredRepository::Git(remote) => GitRepository::new(remote)
-                    .map(|repository| Arc::new(repository) as Arc<dyn PackageRepository>)
+                    .map(|repository| PackageRepository::Git(Arc::new(repository)))
                     .map_err(|source| RepositoriesFromDescriptionError::Repository {
                         kind: "Git",
                         source,
                     }),
-                ConfiguredRepository::Additional(url) => <dyn PackageRepository>::from_url(url)
+                ConfiguredRepository::Additional(url) => discovered
+                    .try_get_with(url.clone(), Box::pin(PackageRepository::from_url(url)))
                     .await
-                    .map_err(|source| RepositoriesFromDescriptionError::Repository {
-                        kind: "additional",
-                        source,
+                    .map_err(|source| {
+                        RepositoriesFromDescriptionError::remote(
+                            "additional",
+                            Arc::unwrap_or_clone(source),
+                        )
                     }),
             }
-        },
-    ))
+        }
+    }))
     .await
     .into_iter()
     .collect()
