@@ -93,6 +93,16 @@ pub(crate) async fn sync_resolved_project(
     resolution: ProjectResolution,
     project_package: ProjectPackageMode,
 ) -> Result<(), SyncError> {
+    sync_resolved_project_with_progress(project, resolution, project_package, |_, _| {}).await
+}
+
+/// Reports completed and total package installations, starting with zero completed.
+pub(crate) async fn sync_resolved_project_with_progress(
+    project: &Project,
+    resolution: ProjectResolution,
+    project_package: ProjectPackageMode,
+    mut report: impl FnMut(u64, u64),
+) -> Result<(), SyncError> {
     let desired = desired_packages(project, resolution.packages, project_package)?;
     let library = ensure_project_library(&project.root)?;
     let target = SyncTarget::inspect(library, resolution.r_version).await?;
@@ -107,6 +117,7 @@ pub(crate) async fn sync_resolved_project(
     );
     let plan = span.in_scope(|| SyncPlan::prepare(desired, target))?;
     let total = plan.install_count() as u64;
+    report(0, total);
     span.record("total", total);
     span.record("pending", total);
     span.pb_set_style(&progress_count_style());
@@ -122,6 +133,7 @@ pub(crate) async fn sync_resolved_project(
             span.record("completed", completed);
             span.record("pending", total - completed);
             span.pb_set_position(completed);
+            report(completed, total);
         })
         .instrument(span.clone())
         .await;

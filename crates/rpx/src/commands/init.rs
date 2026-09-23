@@ -12,7 +12,7 @@ use crate::{
         pin_unconstrained_dependencies, resolve_project, write_project_files,
     },
     repository::parse_repository_url,
-    sync::{ProjectPackageMode, SyncError, sync_resolved_project},
+    sync::{ProjectPackageMode, SyncError, sync_resolved_project_with_progress},
     ui::is_interactive,
 };
 use miette::Diagnostic;
@@ -479,12 +479,30 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
     write_development_setup(&target, &package_name, project_type, &development_packages)?;
-    with_spinner(
-        interactive,
-        "Install packages",
-        sync_resolved_project(&project, resolution, ProjectPackageMode::Install),
+    let progress = interactive.then(|| cliclack::progress_bar(0));
+    if let Some(progress) = &progress {
+        progress.start("Install packages");
+    }
+    let result = sync_resolved_project_with_progress(
+        &project,
+        resolution,
+        ProjectPackageMode::Install,
+        |completed, total| {
+            if let Some(progress) = &progress {
+                progress.set_length(total);
+                progress.set_position(completed);
+            }
+        },
     )
-    .await?;
+    .await;
+    if let Some(progress) = progress {
+        if result.is_ok() {
+            progress.stop("Packages installed");
+        } else {
+            progress.error("Install packages failed");
+        }
+    }
+    result?;
     let initialize_git = if interactive {
         prompt_for_git_repository(&target)?
     } else {
