@@ -1,12 +1,13 @@
 //! Package operations and their native inputs, outputs, and failures.
 //! These functions do not depend on the graph runner or sync orchestration.
+pub(super) use super::source_archive::BuildRequest;
+use super::source_archive::{ArchiveEntry, artifact_digest};
 use crate::{
     cache::{
         BinaryArtifactCacheKey, INSTALLER_CACHE_VERSION, RegistryCacheKey, SourceArtifactCacheKey,
         SourceArtifactIdentity, binary_artifact_cache_path, source_artifact_cache_path,
     },
-    http,
-    r::{self, build_package_archive},
+    http, r,
     repository::{GitRepository, PackageRepository, RepositoryError},
     resolver::PackageVersion,
     ui::{progress_bar_style, progress_spinner_style},
@@ -20,8 +21,6 @@ use r_package_installer::{
 };
 use sha2::{Digest as _, Sha256};
 use std::{
-    fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -78,46 +77,19 @@ impl PreparedArtifact {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct BuildInput {
-    package_root: PathBuf,
-    archive_path: PathBuf,
-    package: String,
-    version: Version,
-    local: bool,
-}
-
-impl BuildInput {
-    pub fn local(package_root: PathBuf, package: String, version: Version) -> Self {
-        let archive_path = source_artifact_cache_path(&SourceArtifactCacheKey::new(
-            SourceArtifactIdentity::Local(package_root.clone()),
-            &package,
-            version.clone(),
-        ));
-        Self {
-            package_root,
-            archive_path,
-            package,
-            version,
-            local: true,
-        }
-    }
-}
-
-pub(super) async fn build(
-    input: Arc<BuildInput>,
+pub(super) async fn build_local(
+    request: BuildRequest,
 ) -> Result<PreparedArtifact, r::PackageBuildError> {
-    let fingerprint = if input.local {
-        local_fingerprint(&input.package_root).await?
-    } else {
-        None
-    };
-    let reusable = !input.local || fingerprint.is_some();
+    let fingerprint = local_fingerprint(&request.package_root).await?;
+    let base_path = source_artifact_cache_path(&SourceArtifactCacheKey::new(
+        SourceArtifactIdentity::Local(request.package_root.clone()),
+        &request.package,
+        request.version.clone(),
+    ));
     let archive_path = fingerprint.as_ref().map_or_else(
-        || input.archive_path.clone(),
+        || base_path.clone(),
         |digest| {
-            input
-                .archive_path
+            base_path
                 .parent()
                 .unwrap()
                 .join("content-v1")
@@ -125,94 +97,31 @@ pub(super) async fn build(
                 .join("artifact.tar.gz")
         },
     );
-    // The OS releases the lock on cancellation or process exit. Always recheck
-    // after acquiring it: another process may have published while we waited.
-    let lock_path = archive_path.with_extension("lock");
-    let _lock = tokio::task::spawn_blocking(move || {
-        fs::create_dir_all(lock_path.parent().unwrap())?;
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)?;
-        lock.lock()?;
-        Ok::<_, std::io::Error>(lock)
+    let archive = ArchiveEntry::new(archive_path).lock().await?;
+    let Some(fingerprint) = fingerprint else {
+        // Unsupported trees always rebuild; never look up this fallback entry.
+        return Ok(PreparedArtifact::Source {
+            path: archive.build(&request).await?.publish().await?,
+        });
+    };
+    verify_local_fingerprint(&request.package_root, &fingerprint).await?;
+    if let Some(path) = archive.lookup().await {
+        return Ok(PreparedArtifact::Source { path });
+    }
+    let candidate = archive.build(&request).await?;
+    verify_local_fingerprint(&request.package_root, &fingerprint).await?;
+    Ok(PreparedArtifact::Source {
+        path: candidate.publish().await?,
     })
-    .await
-    .map_err(std::io::Error::other)
-    .and_then(|result| result)
-    .map_err(|source| r::PackageBuildError::Cache {
-        path: archive_path.clone(),
-        source,
-    })?;
-    if input.local
-        && fingerprint.is_some()
-        && local_fingerprint(&input.package_root).await? != fingerprint
-    {
-        return Err(r::PackageBuildError::SourceChanged {
-            path: input.package_root.clone(),
-        });
-    }
-    if reusable && valid_built_archive(&archive_path).await {
-        return Ok(PreparedArtifact::Source { path: archive_path });
-    }
-    // Publish only after checking that the local inputs are still unchanged.
-    let candidate = tempfile::TempPath::try_from_path(
-        archive_path.with_extension("pending.tar.gz"),
-    )
-    .map_err(|source| r::PackageBuildError::Cache {
-        path: archive_path.clone(),
-        source,
-    })?;
-    build_package_archive(
-        &input.package_root,
-        &input.package,
-        input.version.as_ref(),
-        &candidate,
-    )
-    .await?;
-    if input.local
-        && fingerprint.is_some()
-        && local_fingerprint(&input.package_root).await? != fingerprint
-    {
-        return Err(r::PackageBuildError::SourceChanged {
-            path: input.package_root.clone(),
-        });
-    }
-    candidate
-        .persist(&archive_path)
-        .map_err(|error| error.error)
-        .map_err(|source| r::PackageBuildError::PublishArchive {
-            path: archive_path.clone(),
-            source,
-        })?;
-    if reusable {
-        let path = archive_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let digest = artifact_digest(&path)?;
-            fs::write(path.with_extension("sha256"), digest.as_bytes())
-        })
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(|result| result)
-        .map_err(|source| r::PackageBuildError::Cache {
-            path: archive_path.clone(),
-            source,
-        })?;
-    }
-    Ok(PreparedArtifact::Source { path: archive_path })
 }
 
-async fn valid_built_archive(path: &Path) -> bool {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let Ok(expected) = fs::read(path.with_extension("sha256")) else {
-            return false;
-        };
-        artifact_digest(&path).is_ok_and(|digest| expected == digest.as_bytes())
-    })
-    .await
-    .unwrap_or(false)
+async fn verify_local_fingerprint(root: &Path, expected: &str) -> Result<(), r::PackageBuildError> {
+    if local_fingerprint(root).await?.as_deref() != Some(expected) {
+        return Err(r::PackageBuildError::SourceChanged {
+            path: root.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 async fn local_fingerprint(root: &Path) -> Result<Option<String>, r::PackageBuildError> {
@@ -246,15 +155,26 @@ pub(crate) enum CheckoutError {
 #[derive(Debug)]
 pub(super) enum CheckoutOutput {
     Cached(PathBuf),
-    Build(Arc<BuildInput>),
+    Build {
+        request: BuildRequest,
+        archive: ArchiveEntry,
+    },
 }
 
-pub(super) async fn build_checkout(
+pub(super) async fn build_git(
     input: Arc<CheckoutOutput>,
 ) -> Result<PreparedArtifact, r::PackageBuildError> {
     match input.as_ref() {
         CheckoutOutput::Cached(path) => Ok(PreparedArtifact::Source { path: path.clone() }),
-        CheckoutOutput::Build(input) => build(input.clone()).await,
+        CheckoutOutput::Build { request, archive } => {
+            let archive = archive.lock().await?;
+            if let Some(path) = archive.lookup().await {
+                return Ok(PreparedArtifact::Source { path });
+            }
+            Ok(PreparedArtifact::Source {
+                path: archive.build(request).await?.publish().await?,
+            })
+        }
     }
 }
 
@@ -279,8 +199,9 @@ pub(super) async fn checkout(
         &package,
         version.clone(),
     ));
-    if valid_built_archive(&archive_path).await {
-        return Ok(CheckoutOutput::Cached(archive_path));
+    let archive = ArchiveEntry::new(archive_path);
+    if let Some(path) = archive.lookup().await {
+        return Ok(CheckoutOutput::Cached(path));
     }
     let checkout = repository
         .checkout()
@@ -292,13 +213,14 @@ pub(super) async fn checkout(
     let package_root = repository
         .subdirectory()
         .map_or_else(|| checkout.clone(), |path| checkout.join(path));
-    Ok(CheckoutOutput::Build(Arc::new(BuildInput {
-        package_root,
-        archive_path,
-        package,
-        version,
-        local: false,
-    })))
+    Ok(CheckoutOutput::Build {
+        request: BuildRequest {
+            package_root,
+            package,
+            version,
+        },
+        archive,
+    })
 }
 
 /// Common error at the graph boundary. The operations themselves return narrower
@@ -800,20 +722,6 @@ pub(super) async fn install_package(
     .await
 }
 
-fn artifact_digest(path: &Path) -> Result<InstallerDigest, std::io::Error> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(InstallerDigest::from_bytes(hasher.finalize().into()))
-}
-
 fn installer_build_key(
     artifact: &PreparedArtifact,
     artifact_digest: InstallerDigest,
@@ -963,7 +871,7 @@ async fn publish_artifact_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, fs};
 
     #[tokio::test]
     async fn checkout_output_carries_the_pinned_tree_and_archive_destination() {
@@ -982,13 +890,13 @@ mod tests {
         let input = checkout(repository, "example".into(), "1.0.0".parse().unwrap())
             .await
             .unwrap();
-        let CheckoutOutput::Build(input) = input else {
+        let CheckoutOutput::Build { request, archive } = input else {
             panic!("uncached commit should need a build");
         };
-        let description = fs::read_to_string(input.package_root.join("DESCRIPTION")).unwrap();
+        let description = fs::read_to_string(request.package_root.join("DESCRIPTION")).unwrap();
         assert!(description.contains("Version: 1.0.0"));
         assert_eq!(
-            input.archive_path,
+            archive.path(),
             source_artifact_cache_path(&SourceArtifactCacheKey::new(
                 SourceArtifactIdentity::Git {
                     remote,
@@ -1032,8 +940,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let artifact = build_checkout(Arc::new(output)).await.unwrap();
+        let artifact = build_git(Arc::new(output)).await.unwrap();
         assert_eq!(artifact.path(), archive);
+        // A competing build may publish after checkout. The Git build operation
+        // must recheck under its lock before attempting to use this missing tree.
+        let pending = CheckoutOutput::Build {
+            request: BuildRequest {
+                package_root: directory.path().join("missing-checkout"),
+                package: "example".into(),
+                version: "1.0.0".parse().unwrap(),
+            },
+            archive: ArchiveEntry::new(archive.clone()),
+        };
+        assert_eq!(build_git(Arc::new(pending)).await.unwrap().path(), archive);
         for other in [
             repository
                 .clone()
@@ -1079,14 +998,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("not-a-directory");
         fs::write(&file, "occupied").unwrap();
-        let input = Arc::new(BuildInput {
-            package_root: directory.path().to_path_buf(),
-            archive_path: file.join("archive.tar.gz"),
-            package: "example".into(),
-            version: "1.0.0".parse().unwrap(),
-            local: false,
+        let input = Arc::new(CheckoutOutput::Build {
+            request: BuildRequest {
+                package_root: directory.path().to_path_buf(),
+                package: "example".into(),
+                version: "1.0.0".parse().unwrap(),
+            },
+            archive: ArchiveEntry::new(file.join("archive.tar.gz")),
         });
-        let error = build(input).await.unwrap_err();
+        let error = build_git(input).await.unwrap_err();
         assert!(matches!(error, r::PackageBuildError::Cache { .. }));
     }
 

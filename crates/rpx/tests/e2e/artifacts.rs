@@ -93,6 +93,32 @@ fn concurrent_local_builds_share_one_completed_archive() {
 
 #[cfg(unix)]
 #[test]
+fn local_symlink_inputs_always_rebuild() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    write_source(&f.project, "first");
+    let external = f.root.join("external.R");
+    let source = f.project.join("R/value.R");
+    fs::rename(&source, &external).unwrap();
+    symlink(&external, &source).unwrap();
+    f.success(&f.project, &["lock"]);
+    f.success(&f.project, &["sync"]);
+    f.r_assert(
+        &f.project,
+        "stopifnot(artifactpkg::artifact_value() == 'first')",
+    );
+    fs::write(&external, "artifact_value <- function() 'other'\n").unwrap();
+    f.success(&f.project, &["sync"]);
+    f.r_assert(
+        &f.project,
+        "stopifnot(artifactpkg::artifact_value() == 'other')",
+    );
+    f.assert_no_staging();
+    f.close();
+}
+
+#[cfg(unix)]
+#[test]
 fn local_source_changes_during_build_are_not_published() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();

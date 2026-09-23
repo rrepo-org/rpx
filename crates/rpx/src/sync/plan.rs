@@ -1,7 +1,7 @@
 //! Reconcile package snapshots, assemble the workflow, and report package progress.
 //! Graph IDs, resources, and operation metadata stay inside this module.
 
-use super::operations::{self, BuildInput, DependencyInput, OperationError, PreparedArtifact};
+use super::operations::{self, BuildRequest, DependencyInput, OperationError, PreparedArtifact};
 use crate::{
     cache::installer_cache_path,
     project::RequiredPackages,
@@ -356,8 +356,12 @@ impl Assembly {
             PackageRepository::Local(local) => {
                 let root = local.path().to_path_buf();
                 self.register(package, TaskKind::Build, (), move |()| async move {
-                    let input = Arc::new(BuildInput::local(root, name.clone(), version));
-                    operations::build(input)
+                    let request = BuildRequest {
+                        package_root: root,
+                        package: name.clone(),
+                        version,
+                    };
+                    operations::build_local(request)
                         .await
                         .map_err(|source| OperationError::Build {
                             package: name,
@@ -380,12 +384,12 @@ impl Assembly {
                     })?;
                 let name = package.to_string();
                 self.register(package, TaskKind::Build, source, move |input| async move {
-                    operations::build_checkout(input).await.map_err(|source| {
-                        OperationError::Build {
+                    operations::build_git(input)
+                        .await
+                        .map_err(|source| OperationError::Build {
                             package: name,
                             source: Box::new(source),
-                        }
-                    })
+                        })
                 })
             }
             PackageRepository::Cran(_) | PackageRepository::Rrepo(_) => {
