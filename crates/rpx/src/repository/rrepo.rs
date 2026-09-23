@@ -69,22 +69,13 @@ impl RrepoRepository {
                     .await
                     .map_err(RepositoryError::from)?;
 
-                response
-                    .versions
-                    .into_iter()
-                    .map(|summary| {
-                        summary.version.parse::<Version>().map_err(|source| {
-                            RepositoryError::InvalidData {
-                                resource: format!(
-                                    "package version {} for {package}",
-                                    summary.version
-                                ),
-                                details: source.to_string(),
-                            }
-                        })
-                    })
-                    .collect::<Result<BTreeSet<_>, RepositoryError>>()
-                    .map(Arc::new)
+                Ok::<_, RepositoryError>(Arc::new(
+                    response
+                        .versions
+                        .into_iter()
+                        .map(|summary| summary.version)
+                        .collect(),
+                ))
             })
             .await
             .map_err(Arc::unwrap_or_clone)?;

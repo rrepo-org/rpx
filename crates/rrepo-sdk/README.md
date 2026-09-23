@@ -31,7 +31,8 @@ The application remains responsible for scoping its own caches appropriately.
 ## Surface
 
 - `packages`: native package-index response, including summary fields.
-- `versions`: native version response, retaining source URLs.
+- `versions`: typed `r_metadata::Version` values with their original spelling,
+  retaining source URLs. Invalid versions fail response deserialization.
 - `description`: parsed version-specific DESCRIPTION.
 - `source`: unconsumed source artifact response.
 - `binary`: an unconsumed Windows/macOS artifact response selected by a

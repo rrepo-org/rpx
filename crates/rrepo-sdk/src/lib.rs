@@ -60,9 +60,18 @@ pub struct VersionsResponse {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct VersionSummary {
-    pub version: String,
+    #[serde(deserialize_with = "deserialize_version")]
+    pub version: Version,
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
+}
+
+fn deserialize_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Version, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone)]

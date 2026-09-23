@@ -5,6 +5,29 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[tokio::test]
+async fn version_summaries_deserialize_native_versions_and_reject_invalid_values() {
+    let mut server = mockito::Server::new_async().await;
+    let repository = Repository::new(server.url().parse().unwrap()).unwrap();
+    let client = reqwest::Client::new().into();
+    let valid = server.mock("GET", "/packages/example/versions")
+        .with_body(r#"{"package":"example","versions":[{"version":"01.0-2","sourceUrl":"https://example.test/source"}]}"#)
+        .create_async().await;
+    let response = repository.versions(&client, "example").await.unwrap();
+    assert_eq!(response.versions[0].version.as_str(), "01.0-2");
+    assert_eq!(
+        response.versions[0].version,
+        "1.0.2".parse::<Version>().unwrap()
+    );
+    let invalid = server.mock("GET", "/packages/invalid/versions")
+        .with_body(r#"{"package":"invalid","versions":[{"version":"not-a-version","sourceUrl":"https://example.test/source"}]}"#)
+        .create_async().await;
+    assert!(matches!(repository.versions(&client, "invalid").await,
+        Err(FetchError::Response(error)) if error.is_decode()));
+    valid.assert_async().await;
+    invalid.assert_async().await;
+}
+
 struct Mark(Arc<AtomicUsize>);
 #[async_trait::async_trait]
 impl Middleware for Mark {
