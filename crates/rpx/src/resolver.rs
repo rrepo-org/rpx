@@ -7,7 +7,7 @@ use r_description::Description;
 use r_metadata::{Relation, RequirementVersion, Version, VersionRequirement};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -20,7 +20,14 @@ use crate::{
     repository::{LocalRepository, PackageRepository, RepositoryError, built_in_repository},
 };
 
+pub(crate) mod report;
+
 const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
+
+// Only fully enumerated repository listings are recorded. A latest-version lookup
+// alone cannot establish which versions are available for reporting.
+type VersionListings = Mutex<BTreeMap<String, BTreeMap<usize, BTreeSet<PackageVersion>>>>;
+
 #[derive(Debug, Clone, Error)]
 pub(crate) enum ProviderError {
     #[error(transparent)]
@@ -36,6 +43,9 @@ pub(crate) enum ProviderError {
 
 #[derive(Debug, Error)]
 pub(crate) enum ResolutionError {
+    #[error(transparent)]
+    NoSolution(Box<report::ResolutionReport>),
+
     #[error(transparent)]
     BasePackages(#[from] BasePackagesError),
 
@@ -112,6 +122,7 @@ pub(crate) struct RDependencyProvider {
     preferred_versions: BTreeMap<String, Version>,
     base_packages: BTreeSet<String>,
     description_prefetch_permits: Arc<Semaphore>,
+    version_listings: VersionListings,
 }
 
 impl RDependencyProvider {
@@ -131,6 +142,7 @@ impl RDependencyProvider {
             preferred_versions,
             base_packages,
             description_prefetch_permits: Arc::new(Semaphore::new(DESCRIPTION_PREFETCH_WORKERS)),
+            version_listings: Mutex::default(),
         }
     }
 
@@ -173,6 +185,7 @@ impl RDependencyProvider {
                         &preferred_versions,
                         &package,
                         &range,
+                        None,
                     )
                     .await
                     {
@@ -273,6 +286,7 @@ impl DependencyProvider for RDependencyProvider {
             &self.preferred_versions,
             package,
             range,
+            Some(&self.version_listings),
         ))
     }
 
@@ -324,6 +338,7 @@ async fn choose_package_version(
     preferred_versions: &BTreeMap<String, Version>,
     package: &str,
     range: &Ranges<PackageVersion>,
+    listings: Option<&VersionListings>,
 ) -> Result<Option<PackageVersion>, ProviderError> {
     let preferred = preferred_versions.get(package).filter(|preferred| {
         range.contains(&PackageVersion::new(
@@ -334,8 +349,17 @@ async fn choose_package_version(
 
     let candidates = futures_util::future::join_all(repositories.iter().enumerate().map(
         |(repository_index, repository)| async move {
-            let version =
+            let (version, listing) =
                 choose_repository_version(repository.as_ref(), package, range, preferred).await?;
+
+            if let (Some(listings), Some(listing)) = (listings, listing) {
+                listings
+                    .lock()
+                    .expect("version listings lock poisoned")
+                    .entry(package.to_owned())
+                    .or_default()
+                    .insert(repository_index, listing);
+            }
 
             Ok::<_, ProviderError>(version.map(|version| (version, repository_index)))
         },
@@ -369,34 +393,37 @@ async fn choose_repository_version(
     package: &str,
     range: &Ranges<PackageVersion>,
     preferred: Option<&Version>,
-) -> Result<Option<PackageVersion>, ProviderError> {
+) -> Result<(Option<PackageVersion>, Option<BTreeSet<PackageVersion>>), ProviderError> {
     let packages = repository.packages().await?;
 
     let Some(latest) = packages.get(package).cloned() else {
-        return Ok(None);
+        return Ok((None, Some(BTreeSet::new())));
     };
 
     if preferred.is_some_and(|preferred| latest.version() == preferred) && range.contains(&latest) {
-        return Ok(Some(latest));
+        return Ok((Some(latest), None));
     }
 
     if preferred.is_none() && range.contains(&latest) {
-        return Ok(Some(latest));
+        return Ok((Some(latest), None));
     }
 
-    let versions = repository.versions(package).await?;
+    let mut versions = repository.versions(package).await?;
+    versions.insert(latest);
     if let Some(preferred) = preferred
         && let Some(version) = versions
             .iter()
             .find(|version| version.version() == preferred && range.contains(version))
     {
-        return Ok(Some(version.clone()));
+        return Ok((Some(version.clone()), Some(versions)));
     }
 
-    Ok(std::iter::once(latest)
-        .chain(versions)
+    let selected = versions
+        .iter()
         .filter(|version| range.contains(version))
-        .max())
+        .max()
+        .cloned();
+    Ok((selected, Some(versions)))
 }
 
 fn package_version_range_from_relation(relation: &Relation) -> Ranges<PackageVersion> {
@@ -471,9 +498,29 @@ pub(crate) async fn resolve_from_registry(
             base_packages,
         );
 
-        let selected = resolve(&provider, root_package, root_version)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+        let solution = match resolve(&provider, root_package.clone(), root_version.clone()) {
+            Ok(solution) => solution,
+            Err(PubGrubError::NoSolution(tree)) => {
+                let mut versions = provider
+                    .version_listings
+                    .lock()
+                    .expect("version listings lock poisoned")
+                    .iter()
+                    .filter(|(_, listings)| listings.len() == provider.repositories.len())
+                    .map(|(package, listings)| {
+                        (package.clone(), listings.values().flatten().cloned().collect())
+                    })
+                    .collect::<BTreeMap<_, BTreeSet<_>>>();
+                versions.insert(root_package.clone(), BTreeSet::from([root_version]));
+                return Err(ResolutionError::NoSolution(Box::new(report::render(
+                    tree,
+                    Some(root_package),
+                    versions,
+                ))));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let selected = solution.into_iter().collect::<BTreeMap<_, _>>();
         resolve_span.record("selected", selected.len());
 
         Ok::<_, ResolutionError>(selected)
@@ -702,6 +749,56 @@ mod tests {
         assert!(dependencies.contains_key("cli"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_metadata_rejections_have_one_explanation() {
+        let mut metadata = TestRepository::empty("metadata");
+        for major in 1..=30 {
+            let version = Version::from_str(&format!("{major}.0.0")).unwrap();
+            metadata.descriptions.insert(
+                ("AzureStor".into(), version),
+                Arc::new(Description::parse(&format!(
+                    "Package: AzureStor\nVersion: {major}.0.0\nDepends: cli (>= invalid)\n"
+                ))),
+            );
+        }
+        let metadata: Arc<dyn PackageRepository> = Arc::new(metadata);
+        let versions = (1..=30)
+            .map(|major| version(&format!("{major}.0.0"), Arc::clone(&metadata)))
+            .collect::<BTreeSet<_>>();
+        let mut repository = TestRepository::empty("index");
+        repository
+            .packages
+            .insert("AzureStor".into(), versions.last().unwrap().clone());
+        repository.versions.insert("AzureStor".into(), versions);
+
+        let error = resolve_from_registry(
+            vec![Arc::new(repository)],
+            local_repository("project", "1.0.0"),
+            ProjectType::Package,
+            BTreeSet::from([Relation::any("AzureStor").unwrap()]),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+        let ResolutionError::NoSolution(report) = error else {
+            panic!("expected a no-solution report: {error}");
+        };
+        assert_eq!(
+            report.explanation.matches("invalid dependency metadata").count(),
+            1,
+            "{report}"
+        );
+        assert!(
+            report.explanation.contains("all available versions of AzureStor"),
+            "{report}"
+        );
+        assert!(
+            report.explanation.contains("your project requires AzureStor"),
+            "{report}"
+        );
+        assert!(report.explanation.len() < 500, "{report}");
+    }
+
     #[test]
     fn intersects_transitive_constraints_across_dependency_fields() {
         let description = Description::parse(
@@ -799,6 +896,7 @@ mod tests {
             &BTreeMap::from([("example".to_string(), preferred)]),
             "example",
             &Ranges::full(),
+            None,
         )
         .await
         .expect("version selection should succeed")
@@ -846,6 +944,7 @@ mod tests {
             )]),
             "example",
             &Ranges::full(),
+            None,
         )
         .await
         .expect("version selection should succeed")
@@ -887,6 +986,7 @@ mod tests {
             &BTreeMap::new(),
             "example",
             &Ranges::full(),
+            None,
         )
         .await
         .expect("version selection should succeed")
@@ -1097,10 +1197,7 @@ mod tests {
         .await
         .expect_err("dependency on project namespace should be unsatisfiable");
 
-        assert!(matches!(
-            error,
-            ResolutionError::PubGrub(PubGrubError::NoSolution(_))
-        ));
+        assert!(matches!(error, ResolutionError::NoSolution(_)));
         assert!(
             !remote_repository
                 .version_queries
