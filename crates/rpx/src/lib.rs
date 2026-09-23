@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::IsTerminal;
 use tracing_indicatif::{
     filter::{IndicatifFilter, hide_indicatif_span_fields},
     style::ProgressStyle,
@@ -38,12 +39,14 @@ use ui::progress_spinner_style;
 ///
 /// Returns an error when command execution or diagnostic rendering fails.
 pub async fn run() -> miette::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+    let interactive_init = matches!(&cli.command, Commands::Init(_))
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    init_tracing(!interactive_init);
 
     match cli.command {
-        Commands::Init(args) => init::run(args).await?,
+        Commands::Init(args) => init::run(args, interactive_init).await?,
         Commands::Add(args) => add::run(args).await?,
         Commands::Remove(args) => remove::run(args).await?,
         Commands::Run(args) => run_command::run(args).await?,
@@ -57,7 +60,7 @@ pub async fn run() -> miette::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(show_progress: bool) {
     let indicatif_layer = tracing_indicatif::IndicatifLayer::new()
         .with_span_field_formatter(hide_indicatif_span_fields(DefaultFields::new()))
         .with_progress_style(progress_spinner_style())
@@ -76,7 +79,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
-        .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
+        .with(show_progress.then(|| indicatif_layer.with_filter(IndicatifFilter::new(false))))
         .try_init();
 }
 
