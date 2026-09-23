@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added repeatable `rpx init --with` development-tool selection, testthat starter tests, and roxygen2 package configuration. Testthat setup is available only for R packages.
+
 ## [2.0.1]
 
 ### Fixed

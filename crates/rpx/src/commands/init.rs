@@ -1,5 +1,5 @@
 use crate::{
-    cli::{InitArgs, InitLicense, InitProjectType},
+    cli::{InitArgs, InitDevelopmentPackage as DevelopmentPackage, InitLicense, InitProjectType},
     description::{
         DependencyField, DependencyMutationError, DescriptionNormalizationError,
         NamespaceWriteError, ProjectType, add_dependencies, normalize_description,
@@ -15,7 +15,7 @@ use crate::{
     sync::{ProjectPackageMode, SyncError, sync_resolved_project},
 };
 use miette::Diagnostic;
-use r_description::{Description, EditError, LogicalValue};
+use r_description::{Description, EditError, FieldName, LogicalValue};
 use r_metadata::Relation;
 use std::{
     collections::BTreeSet,
@@ -33,6 +33,20 @@ const CRAN_REPOSITORY_URL: &str = "https://cloud.r-project.org/";
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
+    #[error("testthat setup requires an R package")]
+    #[diagnostic(
+        code(rpx::init::testthat_requires_package),
+        help("Use `--type package`, or omit `--with testthat`.")
+    )]
+    TestthatRequiresPackage,
+
+    #[error("failed to write development setup at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::init::development_setup_failed))]
+    DevelopmentSetup {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to determine the current working directory: {0}")]
     #[diagnostic(
         code(rpx::init::working_directory_unavailable),
@@ -181,13 +195,6 @@ pub(crate) enum Error {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Sync(#[from] SyncError),
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DevelopmentPackage {
-    Testthat,
-    Roxygen2,
-    Devtools,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -367,6 +374,7 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
         None if interactive => prompt_for_project_type()?,
         None => InitProjectType::Package,
     };
+    validate_development_packages(project_type, &args.development_packages)?;
 
     let package_name = match args.name {
         Some(package_name) => {
@@ -413,10 +421,10 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
     } else {
         BaseRepository::Rrepo
     };
-    let development_packages = if interactive {
-        prompt_for_development_packages()?
+    let development_packages = if interactive && args.development_packages.is_empty() {
+        prompt_for_development_packages(project_type)?
     } else {
-        Vec::new()
+        args.development_packages
     };
     let initialize_git = if interactive {
         prompt_for_git_repository(&target)?
@@ -435,6 +443,7 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
     });
     set_project_type(&mut description, project_type.into())?;
     configure_base_repository(&mut description, base_repository)?;
+    configure_development_packages(&mut description, project_type, &development_packages)?;
     let development_relations = development_relations(&development_packages);
     add_dependencies(
         &target,
@@ -473,6 +482,7 @@ pub(crate) async fn run(args: InitArgs, interactive: bool) -> Result<(), Error> 
     write_namespace_if_missing(&target)?;
     write_rbuildignore(&target)?;
     write_license_files(&target, license, &author_name)?;
+    write_development_setup(&target, &package_name, project_type, &development_packages)?;
     with_spinner(
         interactive,
         "Install packages",
@@ -768,19 +778,28 @@ fn configure_base_repository(
     Ok(())
 }
 
-fn prompt_for_development_packages() -> Result<Vec<DevelopmentPackage>, Error> {
-    Ok(cliclack::multiselect("Development packages")
-        .item(DevelopmentPackage::Testthat, "testthat", "Unit testing")
-        .item(
-            DevelopmentPackage::Roxygen2,
-            "roxygen2",
-            "Documentation generation",
-        )
-        .item(
-            DevelopmentPackage::Devtools,
-            "devtools",
-            "Package development toolkit",
-        )
+fn development_package_choices(project_type: InitProjectType) -> Vec<DevelopmentPackage> {
+    let mut packages = Vec::new();
+    if project_type == InitProjectType::Package {
+        packages.push(DevelopmentPackage::Testthat);
+    }
+    packages.extend([DevelopmentPackage::Roxygen2, DevelopmentPackage::Devtools]);
+    packages
+}
+
+fn prompt_for_development_packages(
+    project_type: InitProjectType,
+) -> Result<Vec<DevelopmentPackage>, Error> {
+    let mut prompt = cliclack::multiselect("Development packages");
+    for package in development_package_choices(project_type) {
+        let hint = match package {
+            DevelopmentPackage::Testthat => "Unit testing with starter tests",
+            DevelopmentPackage::Roxygen2 => "Documentation generation",
+            DevelopmentPackage::Devtools => "Package development toolkit",
+        };
+        prompt = prompt.item(package, package.name(), hint);
+    }
+    Ok(prompt
         .required(false)
         .interact()
         .map_err(Error::InteractivePrompt)?)
@@ -790,9 +809,89 @@ fn development_relations(packages: &[DevelopmentPackage]) -> BTreeSet<Relation> 
     packages
         .iter()
         .map(|package| {
-            Relation::any(package.name()).expect("built-in package names should be valid")
+            if *package == DevelopmentPackage::Testthat {
+                "testthat (>= 3.0.0)"
+                    .parse()
+                    .expect("built-in relation should be valid")
+            } else {
+                Relation::any(package.name()).expect("built-in package names should be valid")
+            }
         })
         .collect()
+}
+
+fn validate_development_packages(
+    project_type: InitProjectType,
+    packages: &[DevelopmentPackage],
+) -> Result<(), Error> {
+    if project_type == InitProjectType::Project && packages.contains(&DevelopmentPackage::Testthat)
+    {
+        return Err(Error::TestthatRequiresPackage);
+    }
+    Ok(())
+}
+
+fn configure_development_packages(
+    description: &mut Description,
+    project_type: InitProjectType,
+    packages: &[DevelopmentPackage],
+) -> Result<(), EditError> {
+    if project_type != InitProjectType::Package {
+        return Ok(());
+    }
+    let mut fields = Vec::new();
+    if packages.contains(&DevelopmentPackage::Testthat) {
+        fields.push(("Config/testthat/edition", "3"));
+    }
+    if packages.contains(&DevelopmentPackage::Roxygen2) {
+        fields.extend([("Roxygen", "list(markdown = TRUE)"), ("Encoding", "UTF-8")]);
+    }
+    for (name, value) in fields {
+        *description = description.set_field(
+            &FieldName::new(name).expect("built-in field name should be valid"),
+            &LogicalValue::new(value).expect("built-in field value should be valid"),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_development_setup(
+    target: &Path,
+    package_name: &str,
+    project_type: InitProjectType,
+    packages: &[DevelopmentPackage],
+) -> Result<(), Error> {
+    if project_type != InitProjectType::Package {
+        return Ok(());
+    }
+    let create_directory = |relative: &str| {
+        let path = target.join(relative);
+        fs::create_dir_all(&path).map_err(|source| Error::DevelopmentSetup { path, source })
+    };
+    let write = |relative: &str, contents: &str| {
+        let path = target.join(relative);
+        fs::write(&path, contents).map_err(|source| Error::DevelopmentSetup { path, source })
+    };
+    if packages.contains(&DevelopmentPackage::Testthat) {
+        create_directory("tests/testthat")?;
+        write(
+            "tests/testthat.R",
+            &include_str!("../../assets/init/testthat.R")
+                .replace("{{package}}", &r_string(package_name)),
+        )?;
+        write(
+            "tests/testthat/test-example.R",
+            include_str!("../../assets/init/test-example.R"),
+        )?;
+    }
+    if packages.contains(&DevelopmentPackage::Roxygen2) {
+        create_directory("R")?;
+        write(
+            "NAMESPACE",
+            "# Generated by roxygen2: do not edit by hand\n",
+        )?;
+    }
+    Ok(())
 }
 
 fn initial_description(options: InitialDescriptionOptions<'_>) -> Description {
@@ -1100,6 +1199,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_projects_cannot_select_testthat() {
+        let choices = development_package_choices(InitProjectType::Project);
+        assert!(!choices.contains(&DevelopmentPackage::Testthat));
+        assert!(choices.contains(&DevelopmentPackage::Roxygen2));
+        assert!(choices.contains(&DevelopmentPackage::Devtools));
+        assert!(
+            development_package_choices(InitProjectType::Package)
+                .contains(&DevelopmentPackage::Testthat)
+        );
+    }
+
+    #[test]
+    fn legacy_projects_do_not_receive_package_setup() {
+        let target = tempfile::tempdir().unwrap();
+        let mut description = Description::parse("Package: analysis\nVersion: 0.1.0\n");
+        let original = description.to_string();
+        let packages = [DevelopmentPackage::Roxygen2, DevelopmentPackage::Devtools];
+        configure_development_packages(&mut description, InitProjectType::Project, &packages)
+            .unwrap();
+        write_development_setup(
+            target.path(),
+            "analysis",
+            InitProjectType::Project,
+            &packages,
+        )
+        .unwrap();
+        assert_eq!(description.to_string(), original);
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn derives_title_from_package_name() {
         assert_eq!(
             title_from_package_name("my.package.name"),
@@ -1193,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_selected_development_packages_to_unconstrained_relations() {
+    fn maps_selected_development_packages_to_relations() {
         let relations = development_relations(&[
             DevelopmentPackage::Testthat,
             DevelopmentPackage::Roxygen2,
@@ -1205,7 +1335,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["devtools", "roxygen2", "testthat"]
+            ["devtools", "roxygen2", "testthat (>= 3.0.0)"]
         );
     }
 

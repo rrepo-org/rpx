@@ -105,6 +105,20 @@ pub struct InitArgs {
 
     #[arg(long, value_enum, help = "Package license")]
     pub license: Option<InitLicense>,
+
+    #[arg(
+        long = "with",
+        value_enum,
+        help = "Development tool to set up (repeatable; testthat requires package type)"
+    )]
+    pub development_packages: Vec<InitDevelopmentPackage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InitDevelopmentPackage {
+    Testthat,
+    Roxygen2,
+    Devtools,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -362,8 +376,31 @@ mod tests {
                 author_name: None,
                 author_email: None,
                 license: None,
-            })
+                development_packages,
+            }) if development_packages.is_empty()
         ));
+    }
+
+    #[test]
+    fn parses_repeatable_development_tools() {
+        let cli = Cli::try_parse_from([
+            "rpx", "init", "--with", "testthat", "--with", "roxygen2", "--with", "devtools",
+            "--with", "testthat",
+        ])
+        .unwrap();
+        let Commands::Init(args) = cli.command else {
+            panic!("expected init")
+        };
+        assert_eq!(
+            args.development_packages,
+            vec![
+                InitDevelopmentPackage::Testthat,
+                InitDevelopmentPackage::Roxygen2,
+                InitDevelopmentPackage::Devtools,
+                InitDevelopmentPackage::Testthat,
+            ]
+        );
+        assert!(Cli::try_parse_from(["rpx", "init", "--with", "unknown"]).is_err());
     }
 
     #[test]
@@ -397,7 +434,9 @@ mod tests {
                 author_name: Some(author_name),
                 author_email: Some(author_email),
                 license: Some(license),
+                development_packages,
             }) if path == PathBuf::from("projects/example")
+                && development_packages.is_empty()
                 && project_type == InitProjectType::Project
                 && name == "example.pkg"
                 && title == "Example Package"

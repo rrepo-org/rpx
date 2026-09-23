@@ -12,6 +12,13 @@ The integration tests run native R processes and require R on `PATH`, plus the
 toolchain needed to compile R source packages. They isolate project libraries,
 caches, and temporary files. Some tests access the live built-in repository.
 
+On Debian or Ubuntu, install `libuv1-dev` for the `fs` dependency used by the
+development-tool initialization tests:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libuv1-dev
+```
+
 For the same concurrency settings used by the native E2E suite, run:
 
 ```bash
