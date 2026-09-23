@@ -8,7 +8,6 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
-    url: Url,
     source: rrepo_sdk::Repository,
     packages: Cache<(), Arc<rrepo_sdk::PackagesResponse>>,
     versions: Cache<String, Arc<BTreeMap<Version, String>>>,
@@ -24,8 +23,7 @@ impl std::fmt::Display for RrepoRepository {
 impl RrepoRepository {
     pub fn new(url: Url) -> Result<Self, rrepo_sdk::InvalidBaseUrl> {
         Ok(Self {
-            source: rrepo_sdk::Repository::new(url.clone())?,
-            url,
+            source: rrepo_sdk::Repository::new(url)?,
             packages: Cache::new(1),
             versions: Cache::new(1024),
             descriptions: Cache::new(4096),
@@ -33,7 +31,14 @@ impl RrepoRepository {
     }
 
     pub fn url(&self) -> &Url {
-        &self.url
+        self.source.base_url()
+    }
+
+    /// Recognize rrepo and retain its fetched index on the returned handle.
+    pub async fn probe(url: Url) -> Result<Self, RepositoryError> {
+        let repository = Self::new(url)?;
+        repository.packages().await?;
+        Ok(repository)
     }
 
     #[cfg(test)]

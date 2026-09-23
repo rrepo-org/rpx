@@ -1,6 +1,6 @@
 use super::*;
 use crate::description::required_dependencies;
-use crate::repository::RrepoRepository;
+use crate::repository::{CranRepository, RrepoRepository};
 
 struct Registry {
     server: mockito::ServerGuard,

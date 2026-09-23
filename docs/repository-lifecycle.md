@@ -18,8 +18,9 @@ client, authentication, HTTP tracing/progress, and URL display. Both SDKs own
 Windows/macOS binary routing from a triple and metadata R version, including the
 R 4.6 ARM64 transition to Sonoma. Linux binary routing is deferred.
 The existing HTTP-module mapping is still used by R installation.
-Both SDKs validate/normalize base URLs at construction; the rpx adapters retain
-the original configured URLs for source identity and cache-key compatibility.
+Both SDKs validate/normalize base URLs at construction. The adapters delegate URL
+identity to their SDK descriptor, using the same no-trailing-slash convention as
+application configuration and lockfile parsing (host-root URLs retain `/`).
 
 The rpx repository adapters retain Moka caches, source identity, and all existing
 archive-support and fallback policy. SDK error variants retain native causes and
@@ -45,9 +46,17 @@ progress. SDKs configure no subscriber, runtime, cache, or authentication state.
 
 ## Ownership
 
-- Discovery loads the native index into the returned repository's Moka cache.
+- Each native adapter owns its `probe` operation, including index-cache
+  initialization. CRAN fetches its index and probes archive support concurrently,
+  then returns a fully initialized handle. The outer enum only races repository
+  types and combines discovery failures. Lockfile reconstruction performs no I/O.
   Repeated HTTP repository URLs in one configuration load share discovery and
   handles while retaining their precedence positions.
+- CRAN exposes one metadata lookup, cached by `(package, version)`: matching
+  index metadata first, then current source, then archive only after a 404/410.
+  Concurrent lookups share the complete search; successful metadata and confirmed
+  absence are cached, while request/parsing/identity errors are not. Physical
+  source location is not part of the cache key.
 - Cloning preserves the shared caches, Git commit cell, and local DESCRIPTION
   overrides. Configuration equality is not metadata snapshot identity.
 - Locked replay reconstructs each repository record once and shares it among

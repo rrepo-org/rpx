@@ -153,50 +153,8 @@ impl PackageRepository {
 
     pub async fn from_url(url: Url) -> Result<Self, RepositoryError> {
         let value = url.to_string();
-        let rrepo_url = url.clone();
-        let rrepo_probe = async {
-            let repository = Arc::new(RrepoRepository::new(rrepo_url)?);
-            repository.packages().await?;
-            Ok::<_, RepositoryError>(Self::Rrepo(repository))
-        };
-
-        let cran_url = url;
-        let cran_probe = async {
-            let repository = CranRepository::new(cran_url.clone(), ArchiveSupport::Unavailable)?;
-            let packages_probe = repository.packages_index();
-            let archive_probe = async {
-                repository
-                    .archive_root()
-                    .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })
-            };
-
-            let (packages_result, archive_result) = tokio::join!(packages_probe, archive_probe);
-            packages_result?;
-
-            let archives = match archive_result {
-                Ok(_) => ArchiveSupport::Available,
-                Err(RepositoryError::Response { source })
-                    if matches!(
-                        source.status(),
-                        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN)
-                    ) =>
-                {
-                    ArchiveSupport::Unavailable
-                }
-                Err(error) => return Err(error),
-            };
-
-            Ok::<_, RepositoryError>(Self::Cran(Arc::new(
-                repository.with_archive_support(archives),
-            )))
-        };
+        let rrepo_probe = RrepoRepository::probe(url.clone());
+        let cran_probe = CranRepository::probe(url);
 
         tokio::pin!(rrepo_probe);
         tokio::pin!(cran_probe);
@@ -204,10 +162,10 @@ impl PackageRepository {
         tokio::select! {
             rrepo_result = &mut rrepo_probe => {
                 match rrepo_result {
-                    Ok(repository) => Ok(repository),
+                    Ok(repository) => Ok(Self::Rrepo(Arc::new(repository))),
                     Err(rrepo_error) => {
                         match cran_probe.await {
-                            Ok(repository) => Ok(repository),
+                            Ok(repository) => Ok(Self::Cran(Arc::new(repository))),
                             Err(cran_error) => Err(discovery_failure(value.clone(), rrepo_error, cran_error)),
                         }
                     }
@@ -216,10 +174,10 @@ impl PackageRepository {
 
             cran_result = &mut cran_probe => {
                 match cran_result {
-                    Ok(repository) => Ok(repository),
+                    Ok(repository) => Ok(Self::Cran(Arc::new(repository))),
                     Err(cran_error) => {
                         match rrepo_probe.await {
-                            Ok(repository) => Ok(repository),
+                            Ok(repository) => Ok(Self::Rrepo(Arc::new(repository))),
                             Err(rrepo_error) => Err(discovery_failure(value, rrepo_error, cran_error)),
                         }
                     }
@@ -634,5 +592,38 @@ mod tests {
             "https://example.test/"
         );
         assert!(parse_repository_url("mailto:packages@example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn sdk_canonical_urls_preserve_repository_lockfile_and_cache_identity() {
+        for (plain, trailing) in [
+            ("https://example.test/cran", "https://example.test/cran/"),
+            ("https://example.test", "https://example.test/"),
+        ] {
+            let cran = |url: &str| {
+                PackageRepository::Cran(Arc::new(
+                    CranRepository::new(url.parse().unwrap(), ArchiveSupport::Available).unwrap(),
+                ))
+            };
+            let rrepo = |url: &str| {
+                PackageRepository::Rrepo(Arc::new(
+                    RrepoRepository::new(url.parse().unwrap()).unwrap(),
+                ))
+            };
+            for (first, second) in [
+                (cran(plain), cran(trailing)),
+                (rrepo(plain), rrepo(trailing)),
+            ] {
+                assert_eq!(first, second);
+                assert_eq!(
+                    crate::cache::RegistryCacheKey::from_repository(&first),
+                    crate::cache::RegistryCacheKey::from_repository(&second)
+                );
+                let locked = first.to_lockfile().await.unwrap();
+                assert_eq!(locked, second.to_lockfile().await.unwrap());
+                assert_eq!(locked.url(), &parse_repository_url(trailing).unwrap());
+                assert_eq!(PackageRepository::from_lockfile(&locked).unwrap(), first);
+            }
+        }
     }
 }

@@ -19,8 +19,7 @@ use crate::{
     },
     r::{BasePackagesError, base_packages},
     repository::{
-        ArchiveSupport, CranRepository, LocalRepository, PackageRepository, RepositoryError,
-        built_in_repository,
+        ArchiveSupport, LocalRepository, PackageRepository, RepositoryError, built_in_repository,
     },
 };
 
@@ -144,16 +143,15 @@ pub(crate) async fn package_description(
 ) -> Result<Arc<Description>, RepositoryError> {
     let description = match repository {
         PackageRepository::Rrepo(repo) => repo.description(package, version).await?,
-        PackageRepository::Cran(repo) => match repo.indexed_description(package, version).await? {
-            Some(description) => description,
-            None => cran_source_description(repo, package, version)
-                .await?
-                .ok_or_else(|| RepositoryError::RepositoryPackageVersionNotFound {
+        PackageRepository::Cran(repo) => {
+            repo.description(package, version).await?.ok_or_else(|| {
+                RepositoryError::RepositoryPackageVersionNotFound {
                     repository: repository.to_string(),
                     package: package.into(),
                     version: version.clone(),
-                })?,
-        },
+                }
+            })?
+        }
         PackageRepository::Git(repo) => repo.description().await?,
         PackageRepository::Local(repo) => repo.description().await?,
     };
@@ -167,19 +165,6 @@ pub(crate) async fn package_description(
         });
     }
     Ok(description)
-}
-
-/// The resolver chooses current -> archive lookup. Native endpoint methods
-/// distinguish absence from errors and memoize both successful and missing probes.
-async fn cran_source_description(
-    repository: &CranRepository,
-    package: &str,
-    version: &Version,
-) -> Result<Option<Arc<Description>>, RepositoryError> {
-    match repository.current_description(package, version).await? {
-        Some(description) => Ok(Some(description)),
-        None => repository.archive_description(package, version).await,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -536,9 +521,7 @@ async fn choose_repository_version(
             {
                 let candidate = PackageVersion::new(preferred.clone(), repository.clone());
                 if range.contains(&candidate)
-                    && cran_source_description(repo, package, preferred)
-                        .await?
-                        .is_some()
+                    && repo.description(package, preferred).await?.is_some()
                 {
                     return Ok(Some(candidate));
                 }
