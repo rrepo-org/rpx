@@ -8,22 +8,22 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct RrepoRepository {
-    url: Url,
-    packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
+    source: rrepo_sdk::Repository,
+    packages: Cache<(), Arc<rrepo_sdk::PackagesResponse>>,
     versions: Cache<String, Arc<BTreeMap<Version, String>>>,
     descriptions: Cache<(String, Version), Arc<Description>>,
 }
 
 impl std::fmt::Display for RrepoRepository {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.url.fmt(formatter)
+        self.url().fmt(formatter)
     }
 }
 
 impl RrepoRepository {
     pub fn new(url: Url) -> Self {
         Self {
-            url,
+            source: rrepo_sdk::Repository::new(url),
             packages: Cache::new(1),
             versions: Cache::new(1024),
             descriptions: Cache::new(4096),
@@ -31,32 +31,21 @@ impl RrepoRepository {
     }
 
     pub fn url(&self) -> &Url {
-        &self.url
+        self.source.base_url()
     }
 
     #[cfg(test)]
     pub(crate) fn invalidate_descriptions(&self) {
         self.descriptions.invalidate_all();
     }
-    pub async fn packages(&self) -> Result<Arc<http::RrepoPackagesResponse>, RepositoryError> {
+    pub async fn packages(&self) -> Result<Arc<rrepo_sdk::PackagesResponse>, RepositoryError> {
         self.packages
             .try_get_with((), async {
-                let response = http::rrepo_repository_packages(&self.url)
+                self.source
+                    .packages(&http::client())
                     .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?
-                    .json::<http::RrepoPackagesResponse>()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
-
-                Ok::<Arc<http::RrepoPackagesResponse>, RepositoryError>(Arc::new(response))
+                    .map(Arc::new)
+                    .map_err(RepositoryError::from)
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -70,20 +59,11 @@ impl RrepoRepository {
         let versions = self
             .versions
             .try_get_with(package.to_string(), async {
-                let response = http::rrepo_package_versions(&self.url, package)
+                let response = self
+                    .source
+                    .versions(&http::client(), package)
                     .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?
-                    .json::<http::RrepoPackageVersionsResponse>()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
+                    .map_err(RepositoryError::from)?;
 
                 response
                     .versions
@@ -109,7 +89,7 @@ impl RrepoRepository {
 
         tracing::trace!(
             package,
-            repository = %self.url,
+            repository = %self.url(),
             versions = versions.len(),
             "loaded package versions"
         );
@@ -126,27 +106,16 @@ impl RrepoRepository {
 
         self.descriptions
             .try_get_with(key, async {
-                let description =
-                    http::rrepo_package_description(&self.url, package, version.as_ref())
-                        .await
-                        .map_err(|source| RepositoryError::Request {
-                            source: Arc::new(source),
-                        })?
-                        .error_for_status()
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?
-                        .text()
-                        .await
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?;
-                let description = Description::parse(&description);
+                let description = self
+                    .source
+                    .description(&http::client(), package, version.as_ref())
+                    .await
+                    .map_err(RepositoryError::from)?;
 
                 tracing::trace!(
                     package,
                     version = %version,
-                    repository = %self.url,
+                    repository = %self.url(),
                     "fetched package description"
                 );
 
@@ -161,7 +130,10 @@ impl RrepoRepository {
         package: &str,
         version: &Version,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
-        http::rrepo_source_artifact(&self.url, package, version.as_ref()).await
+        self.source
+            .source(&http::client(), package, version.as_ref())
+            .await
+            .map_err(request_error)
     }
 
     pub async fn binary(
@@ -171,6 +143,40 @@ impl RrepoRepository {
         target: &target_lexicon::Triple,
         r_version: &semver::Version,
     ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
-        http::rrepo_binary(&self.url, package, version.as_ref(), target, r_version).await
+        use target_lexicon::OperatingSystem;
+        let client = http::client();
+        let r_series = format!("{}.{}", r_version.major, r_version.minor);
+        match target.operating_system {
+            OperatingSystem::Windows => {
+                self.source
+                    .windows_binary(&client, package, version.as_ref(), &r_series)
+                    .await
+            }
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+                self.source
+                    .macos_binary(
+                        &client,
+                        package,
+                        version.as_ref(),
+                        http::r_macos_binary_target(target)?,
+                        &r_series,
+                    )
+                    .await
+            }
+            _ => {
+                return Err(http::BinaryArtifactRequestError::UnsupportedTarget {
+                    target: target.clone(),
+                });
+            }
+        }
+        .map_err(request_error)
+        .map_err(Into::into)
+    }
+}
+
+fn request_error(error: rrepo_sdk::Error) -> reqwest_middleware::Error {
+    match error {
+        rrepo_sdk::Error::Request(error) => error,
+        error => reqwest_middleware::Error::middleware(error),
     }
 }

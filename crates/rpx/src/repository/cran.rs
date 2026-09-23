@@ -1,16 +1,17 @@
 use super::{ArchiveSupport, RepositoryError};
 use crate::{description::description_identity, http};
-use futures_util::TryStreamExt;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use moka::future::Cache;
 use r_description::{Description, LogicalValue};
 use r_metadata::Version;
-use r_packages::{PackageRecord, Packages};
+use r_packages::{Finding, PackageRecord, Packages};
 use reqwest::Url;
-use std::{collections::BTreeSet, io::Read, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct CranRepository {
-    url: Url,
+    source: cran_sdk::Repository,
     archives: ArchiveSupport,
     packages: Cache<(), Arc<Packages>>,
     archive_versions: Cache<String, Option<BTreeSet<Version>>>,
@@ -25,14 +26,14 @@ enum SourceLocation {
 
 impl std::fmt::Display for CranRepository {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.url.fmt(formatter)
+        self.url().fmt(formatter)
     }
 }
 
 impl CranRepository {
     pub fn new(url: Url, archives: ArchiveSupport) -> Self {
         Self {
-            url,
+            source: cran_sdk::Repository::new(url),
             archives,
             packages: Cache::new(1),
             archive_versions: Cache::new(1024),
@@ -41,7 +42,7 @@ impl CranRepository {
     }
 
     pub fn url(&self) -> &Url {
-        &self.url
+        self.source.base_url()
     }
 
     pub fn archive_support(&self) -> ArchiveSupport {
@@ -56,30 +57,11 @@ impl CranRepository {
     pub async fn packages_index(&self) -> Result<Arc<Packages>, RepositoryError> {
         self.packages
             .try_get_with((), async {
-                let response = http::cran_packages(&self.url)
+                self.source
+                    .packages(&http::client())
                     .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
-                let source_name = http::display_safe_url(response.url()).to_string();
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
-                let packages = Packages::parse(&text);
-                let findings = packages.validate().into_iter().collect::<Vec<_>>();
-                if !findings.is_empty() {
-                    let source = http::CranPackagesParseError::new(source_name, text, findings);
-                    return Err(RepositoryError::CranPackages(Box::new(source)));
-                }
-
-                Ok::<Arc<Packages>, RepositoryError>(Arc::new(packages))
+                    .map(Arc::new)
+                    .map_err(RepositoryError::from)
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -91,38 +73,23 @@ impl CranRepository {
     ) -> Result<Option<BTreeSet<Version>>, RepositoryError> {
         self.archive_versions
             .try_get_with(package.to_string(), async {
-                let response = http::cran_package_archive_listing(&self.url, package)
-                    .await
-                    .map_err(|source| RepositoryError::Request {
-                        source: Arc::new(source),
-                    })?;
-                // Listing access is distinct from direct artifact access.
-                if matches!(
-                    response.status(),
-                    reqwest::StatusCode::FORBIDDEN
-                        | reqwest::StatusCode::NOT_FOUND
-                        | reqwest::StatusCode::GONE
-                ) {
-                    return Ok(None);
+                match self.source.archive_listing(&http::client(), package).await {
+                    Ok(listing) => Ok(Some(listing.versions.into_iter().collect())),
+                    // Preserve the existing listing-support policy in rpx.
+                    Err(error)
+                        if matches!(
+                            error.status(),
+                            Some(
+                                reqwest::StatusCode::FORBIDDEN
+                                    | reqwest::StatusCode::NOT_FOUND
+                                    | reqwest::StatusCode::GONE
+                            )
+                        ) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(RepositoryError::from(error)),
                 }
-                let text = response
-                    .error_for_status()
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?
-                    .text()
-                    .await
-                    .map_err(|source| RepositoryError::Response {
-                        source: Arc::new(source),
-                    })?;
-                let listing =
-                    text.parse::<http::CranPackageArchiveListing>()
-                        .map_err(|source| RepositoryError::InvalidData {
-                            resource: "CRAN package archive listing".to_string(),
-                            details: source.to_string(),
-                        })?;
-
-                Ok::<_, RepositoryError>(Some(listing.versions.into_iter().collect()))
             })
             .await
             .map_err(Arc::unwrap_or_clone)
@@ -173,36 +140,40 @@ impl CranRepository {
     ) -> Result<Option<Arc<Description>>, RepositoryError> {
         self.descriptions
             .try_get_with((location, package.to_string(), version.clone()), async {
-                let response = match location {
-                    SourceLocation::Current => self.current_source(package, version).await,
-                    SourceLocation::Archive => self.archive_source(package, version).await,
-                }
-                .map_err(|source| RepositoryError::Request {
-                    source: Arc::new(source),
-                })?;
-                if matches!(
-                    response.status(),
-                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
-                ) {
-                    return Ok(None);
-                }
-                let response =
-                    response
-                        .error_for_status()
-                        .map_err(|source| RepositoryError::Response {
-                            source: Arc::new(source),
-                        })?;
-                let description =
-                    description_from_source_tarball_response(response, package).await?;
+                let client = http::client();
+                let result = match location {
+                    SourceLocation::Current => {
+                        self.source
+                            .current_description(&client, package, version.as_ref())
+                            .await
+                    }
+                    SourceLocation::Archive => {
+                        self.source
+                            .archive_description(&client, package, version.as_ref())
+                            .await
+                    }
+                };
+                let description = match result {
+                    Ok(description) => description,
+                    Err(error)
+                        if matches!(
+                            error.status(),
+                            Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+                        ) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(RepositoryError::from(error)),
+                };
                 let (found_name, found_version) = description_identity(
-                    format!("source DESCRIPTION from {}", self.url),
+                    format!("source DESCRIPTION from {}", self.url()),
                     &description,
                 )?;
                 if found_name != package || &found_version != version {
                     return Err(RepositoryError::InvalidData {
                         resource: format!(
                             "source archive for {package} {version} from {}",
-                            self.url
+                            self.url()
                         ),
                         details: format!("contains {found_name} {found_version}"),
                     });
@@ -218,7 +189,10 @@ impl CranRepository {
         package: &str,
         version: &Version,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
-        http::cran_current_source_tarball(&self.url, package, version.as_ref()).await
+        self.source
+            .current_source(&http::client(), package, version.as_ref())
+            .await
+            .map_err(request_error)
     }
 
     pub async fn archive_source(
@@ -226,7 +200,10 @@ impl CranRepository {
         package: &str,
         version: &Version,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
-        http::cran_archive_source_tarball(&self.url, package, version.as_ref()).await
+        self.source
+            .archive_source(&http::client(), package, version.as_ref())
+            .await
+            .map_err(request_error)
     }
 
     pub async fn binary(
@@ -236,7 +213,50 @@ impl CranRepository {
         target: &target_lexicon::Triple,
         r_version: &semver::Version,
     ) -> Result<reqwest::Response, http::BinaryArtifactRequestError> {
-        http::cran_binary(&self.url, package, version.as_ref(), target, r_version).await
+        use target_lexicon::OperatingSystem;
+        let client = http::client();
+        let r_series = format!("{}.{}", r_version.major, r_version.minor);
+        match target.operating_system {
+            OperatingSystem::Windows => {
+                self.source
+                    .windows_binary(&client, package, version.as_ref(), &r_series)
+                    .await
+            }
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
+                self.source
+                    .macos_binary(
+                        &client,
+                        package,
+                        version.as_ref(),
+                        http::r_macos_binary_target(target)?,
+                        &r_series,
+                    )
+                    .await
+            }
+            _ => {
+                return Err(http::BinaryArtifactRequestError::UnsupportedTarget {
+                    target: target.clone(),
+                });
+            }
+        }
+        .map_err(request_error)
+        .map_err(Into::into)
+    }
+
+    pub(crate) async fn archive_root(
+        &self,
+    ) -> Result<reqwest::Response, reqwest_middleware::Error> {
+        self.source
+            .archive_root(&http::client())
+            .await
+            .map_err(request_error)
+    }
+}
+
+fn request_error(error: cran_sdk::Error) -> reqwest_middleware::Error {
+    match error {
+        cran_sdk::Error::Request(error) => error,
+        error => reqwest_middleware::Error::middleware(error),
     }
 }
 
@@ -269,75 +289,52 @@ fn packages_record_to_description(record: &PackageRecord) -> Description {
     builder.build()
 }
 
-async fn description_from_source_tarball_response(
-    response: reqwest::Response,
-    package: &str,
-) -> Result<Description, RepositoryError> {
-    let capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default();
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream
-        .try_next()
-        .await
-        .map_err(|source| RepositoryError::Response {
-            source: Arc::new(source),
-        })?
-    {
-        bytes.extend_from_slice(&chunk);
-    }
-
-    let decoder = flate2::read::GzDecoder::new(bytes.as_slice());
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|source| RepositoryError::Archive {
-            source: Arc::new(source),
-        })?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|source| RepositoryError::Archive {
-            source: Arc::new(source),
-        })?;
-        let is_description = {
-            let path = entry.path().map_err(|source| RepositoryError::Archive {
-                source: Arc::new(source),
-            })?;
-
-            path_is_top_level_description(&path, package)
-        };
-
-        if !is_description {
-            continue;
-        }
-
-        let mut body = String::new();
-        entry
-            .read_to_string(&mut body)
-            .map_err(|source| RepositoryError::Archive {
-                source: Arc::new(source),
-            })?;
-
-        return Ok(Description::parse(&body));
-    }
-
-    Err(RepositoryError::DescriptionNotFound {
-        package: package.to_string(),
-    })
+#[derive(Clone, Debug, Error, Diagnostic)]
+#[error("failed to parse CRAN PACKAGES index ({count} errors)")]
+#[diagnostic(
+    code(rpx::repository::cran_packages_parse_failed),
+    help(
+        "The repository returned invalid metadata. Try another mirror or contact the repository maintainer."
+    )
+)]
+pub struct CranPackagesParseError {
+    count: usize,
+    #[source_code]
+    source_code: NamedSource<String>,
+    #[related]
+    issues: Vec<CranPackagesParseIssue>,
 }
 
-fn path_is_top_level_description(path: &std::path::Path, package: &str) -> bool {
-    let mut components = path.components().filter_map(|component| {
-        let component = component.as_os_str().to_str()?;
-        (component != ".").then_some(component)
-    });
+impl CranPackagesParseError {
+    pub(crate) fn new(
+        source_name: impl Into<String>,
+        source: String,
+        findings: Vec<Finding>,
+    ) -> Self {
+        let issues: Vec<_> = findings
+            .into_iter()
+            .map(|finding| {
+                let range = finding.span();
+                CranPackagesParseIssue {
+                    span: (range.start..range.end).into(),
+                    finding,
+                }
+            })
+            .collect();
+        Self {
+            count: issues.len(),
+            source_code: NamedSource::new(source_name.into(), source),
+            issues,
+        }
+    }
+}
 
-    components.next() == Some(package)
-        && components.next() == Some("DESCRIPTION")
-        && components.next().is_none()
+#[derive(Clone, Debug, Error, Diagnostic)]
+#[error("{finding}")]
+struct CranPackagesParseIssue {
+    finding: Finding,
+    #[label("{finding}")]
+    span: SourceSpan,
 }
 
 #[cfg(test)]

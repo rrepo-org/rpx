@@ -203,7 +203,7 @@ mod tests {
         let metadata = "Package: fixture\nVersion: invalid\n".to_string();
         let packages = r_packages::Packages::parse(&metadata);
         let findings = packages.validate().into_iter().collect();
-        let parse_error = crate::http::CranPackagesParseError::new(
+        let parse_error = crate::repository::CranPackagesParseError::new(
             "https://example.test/src/contrib/PACKAGES",
             metadata,
             findings,

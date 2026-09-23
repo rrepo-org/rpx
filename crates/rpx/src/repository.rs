@@ -15,6 +15,7 @@ use std::{
 };
 use thiserror::Error;
 
+pub(crate) use cran::CranPackagesParseError;
 pub use cran::CranRepository;
 pub use git::GitRepository;
 pub use local::LocalRepository;
@@ -51,7 +52,13 @@ pub enum ArchiveSupport {
 pub enum RepositoryError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    CranPackages(Box<http::CranPackagesParseError>),
+    CranPackages(Box<CranPackagesParseError>),
+
+    #[error(transparent)]
+    Cran(Arc<cran_sdk::Error>),
+
+    #[error(transparent)]
+    Rrepo(Arc<rrepo_sdk::Error>),
 
     #[error("request failed: {source}")]
     Request {
@@ -152,7 +159,8 @@ impl PackageRepository {
             let repository = CranRepository::new(cran_url.clone(), ArchiveSupport::Unavailable);
             let packages_probe = repository.packages_index();
             let archive_probe = async {
-                http::cran_archive_root(&cran_url)
+                repository
+                    .archive_root()
                     .await
                     .map_err(|source| RepositoryError::Request {
                         source: Arc::new(source),
@@ -311,6 +319,47 @@ impl PackageRepository {
                 resource: "lockfile repository".to_string(),
                 details: format!("unsupported repository {self}"),
             }),
+        }
+    }
+}
+
+impl From<cran_sdk::Error> for RepositoryError {
+    fn from(error: cran_sdk::Error) -> Self {
+        match error {
+            cran_sdk::Error::Request(source) => Self::Request {
+                source: Arc::new(source),
+            },
+            cran_sdk::Error::Response(source) => Self::Response {
+                source: Arc::new(source),
+            },
+            cran_sdk::Error::Archive(source) => Self::Archive {
+                source: Arc::new(source),
+            },
+            cran_sdk::Error::DescriptionNotFound { package } => {
+                Self::DescriptionNotFound { package }
+            }
+            cran_sdk::Error::Packages(error) => {
+                Self::CranPackages(Box::new(CranPackagesParseError::new(
+                    http::display_safe_url(&error.url).to_string(),
+                    error.text,
+                    error.findings,
+                )))
+            }
+            error => Self::Cran(Arc::new(error)),
+        }
+    }
+}
+
+impl From<rrepo_sdk::Error> for RepositoryError {
+    fn from(error: rrepo_sdk::Error) -> Self {
+        match error {
+            rrepo_sdk::Error::Request(source) => Self::Request {
+                source: Arc::new(source),
+            },
+            rrepo_sdk::Error::Response(source) => Self::Response {
+                source: Arc::new(source),
+            },
+            error => Self::Rrepo(Arc::new(error)),
         }
     }
 }

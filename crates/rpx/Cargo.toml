@@ -10,6 +10,8 @@ keywords = ["r", "packages", "cli", "dependencies"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+cran-sdk = { path = "../cran-sdk" }
+rrepo-sdk = { path = "../rrepo-sdk" }
 rpx-task = { path = "../rpx-task" }
 async-trait = "0.1"
 clap = { version = "4.6.0", features = ["derive"] }

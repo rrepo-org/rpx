@@ -429,6 +429,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cran-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flate2",
+ "http",
+ "mockito",
+ "r-description-parser",
+ "r-metadata",
+ "r-packages-parser",
+ "reqwest",
+ "reqwest-middleware",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1950,6 +1970,7 @@ dependencies = [
  "bytes",
  "clap",
  "cliclack",
+ "cran-sdk",
  "directories",
  "flate2",
  "futures-core",
@@ -1973,6 +1994,7 @@ dependencies = [
  "reqwest-tracing",
  "rpassword",
  "rpx-task",
+ "rrepo-sdk",
  "semver",
  "serde",
  "serde_json",
@@ -1995,6 +2017,22 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "rrepo-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "mockito",
+ "r-description-parser",
+ "reqwest",
+ "reqwest-middleware",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

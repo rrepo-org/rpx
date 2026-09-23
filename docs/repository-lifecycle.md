@@ -5,6 +5,29 @@ Concrete implementations expose native operations; resolution chooses how to
 combine indexes, version endpoints, or single-package sources. They do not
 construct solver candidates or implement a uniform repository trait.
 
+## Protocol SDKs and client injection
+
+`cran-sdk` and `rrepo-sdk` own endpoint construction, native response models,
+parsing, and protocol errors. They borrow a `reqwest_middleware::ClientWithMiddleware`
+per call. A plain reqwest client can be converted once; middleware clients retain
+their complete chain and request initializers. SDK descriptors own only their URL.
+
+The dependency direction is `rpx -> SDKs -> reqwest/middleware + metadata parsers`.
+Neither SDK imports rpx or the other SDK. rpx's HTTP module configures the shared
+client, authentication, HTTP tracing/progress, and URL display. The existing binary
+target mapping remains shared there. SDK binary endpoints accept explicit native
+platform/R-series values supplied by that mapping.
+
+The rpx repository adapters retain Moka caches, source identity, and all existing
+archive-support and fallback policy. Generic SDK errors preserve HTTP status and
+parse findings; the adapters provide rpx-specific positioned diagnostics.
+The CRAN SDK also exposes the latest web DESCRIPTION endpoint even though rpx's
+resolver uses index or version-pinned source metadata instead.
+
+SDK operation spans inherit caller tracing context and cover metadata parsing.
+Injected middleware owns HTTP spans; rpx owns terminal UI and streamed-download
+progress. SDKs configure no subscriber, runtime, cache, or authentication state.
+
 ## Ownership
 
 - Discovery loads the native index into the returned repository's Moka cache.

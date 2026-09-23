@@ -1,0 +1,21 @@
+[package]
+name = "rrepo-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Async rrepo repository SDK with caller-supplied HTTP clients"
+repository = "https://github.com/rrepo-org/rpx"
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+reqwest-middleware = "0.5"
+r-description = { package = "r-description-parser", version = "=0.2.0" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.17"
+tracing = "0.1.41"
+
+[dev-dependencies]
+async-trait = "0.1"
+http = "1"
+mockito = "1.7.0"
+tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread"] }
