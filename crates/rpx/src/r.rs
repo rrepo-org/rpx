@@ -37,6 +37,17 @@ pub enum RSubprocessError {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum PackageBuildError {
+    #[error("failed to prepare source cache for {}: {source}", path.display())]
+    #[diagnostic(code(rpx::build::source_cache_failed))]
+    Cache {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("package source changed during build at {}; retry syncing", path.display())]
+    #[diagnostic(code(rpx::build::source_changed))]
+    SourceChanged { path: PathBuf },
+
     #[error("failed to prepare package artifact directory at {}: {source}", path.display())]
     #[diagnostic(code(rpx::build::artifact_directory_failed))]
     ArtifactDirectory {

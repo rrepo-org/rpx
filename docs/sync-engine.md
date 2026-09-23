@@ -41,7 +41,7 @@ metadata, progress spans, and diagnostics.
 
 ## Package operations
 
-Sync has three application modules:
+Sync has four application modules:
 
 - `sync.rs`: adapt the resolved project and root-package policy, prepare the target,
   and render package progress. It does not interpret graph IDs or task kinds.
@@ -49,19 +49,23 @@ Sync has three application modules:
   the private graph, and translate its events and errors into package terms.
 - `sync/operations.rs`: download, checkout, build, install, and remove functions,
   together with their inputs, outputs, errors, and artifact/cache helpers.
+- `sync/source_archive.rs`: shared source archive lookup, locking, temporary
+  builds, checksum validation, and publication. Freshness policy stays in the
+  separate Git and local operations.
 
 `sync/plan.rs` constructs the workflow using existing repository implementations:
 
 ```text
 registry download -------------------- artifact ----> install
-Git checkout ---- BuildInput ----> build -- artifact -> install
-local BuildInput ---------------> build -- artifact -> install
+Git lookup/checkout --------> build_git -- artifact -> install
+local BuildRequest -------> build_local -- artifact -> install
 dependency installs -------------------------------> install
 ```
 
 Downloads return the successfully published or cached `PreparedArtifact`, with
-its source/binary kind, path, and binary format. Git checkout returns the pinned
-tree and commit-specific archive destination. Builds return their source archive.
+its source/binary kind, path, and binary format. Git lookup returns a cached
+archive or the pinned tree and commit-specific archive destination. Builds return
+their source archive.
 Installation receives that exact result and never reconstructs candidate cache
 paths or searches for another artifact.
 
@@ -69,6 +73,42 @@ Package version, R version, dependency fingerprint inputs, installer options,
 binary-first fallback, and cache-key construction retain their existing policy.
 Cycles are now rejected during graph finalization, before artifact operations
 or removals start. Normal CLI entry points and repository dispatch remain in rpx.
+
+## Built source caching
+
+`build_git` and `build_local` are separate operations returning the same
+`PreparedArtifact` type. Their common `BuildRequest` contains only the package
+root, name, and version. Git uses the commit-keyed entry supplied by checkout;
+local builds own fingerprinting, freshness checks, and the unsupported-tree
+fallback. Neither the task engine nor the shared build request dispatches on a
+source-type flag.
+
+Both operations use `ArchiveEntry` to look up and lock entries. A locked entry
+builds a temporary candidate that borrows the lock; dropping it cleans up the
+unpublished archive. Local builds validate their inputs between building and
+publishing, while Git builds publish immediately. The Git checkout stage retains
+its separate concurrency limit.
+
+Git builds reuse archives keyed by remote, resolved commit, package subdirectory,
+name, and version. Local builds fingerprint the full package tree using SHA-256:
+relative paths, entry types, file contents, and permissions. Traversal is sorted;
+timestamps are not inputs. Untracked, Git-ignored, and `.Rbuildignore`-excluded
+files are included conservatively. Trees containing symlinks or special files
+bypass archive reuse. Local fingerprints are checked again after waiting for a
+cache lock and after building; concurrent source changes fail with a retry hint.
+
+Cache misses acquire a per-entry filesystem lock and recheck before building.
+Builds publish atomically after validation, with an archive checksum used to
+reject incomplete or corrupt cache entries. Existing archives without a checksum
+are rebuilt once. Local fingerprints use a separate `content-v1` namespace.
+
+Cached archives flow into the same installer as registry source archives. Its key
+includes the archive digest, package identity, R version, platform, options, and
+resolved dependency names and versions. Dependency-version changes invalidate
+prepared installations, not source archives. No dependency-content fingerprinting
+or additional transitive invalidation is applied. Git/local packages still pass
+through reconciliation and materialization so a matching installed version does
+not hide source changes or prevent restoration of missing installations.
 
 ## Plan invariants
 
@@ -104,8 +144,8 @@ Operations return their own errors, not `SyncError`:
 | Operation | Result | Error |
 | --- | --- | --- |
 | Download | `PreparedArtifact` | `DownloadPackageArtifactError` |
-| Checkout | `BuildInput` | `CheckoutError` |
-| Build | `PreparedArtifact` | `r::PackageBuildError` |
+| Checkout | `CheckoutOutput` (cached archive or build request and cache entry) | `CheckoutError` |
+| Git/local build | `PreparedArtifact` | `r::PackageBuildError` |
 | Install | `()` | `InstallPackageError` |
 | Remove | `()` | `RemovePackageError` |
 

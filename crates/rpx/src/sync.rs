@@ -2,6 +2,7 @@
 
 mod operations;
 mod plan;
+mod source_archive;
 
 use crate::{
     description::{DescriptionParseError, ProjectType, project_type, root_package},
