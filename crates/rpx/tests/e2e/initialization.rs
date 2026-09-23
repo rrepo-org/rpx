@@ -3,6 +3,68 @@ use std::fs;
 use super::support::{Fixture, diagnostic, snapshot};
 
 #[test]
+fn development_setup_is_ready_for_tests_and_documentation() {
+    let fixture = Fixture::new();
+    fixture.success(
+        &fixture.project,
+        &[
+            "init",
+            "--name",
+            "example.pkg",
+            "--with",
+            "testthat",
+            "--with",
+            "roxygen2",
+            "--with",
+            "testthat",
+        ],
+    );
+    assert!(
+        fixture
+            .project
+            .join("tests/testthat/test-example.R")
+            .is_file()
+    );
+    assert!(fixture.project.join("R").is_dir());
+    fixture.success(&fixture.project, &["status"]);
+    fixture.r_assert(
+        &fixture.project,
+        r#"
+        metadata <- read.dcf("DESCRIPTION")
+        stopifnot(metadata[1, "Config/testthat/edition"] == "3")
+        stopifnot(metadata[1, "Roxygen"] == "list(markdown = TRUE)")
+        stopifnot(metadata[1, "Encoding"] == "UTF-8")
+        stopifnot(packageVersion("testthat") >= "3.0.0")
+        setwd("tests")
+        source("testthat.R")
+    "#,
+    );
+    fs::write(
+        fixture.project.join("R/hello.R"),
+        "#' Say hello\n#' @export\nhello <- function() \"hello\"\n",
+    )
+    .unwrap();
+    fixture.r_assert(
+        &fixture.project,
+        r#"
+        roxygen2::roxygenise()
+        stopifnot(file.exists("man/hello.Rd"))
+        stopifnot(any(grepl('export(hello)', readLines("NAMESPACE"), fixed = TRUE)))
+        stopifnot(any(c("RoxygenNote", "Config/roxygen2/version") %in% colnames(read.dcf("DESCRIPTION"))))
+    "#,
+    );
+    fixture.close();
+}
+
+#[test]
+fn legacy_project_rejects_testthat_before_creating_target() {
+    invalid_metadata(
+        &["--type", "project", "--with", "testthat"],
+        "rpx::init::testthat_requires_package",
+    );
+}
+
+#[test]
 fn default_package_is_immediately_usable() {
     let fixture = Fixture::new();
     fixture.success(&fixture.project, &["init"]);
