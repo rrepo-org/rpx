@@ -4,6 +4,121 @@ use super::support::diagnostic;
 use super::support::{Fixture, RepositoryFixture};
 use std::{fs, path::Path};
 
+fn built_archives(f: &Fixture) -> Vec<std::path::PathBuf> {
+    super::support::snapshot(&f.cache)
+        .into_keys()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "artifact.tar.gz")
+        })
+        .map(|path| f.cache.join(path))
+        .collect()
+}
+
+#[test]
+fn local_archives_are_reused_invalidated_and_repaired() {
+    let f = Fixture::new();
+    write_source(&f.project, "first");
+    f.success(&f.project, &["lock"]);
+    f.success(&f.project, &["sync"]);
+    let archives = built_archives(&f);
+    assert_eq!(archives.len(), 1);
+    let archive = &archives[0];
+    let modified = fs::metadata(archive).unwrap().modified().unwrap();
+    // Make an accidental rebuild observable even on coarse timestamp filesystems.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    fs::remove_dir_all(f.library().join("artifactpkg")).unwrap();
+    f.success(&f.project, &["sync"]);
+    assert_eq!(fs::metadata(archive).unwrap().modified().unwrap(), modified);
+    f.r_assert(
+        &f.project,
+        "stopifnot(artifactpkg::artifact_value() == 'first')",
+    );
+
+    fs::write(archive, "corrupt").unwrap();
+    f.success(&f.project, &["sync"]);
+    assert_ne!(fs::read(archive).unwrap(), b"corrupt");
+    fs::remove_file(archive).unwrap();
+    f.success(&f.project, &["sync"]);
+    assert!(archive.is_file());
+
+    write_source(&f.project, "other");
+    f.success(&f.project, &["sync"]);
+    assert_eq!(built_archives(&f).len(), 2);
+    f.r_assert(
+        &f.project,
+        "stopifnot(artifactpkg::artifact_value() == 'other')",
+    );
+    f.assert_no_staging();
+    f.close();
+}
+
+#[test]
+fn concurrent_local_builds_share_one_completed_archive() {
+    let f = Fixture::new();
+    write_source(&f.project, "concurrent");
+    f.success(&f.project, &["lock"]);
+    let first = f
+        .rpx_command(&f.project)
+        .arg("sync")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = f
+        .rpx_command(&f.project)
+        // Share the artifact cache, but materialize into independent libraries.
+        .env("RPX_DATA_DIR", f.root.join("other-data"))
+        .arg("sync")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for child in [first, second] {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            super::support::diagnostic(&output)
+        );
+    }
+    assert_eq!(built_archives(&f).len(), 1);
+    f.r_assert(
+        &f.project,
+        "stopifnot(artifactpkg::artifact_value() == 'concurrent')",
+    );
+    f.assert_no_staging();
+    f.close();
+}
+
+#[cfg(unix)]
+#[test]
+fn local_source_changes_during_build_are_not_published() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    write_source(&f.project, "before");
+    let cleanup = f.project.join("cleanup");
+    // R CMD build runs cleanup in its copied source tree. Modify an original
+    // input to simulate an editor changing the package while R is building it.
+    fs::write(
+        &cleanup,
+        format!(
+            "#!/bin/sh\necho changed > '{}'\n",
+            f.project.join("changed-during-build").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cleanup, fs::Permissions::from_mode(0o755)).unwrap();
+    f.success(&f.project, &["lock"]);
+    f.failure(&f.project, &["sync"], "package source changed during build");
+    assert!(built_archives(&f).is_empty());
+    f.assert_no_staging();
+    fs::remove_file(cleanup).unwrap();
+    f.success(&f.project, &["sync"]);
+    assert_eq!(built_archives(&f).len(), 1);
+    f.close();
+}
+
 const DESCRIPTION: &str = "Package: artifactpkg\nVersion: 1.0.0\nTitle: Artifact Fixture\nDescription: A fixture for artifact result handoff.\nLicense: GPL-3\nAuthor: Test Author\nMaintainer: Test Author <test@example.com>\n";
 const SOURCE_ENDPOINT: &str = "/packages/artifactpkg/versions/1.0.0/source";
 

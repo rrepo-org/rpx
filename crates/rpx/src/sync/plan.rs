@@ -380,12 +380,12 @@ impl Assembly {
                     })?;
                 let name = package.to_string();
                 self.register(package, TaskKind::Build, source, move |input| async move {
-                    operations::build(input)
-                        .await
-                        .map_err(|source| OperationError::Build {
+                    operations::build_checkout(input).await.map_err(|source| {
+                        OperationError::Build {
                             package: name,
                             source: Box::new(source),
-                        })
+                        }
+                    })
                 })
             }
             PackageRepository::Cran(_) | PackageRepository::Rrepo(_) => {

@@ -22,6 +22,7 @@ mod project;
 mod r;
 mod repository;
 mod resolver;
+mod source_fingerprint;
 mod sync;
 mod ui;
 
