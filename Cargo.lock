@@ -2251,6 +2251,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-tracing",
  "rpassword",
+ "rpx-dist",
  "rpx-task",
  "rrepo-sdk",
  "semver",
@@ -2267,6 +2268,16 @@ dependencies = [
  "tracing-indicatif",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "rpx-dist"
+version = "0.1.0"
+dependencies = [
+ "r-metadata 0.3.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

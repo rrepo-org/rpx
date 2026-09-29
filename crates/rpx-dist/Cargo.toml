@@ -1,0 +1,12 @@
+[package]
+name = "rpx-dist"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Build R source packages for rpx distribution"
+
+[dependencies]
+r-metadata = "=0.3.0"
+tempfile = "3"
+thiserror = "2.0.17"
+tokio = { version = "1.51.1", features = ["process", "fs"] }

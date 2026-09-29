@@ -1,4 +1,5 @@
 ^rpx\.lock$
+^dist$
 ^.*\.Rproj$
 ^\.Rproj\.user$
 ^README\.Rmd$

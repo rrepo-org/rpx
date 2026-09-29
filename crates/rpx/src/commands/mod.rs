@@ -1,5 +1,6 @@
 pub(crate) mod add;
 pub(crate) mod clean;
+pub(crate) mod dist;
 pub(crate) mod init;
 pub(crate) mod lock;
 pub(crate) mod remove;

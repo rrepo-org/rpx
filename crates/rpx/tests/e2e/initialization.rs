@@ -79,6 +79,12 @@ fn default_package_is_immediately_usable() {
         assert!(fixture.project.join(name).is_file(), "missing {name}");
     }
     assert!(
+        fs::read_to_string(fixture.project.join(".Rbuildignore"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "^dist$")
+    );
+    assert!(
         fixture
             .cache
             .join("artifacts/source/v1/sample.package")

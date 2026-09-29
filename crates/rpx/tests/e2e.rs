@@ -2,6 +2,8 @@
 mod artifacts;
 #[path = "e2e/dependencies.rs"]
 mod dependencies;
+#[path = "e2e/dist.rs"]
+mod dist;
 #[path = "e2e/execution.rs"]
 mod execution;
 #[path = "e2e/initialization.rs"]

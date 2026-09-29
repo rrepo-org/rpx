@@ -59,6 +59,12 @@ pub enum Commands {
     )]
     Sync(SyncArgs),
 
+    #[command(about = "Build packages for distribution")]
+    Dist {
+        #[command(subcommand)]
+        command: DistCommands,
+    },
+
     #[command(
         about = "Remove all project libraries and caches",
         long_about = "Remove all isolated project libraries and wipe rpx cache directories so the next sync or add starts from a clean local state."
@@ -182,6 +188,23 @@ pub struct SyncArgs {
         help = "Do not install the current project; remove it if already installed"
     )]
     pub no_install_project: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DistCommands {
+    #[command(about = "Build an R source package archive")]
+    Build(DistBuildArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DistBuildArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::DirPath,
+        help = "Output directory (default: <project>/dist)"
+    )]
+    pub output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
