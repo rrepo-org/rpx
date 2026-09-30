@@ -112,6 +112,12 @@ pub struct InitArgs {
         help = "Development tool to set up (repeatable; testthat requires package type)"
     )]
     pub development_packages: Vec<InitDevelopmentPackage>,
+
+    #[arg(
+        long,
+        help = "Add a GitHub Actions workflow to publish source packages to rrepo and GitHub Releases (package type only)"
+    )]
+    pub publish: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -377,6 +383,7 @@ mod tests {
                 author_email: None,
                 license: None,
                 development_packages,
+                publish: false,
             }) if development_packages.is_empty()
         ));
     }
@@ -435,6 +442,7 @@ mod tests {
                 author_email: Some(author_email),
                 license: Some(license),
                 development_packages,
+                publish: false,
             }) if path == PathBuf::from("projects/example")
                 && development_packages.is_empty()
                 && project_type == InitProjectType::Project
@@ -444,6 +452,14 @@ mod tests {
                 && author_name == "Example Author"
                 && author_email == "author@example.com"
                 && license == InitLicense::Apache2
+        ));
+    }
+
+    #[test]
+    fn parses_init_publishing_option() {
+        assert!(matches!(
+            parse(&["rpx", "init", "--publish"]),
+            Commands::Init(InitArgs { publish: true, .. })
         ));
     }
 

@@ -27,6 +27,7 @@ use thiserror::Error;
 
 const RBUILDIGNORE: &str = include_str!("../../assets/Rbuildignore");
 const GITIGNORE: &str = include_str!("../../assets/R.gitignore");
+const RELEASE_WORKFLOW: &str = include_str!("../../assets/init/release.yml");
 const DEFAULT_DESCRIPTION: &str = "Describe what this package does.";
 const DEFAULT_AUTHOR_NAME: &str = "Package Author";
 const DEFAULT_AUTHOR_EMAIL: &str = "author@example.com";
@@ -34,6 +35,13 @@ const CRAN_REPOSITORY_URL: &str = "https://cloud.r-project.org/";
 
 #[derive(Debug, Error, Diagnostic)]
 pub(crate) enum Error {
+    #[error("publishing setup requires an R package")]
+    #[diagnostic(
+        code(rpx::init::publishing_requires_package),
+        help("Use `--type package`, or omit `--publish`.")
+    )]
+    PublishingRequiresPackage,
+
     #[error("testthat setup requires an R package")]
     #[diagnostic(
         code(rpx::init::testthat_requires_package),
@@ -44,6 +52,13 @@ pub(crate) enum Error {
     #[error("failed to write development setup at {}: {source}", path.display())]
     #[diagnostic(code(rpx::init::development_setup_failed))]
     DevelopmentSetup {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write publishing workflow at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::init::publishing_workflow_failed))]
+    PublishingWorkflow {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -377,6 +392,9 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
         None => InitProjectType::Package,
     };
     validate_development_packages(project_type, &args.development_packages)?;
+    if args.publish && project_type != InitProjectType::Package {
+        return Err(Error::PublishingRequiresPackage);
+    }
 
     let package_name = match args.name {
         Some(package_name) => {
@@ -496,6 +514,16 @@ pub(crate) async fn run(args: InitArgs) -> Result<(), Error> {
             source,
         })?;
         write_gitignore(&target)?;
+    }
+    let publish = if args.publish {
+        true
+    } else if interactive && project_type == InitProjectType::Package {
+        prompt_for_publishing()?
+    } else {
+        false
+    };
+    if publish {
+        write_release_workflow(&target)?;
     }
 
     let message = if initialize_git {
@@ -924,6 +952,23 @@ fn prompt_for_git_repository(target: &Path) -> Result<bool, Error> {
         .map_err(Error::InteractivePrompt)?)
 }
 
+fn prompt_for_publishing() -> Result<bool, Error> {
+    cliclack::confirm("Add a GitHub Actions source publishing workflow?")
+        .initial_value(false)
+        .interact()
+        .map_err(Error::InteractivePrompt)
+}
+
+fn write_release_workflow(target: &Path) -> Result<(), Error> {
+    let directory = target.join(".github/workflows");
+    fs::create_dir_all(&directory).map_err(|source| Error::PublishingWorkflow {
+        path: directory.clone(),
+        source,
+    })?;
+    let path = directory.join("release.yml");
+    fs::write(&path, RELEASE_WORKFLOW).map_err(|source| Error::PublishingWorkflow { path, source })
+}
+
 fn suggested_project_directory(current_dir: &Path) -> Result<String, Error> {
     for _ in 0..64 {
         let Some(name) = petname::petname(2, "-") else {
@@ -1228,6 +1273,18 @@ mod tests {
         .unwrap();
         assert_eq!(description.to_string(), original);
         assert_eq!(fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn writes_source_publishing_workflow() {
+        let target = tempfile::tempdir().unwrap();
+        write_release_workflow(target.path()).unwrap();
+        let path = target.path().join(".github/workflows/release.yml");
+        assert_eq!(fs::read_to_string(path).unwrap(), RELEASE_WORKFLOW);
+        assert!(RELEASE_WORKFLOW.contains("R CMD build ."));
+        assert!(RELEASE_WORKFLOW.contains("gh release create"));
+        assert!(RELEASE_WORKFLOW.contains("${RREPO_REPOSITORY_URL%/}/upload"));
+        assert!(!RELEASE_WORKFLOW.contains("R CMD INSTALL --build"));
     }
 
     #[test]
