@@ -1420,6 +1420,7 @@ mod tests {
         assert_eq!(
             RBUILDIGNORE.lines().collect::<Vec<_>>(),
             "^rpx\\.lock$\n\
+^dist$\n\
 ^.*\\.Rproj$\n\
 ^\\.Rproj\\.user$\n\
 ^README\\.Rmd$\n\
