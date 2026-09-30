@@ -115,7 +115,7 @@ pub struct InitArgs {
 
     #[arg(
         long,
-        help = "Add a GitHub Actions workflow to publish source packages to rrepo and GitHub Releases (package type only)"
+        help = "Add a GitHub Actions workflow to publish source and Windows/macOS binaries to rrepo and GitHub Releases (package type only)"
     )]
     pub publish: bool,
 }
