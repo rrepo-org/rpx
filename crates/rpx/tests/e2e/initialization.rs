@@ -65,6 +65,25 @@ fn legacy_project_rejects_testthat_before_creating_target() {
 }
 
 #[test]
+fn legacy_project_rejects_publishing_before_creating_target() {
+    invalid_metadata(
+        &["--type", "project", "--publish"],
+        "rpx::init::publishing_requires_package",
+    );
+}
+
+#[test]
+fn publishing_option_creates_source_workflow() {
+    let fixture = Fixture::new();
+    fixture.success(&fixture.project, &["init", "--publish"]);
+    let workflow = fs::read_to_string(fixture.project.join(".github/workflows/release.yml"))
+        .expect("publishing workflow should exist");
+    assert!(workflow.contains("R CMD build ."));
+    assert!(workflow.contains("gh release create"));
+    fixture.close();
+}
+
+#[test]
 fn default_package_is_immediately_usable() {
     let fixture = Fixture::new();
     fixture.success(&fixture.project, &["init"]);
@@ -78,6 +97,12 @@ fn default_package_is_immediately_usable() {
     ] {
         assert!(fixture.project.join(name).is_file(), "missing {name}");
     }
+    assert!(
+        !fixture
+            .project
+            .join(".github/workflows/release.yml")
+            .exists()
+    );
     assert!(
         fixture
             .cache

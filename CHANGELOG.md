@@ -13,10 +13,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Added repeatable `rpx init --with` development-tool selection, testthat starter tests, and roxygen2 package configuration. Testthat setup is available only for R packages.
+- Added optional `rpx init --publish` scaffolding for R packages. The generated GitHub Actions workflow publishes a source archive to rrepo and GitHub Releases when a tag matches the package version.
+- Added `RPX_DATA_DIR` and `RPX_CACHE_DIR` environment variables to override the project-library and cache locations.
 
 ### Changed
 
 - Reuse Git source archives by resolved commit and local source archives by full package-tree content, avoiding repeated `R CMD build` calls. Both use the same prepared-installation cache as registry sources, including resolved dependency versions.
+- Show progress while the interactive `rpx init` wizard resolves and installs packages.
+
+### Fixed
+
+- Resolve previously selected CRAN-like package versions from source archives even when archive directory listings are unavailable.
+- Consider every version advertised in a CRAN-like `PACKAGES` index during resolution, including older indexed versions.
 
 ## [2.0.1]
 
