@@ -194,6 +194,9 @@ pub struct SyncArgs {
 pub enum DistCommands {
     #[command(about = "Build an R source package archive")]
     Build(DistBuildArgs),
+
+    #[command(about = "Upload a built source package to rrepo")]
+    Publish(DistPublishArgs),
 }
 
 #[derive(Args, Debug)]
@@ -205,6 +208,24 @@ pub struct DistBuildArgs {
         help = "Output directory (default: <project>/dist)"
     )]
     pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DistPublishArgs {
+    #[arg(
+        long,
+        value_name = "NAMESPACE/REPOSITORY",
+        help = "Destination (overrides RREPO_REPOSITORY and DESCRIPTION Repository)"
+    )]
+    pub repository: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        help = "Source archive (default: <project>/dist/<Package>_<Version>.tar.gz)"
+    )]
+    pub artifact: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -569,6 +590,24 @@ mod tests {
                 no_install_project: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn parses_dist_publish_options() {
+        assert!(matches!(
+            parse(&["rpx", "dist", "publish"]),
+            Commands::Dist {
+                command: DistCommands::Publish(DistPublishArgs {
+                    repository: None,
+                    artifact: None
+                })
+            }
+        ));
+        assert!(matches!(
+            parse(&["rpx", "dist", "publish", "--repository", "acme/staging", "--artifact", "dist/pkg_1.0.tar.gz"]),
+            Commands::Dist { command: DistCommands::Publish(DistPublishArgs { repository: Some(repository), artifact: Some(artifact) }) }
+                if repository == "acme/staging" && artifact == PathBuf::from("dist/pkg_1.0.tar.gz")
         ));
     }
 

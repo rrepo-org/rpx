@@ -1,5 +1,11 @@
 //! Build R source-package archives for distribution.
 
+mod publish;
+
+pub use publish::{
+    PublishError, PublishRequest, PublishResult, RepositorySlug, RepositorySlugError, publish,
+};
+
 use r_metadata::Version;
 use std::{io, path::PathBuf};
 use tempfile::TempPath;

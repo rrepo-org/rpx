@@ -420,3 +420,41 @@ fn explicit_external_output_directory_does_not_require_an_ignore_rule() {
     assert_no_dist_staging(&f);
     f.close();
 }
+
+#[test]
+fn publish_requires_an_api_key_without_prompting_or_building() {
+    let f = Fixture::new();
+    package_source(&f);
+    f.set_field("Repository", "acme/internal");
+    let output = f
+        .rpx_command(&f.project)
+        .args(["dist", "publish"])
+        .env_remove("RREPO_API_KEY")
+        .env_remove("RREPO_REPOSITORY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", diagnostic(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rpx::dist::api_key_missing"));
+    assert!(!archive_path(&f).exists());
+    f.close();
+}
+
+#[test]
+fn publish_rejects_a_mismatched_artifact_without_uploading() {
+    let f = Fixture::new();
+    package_source(&f);
+    f.set_field("Repository", "acme/internal");
+    fs::create_dir(f.project.join("dist")).unwrap();
+    fs::write(archive_path(&f), "not a gzip archive").unwrap();
+    let output = f
+        .rpx_command(&f.project)
+        .args(["dist", "publish"])
+        .env("RREPO_API_KEY", "fixture-key")
+        .env_remove("RREPO_REPOSITORY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", diagnostic(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rpx::dist::publish_failed"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-key"));
+    f.close();
+}

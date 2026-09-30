@@ -6,7 +6,17 @@ publish = false
 description = "Build R source packages for rpx distribution"
 
 [dependencies]
+archive-stream = { path = "../archive-stream" }
+r-description = { package = "r-description-parser", version = "=0.3.0" }
 r-metadata = "=0.3.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
+serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2.0.17"
-tokio = { version = "1.51.1", features = ["process", "fs"] }
+tokio = { version = "1.51.1", features = ["process", "fs", "io-util"] }
+
+[dev-dependencies]
+flate2 = "1.1.5"
+mockito = "1.7.0"
+tar = "0.4.44"
+tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread"] }

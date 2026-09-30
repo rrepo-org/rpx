@@ -1,5 +1,5 @@
 use crate::{
-    cli::{DistBuildArgs, DistCommands},
+    cli::{DistBuildArgs, DistCommands, DistPublishArgs},
     description::{DescriptionParseError, ProjectType, project_type, root_package},
     output::status,
     project::{
@@ -58,12 +58,102 @@ pub(crate) enum Error {
         #[source]
         source: rpx_dist::BuildError,
     },
+
+    #[error("no publish destination configured")]
+    #[diagnostic(
+        code(rpx::dist::repository_missing),
+        help("Set `Repository: acme/internal` in DESCRIPTION, RREPO_REPOSITORY, or --repository.")
+    )]
+    RepositoryMissing,
+
+    #[error("RREPO_REPOSITORY must be valid UTF-8")]
+    #[diagnostic(code(rpx::dist::repository_invalid_env))]
+    InvalidRepositoryEnv,
+
+    #[error("invalid rrepo repository `{value}`: {source}")]
+    #[diagnostic(code(rpx::dist::repository_invalid))]
+    InvalidRepository {
+        value: String,
+        #[source]
+        source: rpx_dist::RepositorySlugError,
+    },
+
+    #[error("RREPO_API_KEY must be set to a packages:write API key")]
+    #[diagnostic(code(rpx::dist::api_key_missing))]
+    ApiKeyMissing,
+
+    #[error("failed to publish source package: {source}")]
+    #[diagnostic(code(rpx::dist::publish_failed))]
+    Publish {
+        #[source]
+        source: rpx_dist::PublishError,
+    },
 }
 
 pub(crate) async fn run(command: DistCommands) -> Result<(), Error> {
     match command {
         DistCommands::Build(args) => build(args).await,
+        DistCommands::Publish(args) => publish(args).await,
     }
+}
+
+fn publish_repository(
+    explicit: Option<String>,
+    environment: Option<String>,
+    description: &r_description::Description,
+) -> Result<rpx_dist::RepositorySlug, Error> {
+    let value = explicit
+        .or(environment)
+        .or_else(|| {
+            description
+                .repository()
+                .map(|value| value.as_str().to_string())
+        })
+        .ok_or(Error::RepositoryMissing)?;
+    value
+        .parse()
+        .map_err(|source| Error::InvalidRepository { value, source })
+}
+
+async fn publish(args: DistPublishArgs) -> Result<(), Error> {
+    let project = load_project()?;
+    if project_type(&project.description) != ProjectType::Package {
+        return Err(Error::NotAPackage);
+    }
+    let (package, version) = root_package(&project.root, &project.description)?;
+    let environment = if args.repository.is_some() {
+        None
+    } else {
+        match std::env::var("RREPO_REPOSITORY") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(Error::InvalidRepositoryEnv),
+            Err(std::env::VarError::NotPresent) => None,
+        }
+    };
+    let repository = publish_repository(args.repository, environment, &project.description)?;
+    let api_key = std::env::var("RREPO_API_KEY").map_err(|_| Error::ApiKeyMissing)?;
+    if api_key.trim().is_empty() {
+        return Err(Error::ApiKeyMissing);
+    }
+    let artifact = args.artifact.unwrap_or_else(|| {
+        project
+            .root
+            .join("dist")
+            .join(format!("{package}_{version}.tar.gz"))
+    });
+    rpx_dist::publish(rpx_dist::PublishRequest {
+        artifact,
+        package: package.clone(),
+        version: version.clone(),
+        repository: repository.clone(),
+        api_key,
+    })
+    .await
+    .map_err(|source| Error::Publish { source })?;
+    status(format_args!(
+        "Published {package} {version} to {repository}"
+    ));
+    Ok(())
 }
 
 async fn build(args: DistBuildArgs) -> Result<(), Error> {
@@ -107,4 +197,46 @@ async fn build(args: DistBuildArgs) -> Result<(), Error> {
         artifact.path.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use r_description::Description;
+
+    #[test]
+    fn publish_destination_uses_explicit_then_environment_then_description() {
+        let description =
+            Description::parse("Package: fixture\nVersion: 1.0.0\nRepository: acme/production\n");
+        assert_eq!(
+            publish_repository(None, None, &description)
+                .unwrap()
+                .to_string(),
+            "acme/production"
+        );
+        assert_eq!(
+            publish_repository(None, Some("acme/staging".into()), &description)
+                .unwrap()
+                .to_string(),
+            "acme/staging"
+        );
+        assert_eq!(
+            publish_repository(
+                Some("acme/custom".into()),
+                Some("CRAN".into()),
+                &description
+            )
+            .unwrap()
+            .to_string(),
+            "acme/custom"
+        );
+        assert!(matches!(
+            publish_repository(None, None, &Description::parse("Package: fixture\n")),
+            Err(Error::RepositoryMissing)
+        ));
+        assert!(matches!(
+            publish_repository(None, None, &Description::parse("Repository: CRAN\n")),
+            Err(Error::InvalidRepository { .. })
+        ));
+    }
 }
