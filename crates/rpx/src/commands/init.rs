@@ -953,7 +953,7 @@ fn prompt_for_git_repository(target: &Path) -> Result<bool, Error> {
 }
 
 fn prompt_for_publishing() -> Result<bool, Error> {
-    cliclack::confirm("Add a GitHub Actions source publishing workflow?")
+    cliclack::confirm("Add a GitHub Actions package publishing workflow?")
         .initial_value(false)
         .interact()
         .map_err(Error::InteractivePrompt)
@@ -1276,15 +1276,17 @@ mod tests {
     }
 
     #[test]
-    fn writes_source_publishing_workflow() {
+    fn writes_package_publishing_workflow() {
         let target = tempfile::tempdir().unwrap();
         write_release_workflow(target.path()).unwrap();
         let path = target.path().join(".github/workflows/release.yml");
         assert_eq!(fs::read_to_string(path).unwrap(), RELEASE_WORKFLOW);
-        assert!(RELEASE_WORKFLOW.contains("R CMD build ."));
-        assert!(RELEASE_WORKFLOW.contains("gh release create"));
+        assert!(RELEASE_WORKFLOW.contains("R CMD build --no-build-vignettes --no-manual ."));
+        assert!(RELEASE_WORKFLOW.contains("r: [release, oldrel-1]"));
+        assert!(RELEASE_WORKFLOW.contains("R CMD INSTALL --build --no-multiarch"));
         assert!(RELEASE_WORKFLOW.contains("${RREPO_REPOSITORY_URL%/}/upload"));
-        assert!(!RELEASE_WORKFLOW.contains("R CMD INSTALL --build"));
+        assert!(RELEASE_WORKFLOW.contains("${RREPO_REPOSITORY_URL%/}/binaries/upload"));
+        assert!(RELEASE_WORKFLOW.contains("gh release create"));
     }
 
     #[test]
