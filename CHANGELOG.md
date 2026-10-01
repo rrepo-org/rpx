@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Added repeatable `rpx init --with` development-tool selection, testthat starter tests, and roxygen2 package configuration. Testthat setup is available only for R packages.
-- Added optional `rpx init --publish` scaffolding for R packages. The generated GitHub Actions workflow publishes a source archive and Windows/macOS binaries to rrepo and GitHub Releases when a tag matches the package version.
+- Added optional `rpx init --publish` scaffolding for R packages. The generated GitHub Actions workflow publishes a source archive to rrepo and GitHub Releases when a tag matches the package version.
 - Added `RPX_DATA_DIR` and `RPX_CACHE_DIR` environment variables to override the project-library and cache locations.
 
 ### Changed
