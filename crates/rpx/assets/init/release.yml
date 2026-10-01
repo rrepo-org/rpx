@@ -1,4 +1,4 @@
-name: publish-package
+name: Release
 
 on:
   push:
@@ -6,184 +6,48 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  source:
+  publish:
+    name: Publish source package
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: bash
-    outputs:
-      package: ${{ steps.identity.outputs.package }}
-      version: ${{ steps.identity.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: release
-      - name: Check release identity
-        id: identity
+      - name: Check release version
+        shell: bash
         run: |
-          package=$(awk '$1 == "Package:" {print $2}' DESCRIPTION)
           version=$(awk '$1 == "Version:" {print $2}' DESCRIPTION)
           test "$GITHUB_REF_NAME" = "v$version"
-          printf 'package=%s\nversion=%s\n' "$package" "$version" >> "$GITHUB_OUTPUT"
       - name: Build source package
-        run: R CMD build --no-build-vignettes --no-manual .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: source
-          path: ${{ steps.identity.outputs.package }}_${{ steps.identity.outputs.version }}.tar.gz
-          if-no-files-found: error
-
-  binaries:
-    needs: source
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        r: [release, oldrel-1]
-        platform:
-          - name: windows
-            runner: windows-2022
-            extension: zip
-          - name: macosx
-            runner: macos-15
-            extension: tgz
-    env:
-      PLATFORM: ${{ matrix.platform.name }}
-      BINARY_TARGET: ''
-    steps:
-      - uses: r-lib/actions/setup-r@v2
-        id: setup-r
-        with:
-          r-version: ${{ matrix.r }}
-      - name: Record R minor version
+        run: R CMD build .
+      - name: Upload source package to rrepo
         shell: bash
         env:
-          R_VERSION: ${{ steps.setup-r.outputs.installed-r-version }}
-        run: printf 'R_MINOR=%s\n' "${R_VERSION%.*}" >> "$GITHUB_ENV"
-      - name: Set macOS target
-        if: runner.os == 'macOS'
-        shell: bash
+          RREPO_REPOSITORY_URL: ${{ secrets.RREPO_REPOSITORY_URL }}
+          RREPO_API_KEY: ${{ secrets.RREPO_API_KEY }}
         run: |
-          pkg_type=$(Rscript --vanilla -e 'cat(.Platform$pkgType)')
-          printf 'BINARY_TARGET=%s\n' "${pkg_type#mac.binary.}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: source
-      - name: Build Windows binary from source archive
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: R CMD INSTALL --build --no-multiarch "source/${{ needs.source.outputs.package }}_${{ needs.source.outputs.version }}.tar.gz"
-      - name: Build macOS binary from source archive
-        if: runner.os == 'macOS'
-        shell: bash
-        run: R CMD INSTALL --build --no-multiarch "source/${{ needs.source.outputs.package }}_${{ needs.source.outputs.version }}.tar.gz"
-      - name: Record upload coordinates
-        shell: bash
-        env:
-          FILENAME: ${{ needs.source.outputs.package }}_${{ needs.source.outputs.version }}.${{ matrix.platform.extension }}
-        run: |
-          jq -n --arg filename "$FILENAME" --arg platform "$PLATFORM" \
-            --arg rMinor "$R_MINOR" --arg target "$BINARY_TARGET" \
-            '{filename: $filename, platform: $platform, rMinor: $rMinor, target: $target}' \
-            > upload.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: binary-${{ matrix.platform.name }}-${{ matrix.r }}
-          path: |
-            ${{ needs.source.outputs.package }}_${{ needs.source.outputs.version }}.${{ matrix.platform.extension }}
-            upload.json
-          if-no-files-found: error
-
-  publish:
-    needs: [source, binaries]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    defaults:
-      run:
-        shell: bash
-    env:
-      RREPO_REPOSITORY_URL: ${{ secrets.RREPO_REPOSITORY_URL }}
-      RREPO_API_KEY: ${{ secrets.RREPO_API_KEY }}
-      PACKAGE_NAME: ${{ needs.source.outputs.package }}
-      PACKAGE_VERSION: ${{ needs.source.outputs.version }}
-      REPLACE: 'false'
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: source
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: binary-*
-          path: binaries
-      - name: Publish source
-        run: |
-          curl --fail-with-body --silent --show-error \
+          : "${RREPO_REPOSITORY_URL:?Set the RREPO_REPOSITORY_URL secret}"
+          : "${RREPO_API_KEY:?Set the RREPO_API_KEY secret}"
+          package=$(awk '$1 == "Package:" {print $2}' DESCRIPTION)
+          version=$(awk '$1 == "Version:" {print $2}' DESCRIPTION)
+          tarball="${package}_${version}.tar.gz"
+          test -f "$tarball"
+          curl --fail --show-error \
+            --request POST \
             --header "Authorization: Bearer ${RREPO_API_KEY}" \
-            --form "file=@source/${PACKAGE_NAME}_${PACKAGE_VERSION}.tar.gz" \
-            --form "replace=${REPLACE}" \
+            --form "file=@${tarball}" \
             "${RREPO_REPOSITORY_URL%/}/upload"
-      - name: Publish binaries
-        run: |
-          for directory in binaries/*; do
-            metadata="$directory/upload.json"
-            filename=$(jq -r '.filename' "$metadata")
-            platform=$(jq -r '.platform' "$metadata")
-            r_minor=$(jq -r '.rMinor' "$metadata")
-            target=$(jq -r '.target' "$metadata")
-            args=(
-              --form "file=@${directory}/${filename}"
-              --form "packageName=${PACKAGE_NAME}"
-              --form "version=${PACKAGE_VERSION}"
-              --form "platform=${platform}"
-              --form "rMinor=${r_minor}"
-              --form "replace=${REPLACE}"
-            )
-            if [ -n "$target" ]; then args+=(--form "target=${target}"); fi
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer ${RREPO_API_KEY}" \
-              "${args[@]}" "${RREPO_REPOSITORY_URL%/}/binaries/upload"
-          done
-      - name: Prepare GitHub release assets
-        run: |
-          mkdir -p release
-          cp "source/${PACKAGE_NAME}_${PACKAGE_VERSION}.tar.gz" release/
-          for directory in binaries/*; do
-            name=$(basename "$directory")
-            filename=$(jq -r '.filename' "$directory/upload.json")
-            zip -j "release/${name}.zip" "$directory/$filename"
-          done
-      - name: Checksums and download table
-        working-directory: release
-        env:
-          RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
-        run: |
-          sha256sum *.tar.gz *.zip > SHA256SUMS
-          {
-            echo '## Downloads'
-            echo
-            echo 'Binary bundles are labeled by platform and R release series.'
-            echo 'Extract the outer ZIP, then run R CMD INSTALL on the package archive inside.'
-            echo
-            echo '| Artifact | Download |'
-            echo '| --- | --- |'
-            for file in *; do
-              echo "| $file | [Download]($RELEASE_URL/$file) |"
-            done
-          } > ../release-notes.md
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" --verify-tag --draft --title "$TAG" \
-            --generate-notes --notes-file release-notes.md
-          gh release upload "$TAG" release/*
-          gh release edit "$TAG" --draft=false
+          package=$(awk '$1 == "Package:" {print $2}' DESCRIPTION)
+          version=$(awk '$1 == "Version:" {print $2}' DESCRIPTION)
+          gh release create "$GITHUB_REF_NAME" "${package}_${version}.tar.gz" \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
