@@ -87,6 +87,6 @@ Run the test suite with:
 cargo test --workspace --locked
 ```
 
-Integration tests require Docker and use `testcontainers` with the official `r-base` image to exercise package-management workflows without modifying your local R library.
+Integration tests run native R processes and require R on `PATH` plus the toolchain needed to compile R source packages. They isolate project libraries, caches, and temporary files. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and source-build instructions.
 
 Release-maintenance instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).

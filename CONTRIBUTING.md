@@ -1,5 +1,23 @@
 # Contributing
 
+## Building from source
+
+The repository is a Cargo workspace. The CLI package manifest is
+`crates/rpx/Cargo.toml`; the root `Cargo.toml` configures the workspace.
+
+Build or install the CLI from the repository root:
+
+```bash
+cargo build -p rpx --locked
+cargo install --path crates/rpx --locked
+```
+
+To build the Docker image, use the root Dockerfile:
+
+```bash
+docker build -f Dockerfile -t rpx .
+```
+
 ## Running tests
 
 Run the test suite with:
@@ -47,6 +65,6 @@ Before releasing:
 2. Move the relevant entries from `Unreleased` into a matching version section in [CHANGELOG.md](CHANGELOG.md). The heading must contain the exact package version so cargo-dist can use it for the GitHub release title and body.
 3. Run the test suite.
 
-Create a release by pushing a matching version tag such as `v2.0.0`. The cargo-dist workflow builds and signs release artifacts, publishing archives, checksums, installers, and release notes to GitHub Releases and uploading release assets to R2 for distribution through `rrepo.org`.
+After the release-preparation pull request is merged, create a release by pushing a matching version tag such as `v2.1.0` on the merged release commit. The cargo-dist workflow builds and signs release artifacts, publishing archives, checksums, installers, and release notes to GitHub Releases and uploading release assets to R2 for distribution through `rrepo.org`.
 
 The Docker workflow publishes `ghcr.io/rrepo-org/rpx` images for `linux/amd64` and `linux/arm64`. Only stable `vMAJOR.MINOR.PATCH` tags update the Docker `latest` tag and the `latest` download on `rrepo.org`.

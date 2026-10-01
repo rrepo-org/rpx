@@ -4,11 +4,14 @@ All notable changes to rpx are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rpx adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/rrepo-org/rpx/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/rrepo-org/rpx/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/rrepo-org/rpx/compare/v1.7.0...v2.0.0
 
 ## [Unreleased]
+
+## [2.1.0]
 
 ### Added
 
@@ -20,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Reuse Git source archives by resolved commit and local source archives by full package-tree content, avoiding repeated `R CMD build` calls. Both use the same prepared-installation cache as registry sources, including resolved dependency versions.
 - Show progress while the interactive `rpx init` wizard resolves and installs packages.
+- Reorganized the repository into a Cargo workspace. Source installs now use `cargo install --path crates/rpx --locked`, and the Dockerfile is at the repository root.
+- Run integration tests with native R processes instead of Docker. Contributors need R on `PATH` and the toolchain required to compile R source packages.
 
 ### Fixed
 
