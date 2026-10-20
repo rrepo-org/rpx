@@ -4,12 +4,23 @@ All notable changes to rpx are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rpx adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/rrepo-org/rpx/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/rrepo-org/rpx/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/rrepo-org/rpx/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/rrepo-org/rpx/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/rrepo-org/rpx/compare/v1.7.0...v2.0.0
 
 ## [Unreleased]
+
+## [2.1.1]
+
+### Fixed
+
+- Install XZ-compressed macOS R 4.6 binaries, including archives named `.tgz`, by detecting binary archive formats with `r-package-installer` 0.2.
+
+### Changed
+
+- Refresh prepared binary installation cache entries for automatic format detection. Downloaded artifacts remain reusable.
 
 ## [2.1.0]
 

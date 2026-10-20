@@ -16,8 +16,8 @@ use futures_util::StreamExt;
 use miette::Diagnostic;
 use r_metadata::Version;
 use r_package_installer::{
-    Artifact, BinaryArtifact, BinaryFormat, CacheKey, Digest as InstallerDigest, ExpectedPackage,
-    InstallOutcome, Installer, PrepareRequest, RemovalOutcome, SourceArtifact, SourceOptions,
+    Artifact, BinaryArtifact, CacheKey, Digest as InstallerDigest, ExpectedPackage, InstallOutcome,
+    Installer, PrepareRequest, RemovalOutcome, SourceArtifact, SourceOptions,
 };
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -34,7 +34,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 /// only after building, downloading, or finding the file in the cache.
 #[derive(Debug)]
 pub(super) enum PreparedArtifact {
-    Binary { path: PathBuf, format: BinaryFormat },
+    Binary { path: PathBuf },
     Source { path: PathBuf },
 }
 
@@ -61,10 +61,7 @@ impl PreparedArtifact {
 
     fn to_installer_artifact(&self, project_library: PathBuf) -> Artifact {
         match self {
-            Self::Binary { path, format } => Artifact::Binary(BinaryArtifact {
-                path: path.clone(),
-                format: *format,
-            }),
+            Self::Binary { path } => Artifact::Binary(BinaryArtifact { path: path.clone() }),
             Self::Source { path } => Artifact::Source(SourceArtifact {
                 path: path.clone(),
                 options: SourceOptions {
@@ -411,7 +408,7 @@ pub(super) async fn download_package_artifact(
         span.record("stage", "downloading binary");
         span.pb_set_message(&format!("{package} {version} downloading binary"));
         match registry_binary_location(&registry, &package, &package_version, r_version.as_ref()) {
-            Ok(Some((path, format))) => {
+            Ok(Some(path)) => {
                 let binary_result = async {
                     match artifact_cache_entry(&path) {
                         ArtifactCacheEntry::File => return Ok(()),
@@ -442,7 +439,7 @@ pub(super) async fn download_package_artifact(
                     Ok(()) => {
                         span.record("stage", "prepared");
                         span.pb_set_message(&format!("{package} {version} prepared"));
-                        return Ok(PreparedArtifact::Binary { path, format });
+                        return Ok(PreparedArtifact::Binary { path });
                     }
                     Err(error @ DownloadPackageArtifactError::InvalidArtifact { .. }) => {
                         return Err(error);
@@ -591,15 +588,14 @@ fn registry_binary_location(
     package: &str,
     package_version: &PackageVersion,
     r_version: &semver::Version,
-) -> Result<Option<(PathBuf, BinaryFormat)>, http::BinaryArtifactRequestError> {
-    let format = match HOST.operating_system {
-        OperatingSystem::Windows => BinaryFormat::Zip,
+) -> Result<Option<PathBuf>, http::BinaryArtifactRequestError> {
+    match HOST.operating_system {
+        OperatingSystem::Windows => {}
         OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_) => {
             http::r_macos_binary_target(&HOST)?;
-            BinaryFormat::TarGz
         }
         _ => return Ok(None),
-    };
+    }
     let path = binary_artifact_cache_path(&BinaryArtifactCacheKey::new(
         registry.clone(),
         package,
@@ -607,7 +603,7 @@ fn registry_binary_location(
         HOST.clone(),
         r_version.clone(),
     ));
-    Ok(Some((path, format)))
+    Ok(Some(path))
 }
 
 fn registry_source_path(
@@ -737,14 +733,7 @@ fn installer_build_key(
     };
     field(INSTALLER_CACHE_VERSION.as_bytes());
     field(match artifact {
-        PreparedArtifact::Binary {
-            format: BinaryFormat::Zip,
-            ..
-        } => b"binary-zip",
-        PreparedArtifact::Binary {
-            format: BinaryFormat::TarGz,
-            ..
-        } => b"binary-tar-gz",
+        PreparedArtifact::Binary { .. } => b"binary",
         PreparedArtifact::Source { .. } => b"source",
     });
     field(artifact_digest.as_bytes());
@@ -1014,7 +1003,6 @@ mod tests {
     fn install_artifact_actions_use_r_installation_terms() {
         let binary = PreparedArtifact::Binary {
             path: PathBuf::new(),
-            format: BinaryFormat::Zip,
         };
         let source = PreparedArtifact::Source {
             path: PathBuf::new(),
@@ -1122,11 +1110,10 @@ mod tests {
     }
 
     #[test]
-    fn install_artifact_preserves_binary_format() {
+    fn install_artifact_preserves_binary_path() {
         let artifact_path = PathBuf::from("package.zip");
         let artifact = PreparedArtifact::Binary {
             path: artifact_path.clone(),
-            format: BinaryFormat::Zip,
         }
         .to_installer_artifact(PathBuf::from("unused-library"));
 
@@ -1134,7 +1121,62 @@ mod tests {
             panic!("binary selection should produce a binary artifact");
         };
         assert_eq!(binary.path, artifact_path);
-        assert_eq!(binary.format, BinaryFormat::Zip);
+    }
+
+    #[tokio::test]
+    async fn installs_cached_xz_and_gzip_binaries_named_tgz() {
+        use std::io::Write;
+
+        let description = "Package: example\nVersion: 1.0.0\nBuilt: R 4.6.1; aarch64-apple-darwin23; 2026-10-20; unix\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        for (path, contents) in [
+            ("example/DESCRIPTION", description.as_bytes()),
+            ("example/Meta/package.rds", b"rds".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+        }
+        let tar = archive.into_inner().unwrap();
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(&tar).unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&tar).unwrap();
+
+        for bytes in [xz.finish().unwrap(), gzip.finish().unwrap()] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("example_1.0.0.tgz");
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(artifact_cache_entry(&path), ArtifactCacheEntry::File);
+            let installer = Installer::new(directory.path().join("installer"));
+            let artifact = Arc::new(PreparedArtifact::Binary { path });
+
+            // A second library also exercises reuse of the prepared installation cache.
+            for library in ["library", "second-library"] {
+                let library = directory.path().join(library);
+                install_package(
+                    &installer,
+                    &library,
+                    "example",
+                    &"1.0.0".parse().unwrap(),
+                    &semver::Version::new(4, 6, 1),
+                    &[],
+                    artifact.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(library.join("example/DESCRIPTION")).unwrap(),
+                    description
+                );
+                assert_eq!(
+                    fs::read(library.join("example/Meta/package.rds")).unwrap(),
+                    b"rds"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1168,7 +1210,6 @@ mod tests {
             key(
                 &PreparedArtifact::Binary {
                     path: PathBuf::from("binary.zip"),
-                    format: BinaryFormat::Zip
                 },
                 1,
                 "package",
@@ -1218,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn installer_build_key_ignores_location_but_distinguishes_artifact_formats() {
+    fn installer_build_key_ignores_location_but_distinguishes_artifact_kinds() {
         let key = |artifact: &PreparedArtifact| {
             installer_build_key(
                 artifact,
@@ -1237,18 +1278,13 @@ mod tests {
                 },
                 PreparedArtifact::Binary {
                     path: PathBuf::from(path),
-                    format: BinaryFormat::Zip,
-                },
-                PreparedArtifact::Binary {
-                    path: PathBuf::from(path),
-                    format: BinaryFormat::TarGz,
                 },
             ]
         };
         let original = artifacts("cache/original").each_ref().map(key);
         let relocated = artifacts("cache/relocated").each_ref().map(key);
         assert_eq!(original, relocated);
-        assert_eq!(original.iter().collect::<BTreeSet<_>>().len(), 3);
+        assert_eq!(original.iter().collect::<BTreeSet<_>>().len(), 2);
     }
 
     #[test]
