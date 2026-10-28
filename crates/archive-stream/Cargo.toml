@@ -12,5 +12,8 @@ futures-util = "0.3"
 
 [dev-dependencies]
 flate2 = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+sha2 = "0.10"
 tar = "0.4"
 tokio = { version = "1", features = ["macros", "rt"] }
+tokio-util = { version = "0.7", features = ["io"] }

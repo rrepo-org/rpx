@@ -99,8 +99,11 @@ dependencies = [
  "async-compression",
  "flate2",
  "futures-util",
+ "reqwest",
+ "sha2",
  "tar",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

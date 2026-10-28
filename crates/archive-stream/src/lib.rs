@@ -115,6 +115,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skips_large_payload_and_returns_first_duplicate() {
+        let bytes = archive(&[
+            ("pkg/large", tar::EntryType::Regular, &vec![42; 2_000_000]),
+            ("pkg/DESCRIPTION", tar::EntryType::Regular, b"first"),
+            ("pkg/DESCRIPTION", tar::EntryType::Regular, b"second"),
+        ]);
+        assert_eq!(
+            tar_gz_entry(bytes.as_slice(), "./pkg/./DESCRIPTION")
+                .await
+                .unwrap(),
+            Some(b"first".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_target_but_accepts_complete_target_before_broken_tail() {
+        let bytes = archive(&[
+            (
+                "pkg/DESCRIPTION",
+                tar::EntryType::Regular,
+                &vec![42; 32_000],
+            ),
+            ("pkg/tail", tar::EntryType::Regular, &vec![42; 32_000]),
+        ]);
+        // Stored DEFLATE keeps these cuts well inside the selected payload and
+        // the following payload, respectively. No reliance on compression ratio.
+        assert!(
+            tar_gz_entry(&bytes[..4096], "pkg/DESCRIPTION")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tar_gz_entry(&bytes[..40_000], "pkg/DESCRIPTION")
+                .await
+                .unwrap(),
+            Some(vec![42; 32_000])
+        );
+        assert!(tar_gz_entry(&bytes[..40_000], "pkg/missing").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn does_not_require_gzip_checksum_after_target() {
+        let mut bytes = archive(&[
+            ("pkg/DESCRIPTION", tar::EntryType::Regular, b"correct"),
+            ("pkg/tail", tar::EntryType::Regular, &vec![42; 32_000]),
+        ]);
+        let checksum = bytes.len() - 8;
+        bytes[checksum] ^= 0xff;
+        assert_eq!(
+            tar_gz_entry(bytes.as_slice(), "pkg/DESCRIPTION")
+                .await
+                .unwrap(),
+            Some(b"correct".to_vec())
+        );
+    }
+
+    #[tokio::test]
     async fn distinguishes_missing_invalid_and_broken_streams() {
         let bytes = archive(&[("pkg/other", tar::EntryType::Regular, b"body")]);
         assert_eq!(
