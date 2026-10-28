@@ -4,14 +4,7 @@
 use archive_stream::tar_entry;
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
-use std::{
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{io, time::Duration};
 use tokio_util::io::StreamReader;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -30,16 +23,15 @@ async fn lookup(
     path: &str,
 ) -> Result<(Option<Vec<u8>>, usize)> {
     let response = client.get(url).send().await?.error_for_status()?;
-    let received = Arc::new(AtomicUsize::new(0));
-    let counter = received.clone();
+    let mut received = 0;
     let stream = response
         .bytes_stream()
-        .inspect_ok(move |chunk| {
-            counter.fetch_add(chunk.len(), Ordering::Relaxed);
+        .inspect_ok(|chunk| {
+            received += chunk.len();
         })
         .map_err(io::Error::other);
     let result = tar_entry(StreamReader::new(stream), path).await?;
-    Ok((result, received.load(Ordering::Relaxed)))
+    Ok((result, received))
 }
 
 async fn check(

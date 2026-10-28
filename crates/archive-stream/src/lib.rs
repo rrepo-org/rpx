@@ -39,9 +39,9 @@ async fn read_tar_entry(
     reader: impl AsyncRead + Unpin,
     path: impl AsRef<Path>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let mut archive = TarArchive::new(reader);
+    let mut members = TarArchive::new(reader).members();
     let path = path.as_ref();
-    while let Some(member) = archive.next_member().await.map_err(decode_error)? {
+    while let Some(member) = members.next().await.map_err(decode_error)? {
         // Advancing automatically drains the previous member using bounded buffers.
         if let Member::File {
             metadata,
@@ -56,13 +56,20 @@ async fn read_tar_entry(
                     .filter(|part| *part != std::path::Component::CurDir))
         {
             let mut bytes = Vec::new();
-            let mut chunk = Vec::new();
-            while payload
-                .next_chunk(&mut chunk, 64 * 1024)
+            // Keep the first chunk as the result; small files need no extra copy.
+            if payload
+                .next_chunk(&mut bytes, 64 * 1024)
                 .await
                 .map_err(decode_error)?
             {
-                bytes.extend_from_slice(&chunk);
+                let mut chunk = Vec::new();
+                while payload
+                    .next_chunk(&mut chunk, 64 * 1024)
+                    .await
+                    .map_err(decode_error)?
+                {
+                    bytes.extend_from_slice(&chunk);
+                }
             }
             return Ok(Some(bytes));
         }
@@ -161,6 +168,21 @@ mod tests {
             Some(b"correct".to_vec())
         );
         assert!(read.load(Ordering::Relaxed) < 8192);
+    }
+
+    #[tokio::test]
+    async fn collects_empty_single_and_multiple_chunk_payloads() {
+        for size in [0, 1, 64 * 1024, 64 * 1024 + 1, 150_000] {
+            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let bytes = archive(&[("pkg/DESCRIPTION", tar::EntryType::Regular, &body)]);
+            assert_eq!(
+                tar_entry(bytes.as_slice(), "pkg/DESCRIPTION")
+                    .await
+                    .unwrap(),
+                Some(body),
+                "payload size {size}"
+            );
+        }
     }
 
     #[tokio::test]
