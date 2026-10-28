@@ -309,7 +309,7 @@ pub async fn description_from_source(
 ) -> Result<Description, DescriptionError> {
     let reader =
         tokio_util::io::StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
-    let bytes = archive_stream::tar_gz_entry(reader, format!("{package}/DESCRIPTION"))
+    let bytes = archive_stream::tar_entry(reader, format!("{package}/DESCRIPTION"))
         .await?
         .ok_or_else(|| DescriptionError::DescriptionNotFound {
             package: package.into(),

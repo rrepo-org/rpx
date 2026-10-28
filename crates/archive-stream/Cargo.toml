@@ -5,12 +5,17 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-compression = { version = "0.4", features = ["tokio", "gzip"] }
-tokio-tar = { package = "astral-tokio-tar", version = "0.7" }
+# Shares xz2/lzma-sys with r-package-installer 0.2; newer XZ backends conflict.
+async-compression = { version = "=0.4.19", features = ["tokio", "gzip", "xz"] }
+tar-codec = "=0.0.15"
 tokio = { version = "1", features = ["io-util"] }
-futures-util = "0.3"
 
 [dev-dependencies]
 flate2 = "1"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+sha2 = "0.10"
 tar = "0.4"
 tokio = { version = "1", features = ["macros", "rt"] }
+tokio-util = { version = "0.7", features = ["io"] }
+xz2 = "0.1"
