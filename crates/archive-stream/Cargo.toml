@@ -6,12 +6,12 @@ publish = false
 
 [dependencies]
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
-tokio-tar = { package = "astral-tokio-tar", version = "0.7" }
+tar-codec = "=0.0.15"
 tokio = { version = "1", features = ["io-util"] }
-futures-util = "0.3"
 
 [dev-dependencies]
 flate2 = "1"
+futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 sha2 = "0.10"
 tar = "0.4"

@@ -1,15 +1,45 @@
 # archive-stream
 
-Internal, non-publishable utility for reading a regular file from a gzip-compressed
+Internal, non-publishable utility for reading a file from a gzip-compressed
 tar stream. Independent of HTTP and package metadata; accepts a Tokio `AsyncRead`.
 
 `tar_gz_entry(reader, path)` returns `io::Result<Option<Vec<u8>>>`. It compares exact
-paths (ignoring `.` components), skips non-regular entries, and buffers only the
+paths (ignoring `.` components), selects regular or contiguous files, and buffers only the
 matching entry plus decoder buffers. Nothing is extracted to disk.
 
-Reading stops at the end of the first matching entry, so the remaining tar data
+Reading stops at the end of the first matching entry's padded tar block, so the remaining tar data
 and gzip checksum are not validated. Missing entries return `None`; input and
 archive errors encountered during the search propagate as I/O errors.
+
+## Decoder compatibility
+
+Decoding uses `tar-codec` pinned to `0.0.15`, with its default policy, over the
+existing async gzip decoder. The upstream crate is early-stage; upgrades should
+run both the local regressions and the opt-in remote suite below.
+
+Compared with the previous `astral-tokio-tar` 0.7 reader:
+- Both regular and contiguous entries are returned as files by the new API.
+  Symlinks and hard links are still excluded; the first matching file wins.
+- The selected payload must include its final 512-byte tar block's padding.
+  No later member, tar end marker, or gzip checksum is required after a match.
+- A missing-entry search requires the two zero tar end blocks; bare EOF or a
+  single end block is now an error.
+- Member paths and link targets must be UTF-8, including on skipped entries.
+  Legacy V7 archives and mixed GNU/PAX framing families are unsupported.
+- Metadata parsing is stricter. Unknown PAX vendor records, duplicate PAX keys,
+  and global path/size overrides are rejected by default. Metadata extension
+  limits remain enabled. Ordinary global PAX comments from GitHub are accepted.
+
+Structural/policy failures become `InvalidData`; underlying I/O error kinds are
+preserved. These are intentional compatibility differences, not a claim of full
+equivalence with the previous parser. All 15 pinned remote cases pass with the
+default policy. The selected payload is accumulated in a Vec; skipped payloads
+are drained incrementally by the decoder when advancing to the next member.
+
+`astral-tokio-tar` is removed. `futures-util` is now only a test dependency of
+this crate, and `tar` remains for fixture generation. `tar-codec` also brings
+`tar-framing` and `archive-trait` (including the latter's filesystem dependencies),
+even though this helper never extracts to disk.
 
 ## Compatibility tests
 

@@ -1,23 +1,27 @@
 //! Read individual regular files from streaming archives without extracting to disk.
 use async_compression::tokio::bufread::GzipDecoder;
-use futures_util::TryStreamExt;
 use std::{io, path::Path};
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tar_codec::{Archive, Member, MemberPayload, TarArchive};
+use tokio::io::{AsyncRead, BufReader};
 
-/// Read the first regular file whose path equals `path` from a gzip tar stream.
+/// Read the first regular or contiguous file whose path equals `path` from a gzip tar stream.
 /// Only the selected file and decoder buffers are held in memory. Stops at the
-/// end of that entry: the remainder of the archive (including its gzip checksum)
+/// end of that entry's padded tar block: the remainder (including its gzip checksum)
 /// is not validated. No archive paths are written to the filesystem.
 pub async fn tar_gz_entry(
     reader: impl AsyncRead + Unpin,
     path: impl AsRef<Path>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let mut archive = tokio_tar::Archive::new(GzipDecoder::new(BufReader::new(reader)));
+    let mut archive = TarArchive::new(GzipDecoder::new(BufReader::new(reader)));
     let path = path.as_ref();
-    let entries = archive.entries()?.try_filter_map(|mut entry| async move {
-        if entry.header().entry_type().is_file()
-            && entry
-                .path()?
+    while let Some(member) = archive.next_member().await.map_err(decode_error)? {
+        // Advancing automatically drains the previous member using bounded buffers.
+        if let Member::File {
+            metadata,
+            mut payload,
+            ..
+        } = member
+            && Path::new(&metadata.path)
                 .components()
                 .filter(|part| *part != std::path::Component::CurDir)
                 .eq(path
@@ -25,14 +29,32 @@ pub async fn tar_gz_entry(
                     .filter(|part| *part != std::path::Component::CurDir))
         {
             let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).await?;
-            Ok(Some(bytes))
-        } else {
-            Ok(None)
+            let mut chunk = Vec::new();
+            while payload
+                .next_chunk(&mut chunk, 64 * 1024)
+                .await
+                .map_err(decode_error)?
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(Some(bytes));
         }
-    });
-    futures_util::pin_mut!(entries);
-    entries.try_next().await
+    }
+    Ok(None)
+}
+
+fn decode_error(error: tar_codec::DecodeError) -> io::Error {
+    // Keep transport error kinds (e.g. ConnectionReset) through framing wrappers.
+    let mut source: &dyn std::error::Error = &error;
+    loop {
+        if let Some(io) = source.downcast_ref::<io::Error>() {
+            return io::Error::new(io.kind(), error);
+        }
+        match source.source() {
+            Some(next) => source = next,
+            None => return io::Error::new(io::ErrorKind::InvalidData, error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +134,43 @@ mod tests {
             Some(b"correct".to_vec())
         );
         assert!(read.load(Ordering::Relaxed) < 8192);
+    }
+
+    #[tokio::test]
+    async fn reads_contiguous_files() {
+        // tar-codec projects regular and contiguous entries to Member::File.
+        let bytes = archive(&[("pkg/DESCRIPTION", tar::EntryType::Continuous, b"body")]);
+        assert_eq!(
+            tar_gz_entry(bytes.as_slice(), "pkg/DESCRIPTION")
+                .await
+                .unwrap(),
+            Some(b"body".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn requires_target_padding_but_not_archive_end_markers() {
+        let bytes = archive(&[("pkg/DESCRIPTION", tar::EntryType::Regular, b"body")]);
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(bytes.as_slice()),
+            &mut plain,
+        )
+        .unwrap();
+        for (end, succeeds) in [(512 + 4, false), (1024, true)] {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+            std::io::Write::write_all(&mut encoder, &plain[..end]).unwrap();
+            let truncated = encoder.finish().unwrap();
+            let result = tar_gz_entry(truncated.as_slice(), "pkg/DESCRIPTION").await;
+            if succeeds {
+                assert_eq!(result.unwrap(), Some(b"body".to_vec()));
+                // A missing-entry search must reach proper tar end markers.
+                assert!(tar_gz_entry(truncated.as_slice(), "missing").await.is_err());
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[tokio::test]
