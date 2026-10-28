@@ -1,7 +1,7 @@
 //! Opt-in compatibility checks against version/commit-pinned public archives.
 //! Run: cargo test -p archive-stream --test remote -- --ignored --test-threads=3
 //! Expected payload hashes were independently computed with Python's tarfile.
-use archive_stream::tar_gz_entry;
+use archive_stream::tar_entry;
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,7 +38,7 @@ async fn lookup(
             counter.fetch_add(chunk.len(), Ordering::Relaxed);
         })
         .map_err(io::Error::other);
-    let result = tar_gz_entry(StreamReader::new(stream), path).await?;
+    let result = tar_entry(StreamReader::new(stream), path).await?;
     Ok((result, received.load(Ordering::Relaxed)))
 }
 

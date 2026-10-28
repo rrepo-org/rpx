@@ -1,18 +1,45 @@
 //! Read individual regular files from streaming archives without extracting to disk.
-use async_compression::tokio::bufread::GzipDecoder;
+use async_compression::tokio::bufread::{GzipDecoder, XzDecoder};
 use std::{io, path::Path};
 use tar_codec::{Archive, Member, MemberPayload, TarArchive};
-use tokio::io::{AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
-/// Read the first regular or contiguous file whose path equals `path` from a gzip tar stream.
+/// Read the first regular or contiguous file whose path equals `path` from a gzip/XZ tar stream.
+/// Compression is detected from the input signature, independently of filenames.
 /// Only the selected file and decoder buffers are held in memory. Stops at the
 /// end of that entry's padded tar block: the remainder (including its gzip checksum)
 /// is not validated. No archive paths are written to the filesystem.
-pub async fn tar_gz_entry(
+pub async fn tar_entry(
+    mut reader: impl AsyncRead + Unpin,
+    path: impl AsRef<Path>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut signature = [0; 6];
+    reader.read_exact(&mut signature).await?;
+    // Replay the signature without seeking or buffering the archive. read_exact
+    // handles network readers that return fewer than six bytes per read.
+    let reader = BufReader::new(signature.as_slice().chain(reader));
+    if signature.starts_with(b"\x1f\x8b") {
+        read_tar_entry(GzipDecoder::new(reader), path).await
+    } else if signature == *b"\xfd7zXZ\0" {
+        let mut decoder = XzDecoder::new(reader);
+        decoder.multiple_members(true);
+        read_tar_entry(decoder, path).await
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported archive compression (expected gzip or XZ)",
+        ))
+    }
+}
+
+/// Compatibility name for [`tar_entry`]; now accepts both gzip and XZ.
+pub use tar_entry as tar_gz_entry;
+
+async fn read_tar_entry(
     reader: impl AsyncRead + Unpin,
     path: impl AsRef<Path>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let mut archive = TarArchive::new(GzipDecoder::new(BufReader::new(reader)));
+    let mut archive = TarArchive::new(reader);
     let path = path.as_ref();
     while let Some(member) = archive.next_member().await.map_err(decode_error)? {
         // Advancing automatically drains the previous member using bounded buffers.
@@ -134,6 +161,74 @@ mod tests {
             Some(b"correct".to_vec())
         );
         assert!(read.load(Ordering::Relaxed) < 8192);
+    }
+
+    #[tokio::test]
+    async fn reads_xz_compressed_tgz_like_macos_r_46_binaries() {
+        // RRE-98: macOS binary downloads named .tgz can contain XZ, not gzip.
+        // The reader receives bytes, so compression must not depend on a suffix.
+        let gzip = archive(&[(
+            "curl/DESCRIPTION",
+            tar::EntryType::Regular,
+            b"Package: curl\nVersion: 8.1.0\n",
+        )]);
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(gzip.as_slice()),
+            &mut plain,
+        )
+        .unwrap();
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+        std::io::Write::write_all(&mut encoder, &plain).unwrap();
+        let xz = encoder.finish().unwrap();
+        assert!(xz.starts_with(b"\xfd7zXZ\0"));
+        assert!(tar_entry(&xz[..20], "curl/DESCRIPTION").await.is_err());
+        let mut broken_tail = xz.clone();
+        let last = broken_tail.len() - 1;
+        broken_tail[last] ^= 0xff;
+        assert_eq!(
+            tar_entry(broken_tail.as_slice(), "curl/DESCRIPTION")
+                .await
+                .unwrap(),
+            Some(b"Package: curl\nVersion: 8.1.0\n".to_vec())
+        );
+        for bytes in [gzip, xz] {
+            let reader = tokio_util::io::StreamReader::new(futures_util::stream::iter(
+                bytes.chunks(1).map(Ok::<_, io::Error>),
+            ));
+            assert_eq!(
+                tar_gz_entry(reader, "curl/DESCRIPTION").await.unwrap(),
+                Some(b"Package: curl\nVersion: 8.1.0\n".to_vec())
+            );
+            assert_eq!(
+                tar_gz_entry(bytes.as_slice(), "curl/missing")
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_and_truncated_compression_signatures() {
+        for signature in [b"\x1f\x8b".as_slice(), b"\xfd7zXZ\0".as_slice()] {
+            for end in 0..signature.len() {
+                assert_eq!(
+                    tar_entry(&signature[..end], "entry")
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
+        assert_eq!(
+            tar_entry(b"not gzip".as_slice(), "entry")
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

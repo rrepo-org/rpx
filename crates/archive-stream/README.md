@@ -1,9 +1,9 @@
 # archive-stream
 
-Internal, non-publishable utility for reading a file from a gzip-compressed
+Internal, non-publishable utility for reading a file from a gzip- or XZ-compressed
 tar stream. Independent of HTTP and package metadata; accepts a Tokio `AsyncRead`.
 
-`tar_gz_entry(reader, path)` returns `io::Result<Option<Vec<u8>>>`. It compares exact
+`tar_entry(reader, path)` returns `io::Result<Option<Vec<u8>>>`. It compares exact
 paths (ignoring `.` components), selects regular or contiguous files, and buffers only the
 matching entry plus decoder buffers. Nothing is extracted to disk.
 
@@ -11,10 +11,23 @@ Reading stops at the end of the first matching entry's padded tar block, so the 
 and gzip checksum are not validated. Missing entries return `None`; input and
 archive errors encountered during the search propagate as I/O errors.
 
+Compression is detected from the first six bytes and replayed into the decoder;
+filenames and HTTP content types are not used. This handles the RRE-98 case of
+XZ-compressed macOS R 4.6 binaries named `.tgz`. Unknown compression is rejected
+as `InvalidData`, and truncated signatures as `UnexpectedEof`. XZ decoding accepts
+concatenated streams. `tar_gz_entry` remains a compatibility alias for `tar_entry`.
+Local tests use independently XZ-encoded tar data, one-byte input chunks, missing
+entries, truncated input, and a broken XZ footer after the selected file.
+
+`async-compression` is pinned to 0.4.19 to share the `xz2`/`lzma-sys` backend
+already used by `r-package-installer` 0.2. Newer versions use `liblzma-sys`,
+which conflicts with `lzma-sys` because both declare the native `lzma` link.
+Upgrade these dependencies together when the installer changes backends.
+
 ## Decoder compatibility
 
 Decoding uses `tar-codec` pinned to `0.0.15`, with its default policy, over the
-existing async gzip decoder. The upstream crate is early-stage; upgrades should
+async gzip/XZ decoders. The upstream crate is early-stage; upgrades should
 run both the local regressions and the opt-in remote suite below.
 
 Compared with the previous `astral-tokio-tar` 0.7 reader:
